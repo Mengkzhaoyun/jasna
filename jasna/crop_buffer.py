@@ -8,8 +8,8 @@ import torch
 import torch.nn.functional as F
 
 RESTORATION_SIZE = 256
-BORDER_RATIO = 0.06
-MIN_BORDER = 20
+BORDER_RATIO = 0.10
+MIN_BORDER = 40
 MAX_EXPANSION_FACTOR = 1.0
 
 

@@ -17,16 +17,35 @@ rm -rf "$JASNA_SRC"
 cp -a /app/jasna "$JASNA_SRC"
 sed -i 's/if wrong_version:/if False:/g' "$JASNA_SRC/jasna/os_utils.py"
 
-echo ">>> 2. 应用修复补丁..."
-# 统一转换为 LF，避免 Windows git 带来的 CRLF 导致 patch 失败
-sed -i 's/\r$//' /app/jasna/.drone/patches/*.patch
-sed -i 's/\r$//' "$JASNA_SRC/jasna/blend_buffer.py"
-sed -i 's/\r$//' "$JASNA_SRC/jasna/cli_video_restoration.py"
-
+echo ">>> 2. 应用修复补丁 (Python直接注入，避免换行符冲突)..."
 # 修复 blend_mask 在 crop 边界硬截断导致的正方形伪影
-patch -p1 -d "$JASNA_SRC" < /app/jasna/.drone/patches/fix_blend_edge_feather.patch
+python3.13 -c '
+import pathlib
+p = pathlib.Path("jasna/blend_buffer.py")
+txt = p.read_text(encoding="utf-8")
+target = "        blend_mask = self.blend_mask_fn(crop_mask, frame_h)\n\n        if cw < 1.0:"
+replacement = """        blend_mask = self.blend_mask_fn(crop_mask, frame_h)
+
+        # Edge feathering: prevent hard blend cutoff at crop boundary
+        _feather_px = max(8, round(frame_h * 0.06))
+        _bh, _bw = blend_mask.shape
+        if _bh > 2 * _feather_px and _bw > 2 * _feather_px:
+            _ramp = torch.linspace(0, 1, _feather_px, device=device, dtype=blend_mask.dtype)
+            blend_mask[:_feather_px, :] *= _ramp[:, None]
+            blend_mask[-_feather_px:, :] *= _ramp.flip(0)[:, None]
+            blend_mask[:, :_feather_px] *= _ramp[None, :]
+            blend_mask[:, -_feather_px:] *= _ramp.flip(0)[None, :]
+
+        if cw < 1.0:"""
+if target in txt:
+    p.write_text(txt.replace(target, replacement), encoding="utf-8")
+else:
+    print("Warning: blend_buffer.py patch target not found. Perhaps it is already patched?")
+'
+
 # 增大 crop 边界使 blend_mask 渐变区完全包含在 crop 内
-patch -p1 -d "$JASNA_SRC" < /app/jasna/.drone/patches/fix_crop_border_expand.patch
+sed -i "s/BORDER_RATIO = 0.06/BORDER_RATIO = 0.10/g" jasna/crop_buffer.py
+sed -i "s/MIN_BORDER = 20/MIN_BORDER = 40/g" jasna/crop_buffer.py
 
 cd "$JASNA_SRC"
 WORKDIR=$(pwd)
@@ -48,8 +67,8 @@ except Exception:
     pass
 ' || true
 
-echo ">>> 4. 安装 Jasna 自身依赖..."
-pip install --no-cache-dir --no-build-isolation \
+echo ">>> 4. 安装 Jasna 自身 (仅代码，依赖已由 Builder 镜像缓存)..."
+pip install --no-cache-dir --no-build-isolation --no-deps \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     --extra-index-url https://pypi.nvidia.com \
     .
