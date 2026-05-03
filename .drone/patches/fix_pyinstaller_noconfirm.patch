@@ -1,0 +1,13 @@
+diff --git a/build_exe.py b/build_exe.py
+index 95aae5a..6b79e37 100644
+--- a/build_exe.py
++++ b/build_exe.py
+@@ -8,7 +8,7 @@ import zipfile
+ 
+ distpath = "dist_linux" if os.name != "nt" else "dist"
+ env = os.environ.copy()
+-subprocess.run([sys.executable, "-m", "PyInstaller", "--distpath", distpath, "jasna.spec"], check=True, env=env)
++subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--distpath", distpath, "jasna.spec"], check=True, env=env)
+ if os.name == "nt":
+     env["BUILD_CLI"] = "1"
+     subprocess.run([sys.executable, "-m", "PyInstaller", "--distpath", distpath, "jasna.spec"], check=True, env=env)

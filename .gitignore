@@ -64,3 +64,5 @@ CLAUDE.md
 model_weights/
 
 /.pip_cache
+*.orig
+*.rej
