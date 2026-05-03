@@ -64,8 +64,12 @@ RUN pip install --no-cache-dir mmengine==0.10.7 && \
     < /tmp/fix_loading_mmengine_weights_on_torch26_and_higher.diff || true && \
     rm -f /tmp/fix_loading_mmengine_weights_on_torch26_and_higher.diff
 
-# 安装构建相关的辅助依赖
-RUN pip install --no-cache-dir pyinstaller psutil cffi cryptography && \
+# 安装构建相关的辅助依赖与应用运行依赖 (缓存到镜像，避免每次 build.sh 重新下载几百兆文件)
+RUN pip install --no-cache-dir \
+    pyinstaller cffi cryptography \
+    "av>=16.1.0" numpy psutil "transformers<5" \
+    opencv-python tqdm customtkinter tkinterdnd2 ultralytics nvidia-vfx \
+    --extra-index-url https://pypi.nvidia.com && \
     echo "/usr/local/lib/python3.13/site-packages/nvidia/nccl/lib" > /etc/ld.so.conf.d/nccl-pip.conf && \
     echo "/usr/local/lib/python3.13/site-packages/torch/lib" > /etc/ld.so.conf.d/torch.conf && \
     ldconfig

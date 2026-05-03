@@ -140,6 +140,16 @@ class BlendBuffer:
 
         blend_mask = self.blend_mask_fn(mask_lr, (x1, y1, x2, y2), sr.frame_shape)
 
+        # Edge feathering: prevent hard blend cutoff at crop boundary
+        _feather_px = max(8, round(frame_h * 0.06))
+        _bh, _bw = blend_mask.shape
+        if _bh > 2 * _feather_px and _bw > 2 * _feather_px:
+            _ramp = torch.linspace(0, 1, _feather_px, device=device, dtype=blend_mask.dtype)
+            blend_mask[:_feather_px, :] *= _ramp[:, None]
+            blend_mask[-_feather_px:, :] *= _ramp.flip(0)[:, None]
+            blend_mask[:, :_feather_px] *= _ramp[None, :]
+            blend_mask[:, -_feather_px:] *= _ramp.flip(0)[None, :]
+
         if cw < 1.0:
             blend_mask = blend_mask * cw
             original_crop = original[:, y1:y2, x1:x2].float()
