@@ -1,6 +1,9 @@
 name: jasna
 
 on:
+  push:
+    branches:
+      - v0.6.0-alpha5
   workflow_run:
     workflows: ["jasna-build"]
     types:
