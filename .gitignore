@@ -54,3 +54,5 @@ jasna/settings.json
 *.pt
 *.pth
 model_weights/
+
+/.pip_cache

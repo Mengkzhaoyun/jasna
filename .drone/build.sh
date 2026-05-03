@@ -67,8 +67,15 @@ except Exception:
     pass
 ' || true
 
-echo ">>> 4. 安装 Jasna 自身 (仅代码，依赖已由 Builder 镜像缓存)..."
-pip install --no-cache-dir --no-build-isolation --no-deps \
+echo ">>> 4. 安装 Jasna 自身依赖 (使用宿主机的 .venv 进行缓存)..."
+VENV_DIR="/app/jasna/.venv"
+if [ ! -d "$VENV_DIR" ]; then
+    echo ">>> 创建虚拟环境以缓存依赖包..."
+    python3.13 -m venv --system-site-packages "$VENV_DIR"
+fi
+source "$VENV_DIR/bin/activate"
+
+pip install --cache-dir /app/jasna/.pip_cache --no-build-isolation \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     --extra-index-url https://pypi.nvidia.com \
     .
