@@ -13,13 +13,13 @@ git merge v0.6.0-alpha5
 ```powershell
 # 触发 v0.6.0-alpha5 构建
 git checkout v0.6.0-alpha5 ;`
-  git merge dev --ff-only ;`
+  git merge main --ff-only ;`
   git push origin v0.6.0-alpha5 ;`
-  git checkout dev
+  git checkout main
 
 # 触发 build 构建
 git checkout build ;`
-  git merge dev --ff-only ;`
+  git merge main --ff-only ;`
   git push origin build ;`
-  git checkout dev
+  git checkout main
 ```
