@@ -31,6 +31,7 @@ git checkout build ;`
 docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
 
 # 2. 本地测试编译流程 (挂载当前代码并执行 build.sh)
+docker pull ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build ; `
 docker run --rm -it `
   -v "${PWD}:/app/jasna" `
   -w /app/jasna `
