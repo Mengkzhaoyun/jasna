@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - build
-  workflow_dispatch:
 
 env:
   BUILD_VERSION: "13.0.3"

@@ -4,11 +4,6 @@ on:
   push:
     branches:
       - v0.6.0-alpha5
-  workflow_run:
-    workflows: ["jasna-build"]
-    types:
-      - completed
-  workflow_dispatch:
 
 env:
   BUILD_VERSION: "13.0.3"
@@ -20,9 +15,6 @@ jobs:
   jasna-runtime:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    permissions:
-      packages: read
 
     steps:
       - name: Free Disk Space
