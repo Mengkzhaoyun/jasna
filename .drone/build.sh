@@ -18,6 +18,11 @@ cp -a /app/jasna "$JASNA_SRC"
 sed -i 's/if wrong_version:/if False:/g' "$JASNA_SRC/jasna/os_utils.py"
 
 echo ">>> 2. 应用修复补丁..."
+# 统一转换为 LF，避免 Windows git 带来的 CRLF 导致 patch 失败
+sed -i 's/\r$//' /app/jasna/.drone/patches/*.patch
+sed -i 's/\r$//' "$JASNA_SRC/jasna/blend_buffer.py"
+sed -i 's/\r$//' "$JASNA_SRC/jasna/cli_video_restoration.py"
+
 # 修复 blend_mask 在 crop 边界硬截断导致的正方形伪影
 patch -p1 -d "$JASNA_SRC" < /app/jasna/.drone/patches/fix_blend_edge_feather.patch
 # 增大 crop 边界使 blend_mask 渐变区完全包含在 crop 内
