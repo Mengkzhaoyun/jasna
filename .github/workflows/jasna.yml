@@ -14,7 +14,7 @@ env:
   BUILD_VERSION: "13.0.3"
   JASNA_VERSION: "v0.6.0-alpha5"
   ALIYUN_IMAGE_NAME: registry.cn-qingdao.aliyuncs.com/wod/cuda
-  GHCR_IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/jasna
+  GHCR_IMAGE_NAME: ghcr.io/mengkzhaoyun/jasna
 
 jobs:
   jasna-runtime:

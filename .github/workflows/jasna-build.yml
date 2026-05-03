@@ -9,7 +9,7 @@ on:
 env:
   BUILD_VERSION: "13.0.3"
   JASNA_VERSION: "v0.6.0-alpha5"
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/jasna
+  IMAGE_NAME: ghcr.io/mengkzhaoyun/jasna
 
 jobs:
   build-builder:
