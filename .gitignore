@@ -63,6 +63,7 @@ CLAUDE.md
 *.pth
 model_weights/
 
+/.tmp
 /.pip_cache
 *.orig
 *.rej
