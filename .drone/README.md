@@ -38,3 +38,22 @@ docker run --rm -it `
   ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build `
   bash .drone/build.sh
 ```
+
+## Hot Update
+
+```powershell
+# 1. 本地编译 (产物在 dist_linux/jasna/)
+docker pull ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build ; `
+docker run --rm -it `
+  -v "${PWD}:/app/jasna" `
+  -w /app/jasna `
+  ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build `
+  bash .drone/build.sh
+
+# 2. 推送到服务器
+scp -r dist_linux/jasna/ root@SERVER:/tmp/jasna_hotfix/
+
+# 3. 热替换进运行中的容器
+docker cp /tmp/jasna_hotfix/. jasna:/app/jasna/
+docker restart jasna
+```

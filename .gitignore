@@ -56,3 +56,5 @@ jasna/settings.json
 model_weights/
 
 /.pip_cache
+*.orig
+*.rej
