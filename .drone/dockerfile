@@ -1,0 +1,54 @@
+# ============================================================
+# Runtime — 精简运行环境
+# ============================================================
+ARG BASE=nvidia/cuda:13.0.3-runtime-ubuntu24.04
+FROM ${BASE}
+
+ARG AUTHOR
+ARG VERSION
+LABEL maintainer=${AUTHOR} version=${VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+ENV PYTHONUNBUFFERED=1
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV SCAN_DIR=/data
+ENV CODEC=hevc
+ENV ENCODER_CQ=20
+ENV EXTRA_ARGS=
+ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
+
+# 仅安装运行时依赖 (无 Python 与构建工具)
+RUN sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true && \
+    sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true && \
+    sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true && \
+    apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates software-properties-common \
+    # 多媒体
+    ffmpeg mkvtoolnix \
+    # 显示 / 渲染
+    libgl1 libglib2.0-0 libdrm2 libx11-6 \
+    # VA-API
+    libva2 libva-drm2 libva-x11-2 \
+    # 图像 / 图形 / XML
+    libxml2 librsvg2-2 libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 修复 Runtime 镜像缺少 libnpp*.so 软链接的问题
+RUN for f in /usr/local/cuda/lib64/libnpp*.so.13; do ln -s "$f" "${f%.13}" 2>/dev/null || true; done
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# 从外部宿主机复制被提取出来的打包编译产物
+COPY ./dist_jasna /app/jasna
+
+WORKDIR /app/jasna
+
+# 模型权重目录
+RUN mkdir -p /app/jasna/model_weights
+
+# 入口脚本
+COPY .drone/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["entrypoint.sh"]

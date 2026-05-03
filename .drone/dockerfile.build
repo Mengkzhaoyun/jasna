@@ -1,0 +1,72 @@
+# ============================================================
+# Builder 环境镜像 — 预装所有编译依赖 (PyTorch/TensorRT/vali 等)
+# 实际编译由 build.sh 在运行时完成
+# ============================================================
+ARG BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04
+FROM ${BASE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+ENV NVIDIA_DRIVER_CAPABILITIES=all
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/python3.13/site-packages/nvidia/nccl/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
+
+# 构建工具 + 开发库
+RUN apt-get update && apt-get install -y --allow-change-held-packages --no-install-recommends \
+    ca-certificates curl wget git \
+    software-properties-common \
+    cmake ninja-build upx-ucl \
+    libavformat-dev libavcodec-dev libavutil-dev \
+    libswscale-dev libswresample-dev \
+    libgl1 libglib2.0-0 \
+    libnccl2=2.28.9-1+cuda13.0 libnccl-dev=2.28.9-1+cuda13.0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装预编译的 Python 3.13 (极速且绕过 PPA 避免网络问题)
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -fsSL https://github.com/actions/python-versions/releases/download/3.13.2-13708744326/python-3.13.2-linux-24.04-x64.tar.gz | tar -xz -C /usr/local && \
+    rm -rf /var/lib/apt/lists/* && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/local/bin/python3.13 1 && \
+    update-alternatives --install /usr/bin/python python /usr/local/bin/python3.13 1
+
+# pip
+RUN curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3.13 && \
+    python3.13 -m pip install --no-cache-dir "setuptools<70" wheel scikit-build wheel-stub
+
+WORKDIR /app/jasna
+
+# PyTorch + TorchVision (cu130) + 显式安装 nvidia-nccl (PyTorch index 专有包)
+RUN pip install --no-cache-dir \
+    torch==2.10.0+cu130 torchvision==0.25.0+cu130 \
+    nvidia-nccl-cu13==2.28.9 \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+
+# TensorRT (显式锁定 torch cu130 版本，防止 pip 从公网覆盖)
+RUN pip install --no-cache-dir \
+    tensorrt==10.14.1.48.post1 \
+    torch-tensorrt==2.10.0 \
+    torch==2.10.0+cu130 \
+    --extra-index-url https://download.pytorch.org/whl/cu130
+
+# 自定义依赖: vali (GPU 视频解码) + PyNvVideoCodec (锁定特定 commit 以保证构建稳定性)
+RUN cd /tmp && \
+    git clone --recursive https://codeberg.org/Kruk2/vali.git && \
+    cd vali && git checkout 7e094ef584200b40da97b97b3c2175593a9c987a && cd .. && \
+    git clone https://codeberg.org/Kruk2/PyNvVideoCodec.git && \
+    cd PyNvVideoCodec && git checkout 395a6aa67e3c1db4c84cbd5294ae5d309b22c7c9 && cd .. && \
+    pip install --no-cache-dir --no-build-isolation ./vali ./PyNvVideoCodec && \
+    rm -rf /tmp/vali /tmp/PyNvVideoCodec
+
+# mmengine (含 torch 2.6+ 兼容补丁)
+COPY patches/fix_loading_mmengine_weights_on_torch26_and_higher.diff /tmp/
+RUN pip install --no-cache-dir mmengine==0.10.7 && \
+    MMENGINE_BASE=$(python3.13 -c "import mmengine, os; print(os.path.dirname(os.path.dirname(mmengine.__file__)))") && \
+    patch -p1 -d "$MMENGINE_BASE" \
+    < /tmp/fix_loading_mmengine_weights_on_torch26_and_higher.diff || true && \
+    rm -f /tmp/fix_loading_mmengine_weights_on_torch26_and_higher.diff
+
+# 安装构建相关的辅助依赖
+RUN pip install --no-cache-dir pyinstaller psutil cffi cryptography && \
+    echo "/usr/local/lib/python3.13/site-packages/nvidia/nccl/lib" > /etc/ld.so.conf.d/nccl-pip.conf && \
+    echo "/usr/local/lib/python3.13/site-packages/torch/lib" > /etc/ld.so.conf.d/torch.conf && \
+    ldconfig
+
