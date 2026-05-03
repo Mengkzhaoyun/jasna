@@ -3,7 +3,7 @@ name: jasna
 on:
   push:
     branches:
-      - v0.6.0-alpha5
+      - release
 
 env:
   BUILD_VERSION: "13.0.3"
