@@ -70,7 +70,6 @@ docker run --name sglang \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -e CUDA_VISIBLE_DEVICES=0 \
   --gpus all \
-  -e EXTRA_ARGS="--batch-size 4 --max-clip-size 150 --temporal-overlap 16 --enable-crossfade --denoise low --detection-score-threshold 0.25 --fp16 --compile-basicvsrpp --log-level info" \
   -v /nas/sglang/model_weights:/app/sglang/model_weights \
   -v /nas/sglang/sglang:/app/sglang/sglang \
   -v /nas/sglang/ai:/data \
