@@ -5,15 +5,15 @@ set -e
 # Jasna Docker Entrypoint
 #
 # 用法:
-#   jasna                              # 自动扫描 /data 批量处理
-#   jasna --input ... --output ...     # 正常处理视频
-#   jasna --stream                     # 流媒体模式
-#   jasna warmup [选项]                # 预编译 TensorRT 引擎
+#   sglang                              # 自动扫描 /data 批量处理
+#   sglang --input ... --output ...     # 正常处理视频
+#   sglang --stream                     # 流媒体模式
+#   sglang warmup [选项]                # 预编译 TensorRT 引擎
 #
 # 环境变量 (批量模式):
 #   SCAN_DIR       扫描目录 (默认: /data)
 #   CODEC          编码器 (默认: hevc, 可选: av1, h264)
-#   EXTRA_ARGS     传给 jasna 的额外参数
+#   EXTRA_ARGS     传给 sglang 的额外参数
 # ============================================================
 
 # 支持的视频扩展名
@@ -30,7 +30,7 @@ if [ "$1" = "warmup" ]; then
     DETECTION_MODEL_PATH="${DETECTION_MODEL_PATH:-model_weights/${DETECTION_MODEL}.onnx}"
 
     echo "============================================"
-    echo " Jasna TensorRT Engine Warmup"
+    echo " sglang TensorRT Engine Warmup"
     echo "============================================"
     echo " Clip Size:         ${CLIP_SIZE}"
     echo " Batch Size:        ${BATCH_SIZE}"
@@ -57,7 +57,7 @@ if [ "$1" = "warmup" ]; then
 }
 EOF
 )
-    /app/jasna/jasna --compile-engines "$JSON_DATA"
+    /app/sglang/sglang --compile-engines "$JSON_DATA"
 
     echo ""
     echo "============================================"
@@ -66,9 +66,9 @@ EOF
     exit 0
 fi
 
-# ---- 带参数时直接透传给 jasna ----
+# ---- 带参数时直接透传给 sglang ----
 if [ $# -gt 0 ]; then
-    exec /app/jasna/jasna --disable-ffmpeg-check --encoder-settings "cq=${ENCODER_CQ:-22}" "$@"
+    exec /app/sglang/sglang --disable-ffmpeg-check --encoder-settings "cq=${ENCODER_CQ:-22}" "$@"
 fi
 
 # ---- 无参数: 批量扫描模式 ----
@@ -77,7 +77,7 @@ CODEC="${CODEC:-hevc}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 echo "============================================"
-echo " Jasna 批量处理模式"
+echo " sglang 批量处理模式"
 echo "============================================"
 echo " 扫描目录: ${SCAN_DIR}"
 echo " 编码器:   ${CODEC}"
@@ -160,7 +160,7 @@ for i in "${!TASKS[@]}"; do
     fi
     echo "============================================"
 
-    if /app/jasna/jasna \
+    if /app/sglang/sglang \
         --disable-ffmpeg-check \
         --codec "$CODEC" \
         --encoder-settings "cq=${ENCODER_CQ:-20}" \
