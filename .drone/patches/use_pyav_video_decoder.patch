@@ -1,6 +1,3 @@
-﻿diff --git a/.drone/patches/use_pyav_video_decoder.patch b/.drone/patches/use_pyav_video_decoder.patch
-index f21c23b..e69de29 100644
-Binary files a/.drone/patches/use_pyav_video_decoder.patch and b/.drone/patches/use_pyav_video_decoder.patch differ
 diff --git a/jasna/media/video_decoder.py b/jasna/media/video_decoder.py
 index 3097126..7af6d65 100644
 --- a/jasna/media/video_decoder.py
