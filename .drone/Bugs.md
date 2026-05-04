@@ -63,8 +63,19 @@ GUI 能够完美运行（无漂浮、无闪烁），是因为它使用了默认�
 **漂浮感产生的原因：**
 当追踪框因为物体的细微运动或网络检测产生即使是 1-2 像素的抖动时，被强行扩大的半透明羽化层就会在原视频背景上产生相对滑动。这种视觉差就是“马赛克像是一张皮浮在脸上”的根本原因。
 
-**解决方案（对齐 GUI）：**
+**原计划解决方案（对齐 GUI）：**
 
 1. 删除 `.drone/patches/fix_blend_ratio_increase.patch`，恢复硬边缘融合。
 2. 修改 `.drone/patches/fix_crop_border_expand.patch`，严格对齐 GUI 反编译得出的参数：`BORDER_RATIO = 0.06`，`MIN_BORDER = 20`。
-   保留 PTS 乱序修复补丁，以双重保障底层时间戳的时序正确。
+3. 原本计划保留 PTS 乱序修复补丁（方案 B）。
+
+## 最终修复与验证总结 (Final Resolution)
+
+经过实机测试验证，**漂浮感已彻底消失，边缘闪烁问题得到完美解决！** 最终在代码库中实际落实并经得起考验的 Patch 组合策略如下：
+
+1. **彻底解决硬件解码 Bug (落实方案 A)**
+   抛弃了不稳定的 `NvidiaVideoReader` 和方案 B 的复杂手动重排机制，新增了 `.drone/patches/use_pyav_video_decoder.patch`。通过 PyAV 实现纯净的 CPU 解码流，天然支持严谨的 PTS 排序。同时删除了多余的 `fix_pts_reordering.patch`。
+2. **解决视觉漂浮感 (落实方案 C)**
+   移除了早期的羽化实验补丁，并将 `.drone/patches/fix_crop_border_expand.patch` 严格对齐至 GUI 反编译参数 (`0.06` 和 `20`)。
+
+**结论**：CLI (Linux Docker) 的表现已经与 GUI (Windows) 完全对齐，核心原因确认为：**底层时序崩坏 (NVDEC B-frame) + 渲染边距过大 (Patch 漂移)** 共同引发了早期的毁灭性伪影。遵循“保持源码纯净，走 Patch 工作流”的规范，所有修复均已固化在 `.drone/patches/` 构建流中，此恶性 Bug 宣告完结！
