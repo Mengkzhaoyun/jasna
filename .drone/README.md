@@ -51,11 +51,11 @@ docker run --rm -it `
   bash .drone/build.sh
 
 # 2. 推送到服务器
-scp -r dist_linux/jasna/ root@SERVER:/tmp/jasna_hotfix/
+scp -r dist_linux/jasna/ root@SERVER:/tmp/sglang_hotfix/
 
 # 3. 热替换进运行中的容器
-docker cp /tmp/jasna_hotfix/. jasna:/app/jasna/
-docker restart jasna
+docker cp /tmp/sglang_hotfix/. sglang:/app/sglang/
+docker restart sglang
 ```
 
 ## Production Deployment (RTX 4090 Recommended)
@@ -63,18 +63,18 @@ docker restart jasna
 对于配备 RTX 4090 (24GB VRAM) 的生产环境，建议使用以下启动命令以充分榨干算力并实现极限画质：
 
 ```bash
-docker rm -f jasna || true && \
-docker pull registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.6.0-alpha5 && \
-docker run --name jasna \
+docker rm -f sglang || true && \
+docker pull registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.6.0-alpha5 && \
+docker run --name sglang \
   -it --rm \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -e CUDA_VISIBLE_DEVICES=0 \
   --gpus all \
   -e EXTRA_ARGS="--batch-size 4 --max-clip-size 150 --temporal-overlap 16 --enable-crossfade --denoise low --detection-score-threshold 0.25 --fp16 --compile-basicvsrpp --log-level info" \
-  -v /nas/jasna/model_weights:/app/jasna/model_weights \
-  -v /nas/jasna/jasna:/app/jasna/jasna \
-  -v /nas/jasna/ai:/data \
-  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.6.0-alpha5
+  -v /nas/sglang/model_weights:/app/sglang/model_weights \
+  -v /nas/sglang/sglang:/app/sglang/sglang \
+  -v /nas/sglang/ai:/data \
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.6.0-alpha5
 ```
 
 ### 核心参数优化说明：
