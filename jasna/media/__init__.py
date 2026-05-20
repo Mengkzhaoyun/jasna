@@ -22,6 +22,7 @@ SUPPORTED_ENCODER_SETTINGS: frozenset[str] = frozenset(
         "cq",
         "qmin",
         "qmax",
+        "bitrate",
         "nonrefp",
         "gop",
         "maxbitrate",
@@ -33,6 +34,10 @@ SUPPORTED_ENCODER_SETTINGS: frozenset[str] = frozenset(
         "aq",
         "initqp",
         "tflevel",
+        "bf",
+        "bref",
+        "profile",
+        "multipass",
     }
 )
 
