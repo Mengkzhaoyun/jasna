@@ -20,7 +20,9 @@ set -e
 #   FP16                       (默认: true)
 #   COMPILE_BASICVSRPP         (默认: true)
 #   LOG_LEVEL                  (默认: info)
-#   POST_COMPRESS_BITRATE      (默认: 5M) 若设置则在处理后使用 FFmpeg 二次压缩
+#   TARGET_BITRATE             (默认: 5M) 直接传给 Jasna NVENC，一阶段输出目标码率
+#   SKIP_LOW_BITRATE           (默认: true) 输入视频码率 <= TARGET_BITRATE 时跳过
+#   POST_COMPRESS_BITRATE      (默认: 空) 若设置则额外使用 FFmpeg 二次压缩
 #   SCAN_DIR                   扫描目录 (默认: /data)
 #   CODEC                      编码器 (默认: hevc, 可选: av1, h264)
 #   EXTRA_ARGS                 传给 sglang 的额外参数
@@ -28,6 +30,56 @@ set -e
 
 # 支持的视频扩展名
 VIDEO_EXTS="mp4 mkv avi mov wmv flv webm ts"
+
+bitrate_to_kbps() {
+	local value="${1:-}"
+	value="${value// /}"
+	if [ -z "$value" ]; then
+		return 1
+	fi
+
+	case "$value" in
+		*[Mm])
+			echo "$(( ${value%[Mm]} * 1000 ))"
+			;;
+		*[Kk])
+			echo "${value%[Kk]}"
+			;;
+		*)
+			echo "$value"
+			;;
+	esac
+}
+
+build_encoder_settings() {
+	local target_bitrate="${TARGET_BITRATE:-5M}"
+	local target_kbps
+	target_kbps="$(bitrate_to_kbps "$target_bitrate")"
+
+	if [ -n "${ENCODER_SETTINGS:-}" ]; then
+		echo "$ENCODER_SETTINGS"
+	elif [ -n "$target_kbps" ]; then
+		echo "rc=vbr,maxbitrate=${target_kbps},vbvbufsize=${target_kbps},cq=${ENCODER_CQ:-20},gop=${ENCODER_GOP:-60}"
+	else
+		echo "cq=${ENCODER_CQ:-20}"
+	fi
+}
+
+probe_video_bitrate_kbps() {
+	local file="$1"
+	local bitrate=""
+
+	bitrate="$(ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -n 1 || true)"
+	if [ -z "$bitrate" ] || [ "$bitrate" = "N/A" ]; then
+		bitrate="$(ffprobe -v error -show_entries format=bit_rate -of default=noprint_wrappers=1:nokey=1 "$file" 2>/dev/null | head -n 1 || true)"
+	fi
+
+	if [ -z "$bitrate" ] || [ "$bitrate" = "N/A" ]; then
+		return 1
+	fi
+
+	echo "$(( (bitrate + 999) / 1000 ))"
+}
 
 # ---- warmup 子命令 ----
 if [ "$1" = "warmup" ]; then
@@ -79,7 +131,7 @@ fi
 
 # ---- 带参数时直接透传给 sglang ----
 if [ $# -gt 0 ]; then
-	exec /app/sglang/sglang --disable-ffmpeg-check --encoder-settings "cq=${ENCODER_CQ:-22}" "$@"
+	exec /app/sglang/sglang --disable-ffmpeg-check --encoder-settings "$(build_encoder_settings)" "$@"
 fi
 
 # ---- 无参数: 批量扫描模式 ----
@@ -96,7 +148,11 @@ DETECTION_SCORE_THRESHOLD="${DETECTION_SCORE_THRESHOLD:-0.25}"
 FP16="${FP16:-true}"
 COMPILE_BASICVSRPP="${COMPILE_BASICVSRPP:-true}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
-POST_COMPRESS_BITRATE="${POST_COMPRESS_BITRATE:-5M}"
+TARGET_BITRATE="${TARGET_BITRATE:-5M}"
+TARGET_BITRATE_KBPS="$(bitrate_to_kbps "$TARGET_BITRATE")"
+SKIP_LOW_BITRATE="${SKIP_LOW_BITRATE:-true}"
+ENCODER_SETTINGS="$(build_encoder_settings)"
+POST_COMPRESS_BITRATE="${POST_COMPRESS_BITRATE:-}"
 
 JASNA_OPTS=""
 [ -n "$BATCH_SIZE" ] && JASNA_OPTS="$JASNA_OPTS --batch-size $BATCH_SIZE"
@@ -114,6 +170,13 @@ echo " sglang 批量处理模式"
 echo "============================================"
 echo " 扫描目录: ${SCAN_DIR}"
 echo " 编码器:   ${CODEC}"
+echo " NVENC:    ${ENCODER_SETTINGS}"
+if [ "$SKIP_LOW_BITRATE" = "true" ] && [ -n "$TARGET_BITRATE_KBPS" ]; then
+	echo " 低码率跳过: <= ${TARGET_BITRATE_KBPS} kbps"
+fi
+if [ -n "$POST_COMPRESS_BITRATE" ]; then
+	echo " 后压缩:   ${POST_COMPRESS_BITRATE}"
+fi
 if [ -n "$EXTRA_ARGS" ]; then
 	echo " 额外参数: ${EXTRA_ARGS}"
 fi
@@ -154,6 +217,14 @@ while IFS= read -r -d '' filepath; do
 		continue
 	fi
 
+	if [ "$SKIP_LOW_BITRATE" = "true" ] && [ -n "$TARGET_BITRATE_KBPS" ]; then
+		input_bitrate_kbps="$(probe_video_bitrate_kbps "$filepath" || true)"
+		if [ -n "$input_bitrate_kbps" ] && [ "$input_bitrate_kbps" -le "$TARGET_BITRATE_KBPS" ]; then
+			echo "[跳过] 输入码率 ${input_bitrate_kbps} kbps <= 目标 ${TARGET_BITRATE_KBPS} kbps: ${filepath}"
+			continue
+		fi
+	fi
+
 	TASKS+=("${filepath}|${output}")
 done < <(find "$SCAN_DIR" -type f \( "${FIND_ARGS[@]}" \) -print0 | sort -z)
 
@@ -188,6 +259,7 @@ for i in "${!TASKS[@]}"; do
 	echo " 输入: ${input}"
 	echo " 输出: ${output}"
 	echo " 编码: ${CODEC}"
+	echo " NVENC: ${ENCODER_SETTINGS}"
 	if [ -n "$EXTRA_ARGS" ]; then
 		echo " 额外参数: ${EXTRA_ARGS}"
 	fi
@@ -196,7 +268,7 @@ for i in "${!TASKS[@]}"; do
 	if /app/sglang/sglang \
 		--disable-ffmpeg-check \
 		--codec "$CODEC" \
-		--encoder-settings "${ENCODER_SETTINGS:-cq=${ENCODER_CQ:-20}}" \
+		--encoder-settings "$ENCODER_SETTINGS" \
 		--input "$input" \
 		--output "$output" \
 		$JASNA_OPTS \

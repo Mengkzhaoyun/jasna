@@ -8,7 +8,7 @@ git fetch upstream
 git merge v0.6.0
 ```
 
-## jasna
+## CI/CD
 
 ```powershell
 # 触发 release 构建
@@ -42,7 +42,12 @@ docker run --rm -it `
 ## Hot Update
 
 ```powershell
-# 1. 本地编译 (产物在 dist_linux/jasna/)
+# 快速热更新源码和 entrypoint:
+#   本地 jasna/              -> /data/jasna/src/jasna              -> 容器 /app/sglang/jasna
+#   本地 .drone/entrypoint.sh -> /data/jasna/src/entrypoint.sh      -> 容器 /usr/local/bin/entrypoint.sh
+.\.tmp\hot-update.ps1
+
+# 如果改了 Python 代码，先本地编译 (产物在 dist_linux/jasna/)
 docker pull ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build ; `
 docker run --rm -it `
   -v "${PWD}:/app/jasna" `
@@ -50,12 +55,8 @@ docker run --rm -it `
   ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build `
   bash .drone/build.sh
 
-# 2. 推送到服务器
-scp -r dist_linux/jasna/ root@SERVER:/tmp/sglang_hotfix/
-
-# 3. 热替换进运行中的容器
-docker cp /tmp/sglang_hotfix/. sglang:/app/sglang/
-docker restart sglang
+# 编译产物热替换进运行中的 jasna 容器
+.\.tmp\hot-update.ps1 -Dist
 ```
 
 ## Production Deployment (RTX 4090 Recommended)
@@ -69,6 +70,7 @@ docker run --name sglang \
   -it --rm \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -e CUDA_VISIBLE_DEVICES=0 \
+  -e TARGET_BITRATE=5M \
   --gpus all \
   -v /nas/sglang/model_weights:/app/sglang/model_weights \
   -v /nas/sglang/sglang:/app/sglang/sglang \
@@ -76,11 +78,29 @@ docker run --name sglang \
   registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.6.0-alpha5
 ```
 
-### 核心参数优化说明：
+### 核心参数优化说明
 
 - `--max-clip-size 150`: 大幅增加 BasicVSR++ 的时序上下文窗口（默认90），让模型能参考更多连续帧，极大提升视频一致性和极限画质。4090 的 24GB 显存完美吃下此参数。
 - `--temporal-overlap 16`: 配合更长的 clip 增加重叠区，配合 crossfade 实现完美丝滑的拼接过渡。
 - `--denoise low`: 开启轻度空间降噪，抹除模型生成的极其细微的杂色噪点，且不损失 4090 跑出的高清纹理细节。
+- `TARGET_BITRATE=5M`: 直接把 5M 目标码率传给 Jasna 内部 PyNvVideoCodec/NVENC，避免先输出高码率文件再用 FFmpeg 二次转码。
+- `SKIP_LOW_BITRATE=true`: 批量扫描时先读取输入视频码率，若输入视频码率已经小于等于 `TARGET_BITRATE`，直接跳过，避免重编码把小文件放大。
+
+### 编码流水线说明
+
+当前镜像默认采用单阶段处理：
+
+```text
+PyAV 解码(PTS 稳定) -> Jasna CUDA/BasicVSR++ 去马赛克 -> PyNvVideoCodec/NVENC 5M 输出 -> 音频/元数据 remux
+```
+
+之前的 `POST_COMPRESS_BITRATE=5M` 是二阶段方案：
+
+```text
+Jasna 输出 -> FFmpeg 重新解码整片 -> hevc_nvenc 二次压缩 -> 输出
+```
+
+这个二阶段会多一次完整视频读写和解码/编码调度，所以经常表现为总耗时很长、GPU 利用率低。现在默认关闭后压缩；只有显式设置 `POST_COMPRESS_BITRATE=5M` 时才会启用它作为兜底实验。
 
 ## Video2X (480p/720p 视频增强)
 
