@@ -84,7 +84,8 @@ docker run --name sglang \
 - `--temporal-overlap 16`: 配合更长的 clip 增加重叠区，配合 crossfade 实现完美丝滑的拼接过渡。
 - `--denoise low`: 开启轻度空间降噪，抹除模型生成的极其细微的杂色噪点，且不损失 4090 跑出的高清纹理细节。
 - `TARGET_BITRATE=5M`: 直接把 5M 目标码率传给 Jasna 内部 PyNvVideoCodec/NVENC，避免先输出高码率文件再用 FFmpeg 二次转码。
-- `SKIP_LOW_BITRATE=true`: 批量扫描时先读取输入视频码率，若输入视频码率已经小于等于 `TARGET_BITRATE`，直接跳过，避免重编码把小文件放大。
+- `PRESERVE_LOW_BITRATE=true`: 批量扫描时先读取输入视频码率，若输入视频码率已经小于等于 `TARGET_BITRATE`，仍正常处理视频，但改用不限码率上限的 NVENC 设置，避免重编码把小文件压到 5M。旧的 `SKIP_LOW_BITRATE` 变量仍兼容，但语义已变为低码率不压缩。
+- `LOW_BITRATE_ENCODER_SETTINGS=...`: 可覆盖低码率输入使用的 NVENC 设置；默认是 `rc=vbr,maxbitrate=0,vbvbufsize=0,cq=20,gop=60`。
 
 ### 编码流水线说明
 
