@@ -2,6 +2,8 @@
 
 ## git
 
+<https://github.com/Kruk2/jasna>
+
 ```bash
 git remote add upstream git@github.com:Kruk2/jasna.git
 git fetch upstream

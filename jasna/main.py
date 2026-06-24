@@ -320,7 +320,7 @@ def main() -> None:
     if input_video is not None and not input_video.exists():
         raise FileNotFoundError(str(input_video))
 
-    output_video = Path(args.output) if args.output else (input_video.with_stem(input_video.stem + "_out") if input_video else None)
+    output_video = Path(args.output) if args.output else (input_video.with_name(input_video.stem + "_out.mp4") if input_video else None)
 
     from jasna.mosaic.detection_registry import coerce_detection_model_name, detection_model_weights_path, discover_available_detection_models
 
@@ -441,7 +441,7 @@ def main() -> None:
         def _make_pipeline(vid_input: Path) -> Pipeline:
             return Pipeline(
                 input_video=vid_input,
-                output_video=output_video or vid_input.with_stem(vid_input.stem + "_out"),
+                output_video=output_video or vid_input.with_name(vid_input.stem + "_out.mp4"),
                 detection_model_name=detection_model_name,
                 detection_model_path=detection_model_path,
                 detection_score_threshold=detection_score_threshold,
