@@ -192,7 +192,7 @@ class TestOutputPath:
                 from jasna.main import main
                 main()
 
-        assert pipeline_kwargs["output_video"] == inp.with_stem(inp.stem + "_out")
+        assert pipeline_kwargs["output_video"] == inp.with_name(inp.stem + "_out.mp4")
 
 
 # ---------------------------------------------------------------------------
