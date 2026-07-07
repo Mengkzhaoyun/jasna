@@ -1,5 +1,5 @@
 # ============================================================
-# Builder 环境镜像 — 预装所有编译依赖 (PyTorch/TensorRT/vali 等)
+# Builder 环境镜像 — 预装所有编译依赖 (PyTorch/TensorRT/vali/Nuitka 等)
 # 实际编译由 build.sh 在运行时完成
 # ============================================================
 ARG BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04
@@ -14,7 +14,7 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib/python3.13/site-packages/nvidi
 RUN apt-get update && apt-get install -y --allow-change-held-packages --no-install-recommends \
     ca-certificates curl wget git \
     software-properties-common \
-    cmake ninja-build upx-ucl \
+    build-essential cmake ninja-build patchelf ccache upx-ucl \
     libavformat-dev libavcodec-dev libavutil-dev \
     libswscale-dev libswresample-dev \
     libgl1 libglib2.0-0 \
@@ -30,21 +30,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 
 # pip
 RUN curl -fsSL https://bootstrap.pypa.io/get-pip.py | python3.13 && \
-    python3.13 -m pip install --no-cache-dir "setuptools<70" wheel scikit-build wheel-stub
+    python3.13 -m pip install --no-cache-dir "setuptools>=70" wheel scikit-build wheel-stub
 
 WORKDIR /app/jasna
 
 # PyTorch + TorchVision (cu130) + 显式安装 nvidia-nccl (PyTorch index 专有包)
 RUN pip install --no-cache-dir \
-    torch==2.10.0+cu130 torchvision==0.25.0+cu130 \
-    nvidia-nccl-cu13==2.28.9 \
+    torch==2.12.0+cu130 torchvision==0.27.0+cu130 \
+    nvidia-nccl-cu13==2.29.7 \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
 # TensorRT (显式锁定 torch cu130 版本，防止 pip 从公网覆盖)
 RUN pip install --no-cache-dir \
-    tensorrt==10.14.1.48.post1 \
-    torch-tensorrt==2.10.0 \
-    torch==2.10.0+cu130 \
+    tensorrt==10.16.1.11 \
+    torch-tensorrt==2.12.0 \
+    torch==2.12.0+cu130 \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
 # 自定义依赖: vali (GPU 视频解码) + PyNvVideoCodec (锁定特定 commit 以保证构建稳定性)
@@ -66,11 +66,10 @@ RUN pip install --no-cache-dir mmengine==0.10.7 && \
 
 # 安装构建相关的辅助依赖与应用运行依赖 (缓存到镜像，避免每次 build.sh 重新下载几百兆文件)
 RUN pip install --no-cache-dir \
-    pyinstaller cffi cryptography \
-    "av>=16.1.0" numpy psutil "transformers<5" \
-    opencv-python tqdm customtkinter tkinterdnd2 ultralytics nvidia-vfx \
+    "nuitka>=2.4" cffi "cryptography>=42" \
+    "av>=16.1.0" numpy psutil diffusers accelerate huggingface-hub "transformers<5" \
+    opencv-python Pillow tqdm customtkinter tkinterdnd2 ultralytics nvidia-vfx onnx \
     --extra-index-url https://pypi.nvidia.com && \
     echo "/usr/local/lib/python3.13/site-packages/nvidia/nccl/lib" > /etc/ld.so.conf.d/nccl-pip.conf && \
     echo "/usr/local/lib/python3.13/site-packages/torch/lib" > /etc/ld.so.conf.d/torch.conf && \
     ldconfig
-

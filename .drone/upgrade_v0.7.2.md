@@ -1,8 +1,8 @@
 # 合并上游 v0.7.2 升级分析
 
-分析时间：2026-06-27  
-当前本地分支：`main` / `40a9275`  
-目标上游标签：`v0.7.2` / `278ab09`  
+分析时间：2026-06-27
+当前本地分支：`main` / `40a9275`
+目标上游标签：`v0.7.2` / `278ab09`
 上游远端：`upstream git@github.com:Kruk2/jasna.git`
 
 ## 结论
@@ -431,3 +431,25 @@ FAIL use_pyav_video_decoder.patch
 3. 重写或删除失效的 `.drone/patches/fix_pyinstaller_*` 和 `use_pyav_video_decoder.patch`。
 4. 决定 `fix_crop_border_expand.patch` 是否还需要保留，避免它反向抵消源码里的 `BORDER_RATIO=0.10` / `MIN_BORDER=40`。
 5. 清理 whitespace 后再跑 `git diff --check v0.7.2..HEAD`。
+
+## dev 分支收尾处理记录
+
+执行时间：2026-06-28
+
+已在 `dev` 工作区继续处理 `.drone` 构建链路：
+
+- `.drone/build.sh` 已从旧 `build_exe.py` / PyInstaller 流程切换为 Nuitka standalone 构建，产物仍规范化到 `dist_linux/jasna/`，以兼容现有 runtime Dockerfile 和 workflow。
+- `.drone/dockerfile.build` 已同步到 `v0.7.2` 的核心依赖版本：`torch==2.12.0+cu130`、`torchvision==0.27.0+cu130`、`tensorrt==10.16.1.11`、`torch-tensorrt==2.12.0`，并预装 `nuitka>=2.4`、`diffusers`、`accelerate`、`huggingface-hub`、`Pillow`、`onnx`、`cryptography>=42` 等新增依赖。
+- 旧的 `.drone/patches/*` 已删除。它们要么目标文件已不存在，要么会抵消当前源码中的 `BORDER_RATIO=0.10` / `MIN_BORDER=40`，要么已经被 CLI 参数和 v0.7.2 源码替代。
+- `.dockerignore` 已放行 `.drone/entrypoint.sh` 和 `dist_jasna/**`，否则 runtime 镜像构建时拿不到入口脚本和 Nuitka 产物。
+- `.github/workflows/*.yml` 和 `.drone/README.md` 的镜像版本已从 `v0.6.0-alpha5` 更新到 `v0.7.2`。
+- `jasna/protection` 子模块仍不是公开可访问仓库；`build.sh` 现在会优先尝试初始化子模块，失败时默认创建临时公共构建 stub。若构建环境必须包含真实 protection 模块，可设置 `REQUIRE_PROTECTION_SUBMODULE=1` 让构建失败退出。
+
+后续验证建议：
+
+```powershell
+git diff --check v0.7.2
+bash -n .drone/build.sh
+docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.7.2-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
+docker run --rm -v ${PWD}:/app/jasna -w /app/jasna ghcr.io/mengkzhaoyun/jasna:v0.7.2-build bash .drone/build.sh
+```

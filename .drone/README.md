@@ -7,7 +7,8 @@
 ```bash
 git remote add upstream git@github.com:Kruk2/jasna.git
 git fetch upstream
-git merge v0.6.0
+git switch dev
+git merge v0.7.2
 ```
 
 ## CI/CD
@@ -30,14 +31,14 @@ git checkout build ;`
 
 ```powershell
 # 1. 本地测试构建 builder 环境镜像
-docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
+docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.7.2-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
 
-# 2. 本地测试编译流程 (挂载当前代码并执行 build.sh)
-docker pull ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build ; `
+# 2. 本地测试 Nuitka 编译流程 (挂载当前代码并执行 build.sh)
+docker pull ghcr.io/mengkzhaoyun/jasna:v0.7.2-build ; `
 docker run --rm -it `
   -v "${PWD}:/app/jasna" `
   -w /app/jasna `
-  ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build `
+  ghcr.io/mengkzhaoyun/jasna:v0.7.2-build `
   bash .drone/build.sh
 ```
 
@@ -50,11 +51,11 @@ docker run --rm -it `
 .\.tmp\hot-update.ps1
 
 # 如果改了 Python 代码，先本地编译 (产物在 dist_linux/jasna/)
-docker pull ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build ; `
+docker pull ghcr.io/mengkzhaoyun/jasna:v0.7.2-build ; `
 docker run --rm -it `
   -v "${PWD}:/app/jasna" `
   -w /app/jasna `
-  ghcr.io/mengkzhaoyun/jasna:v0.6.0-alpha5-build `
+  ghcr.io/mengkzhaoyun/jasna:v0.7.2-build `
   bash .drone/build.sh
 
 # 编译产物热替换进运行中的 jasna 容器
@@ -67,7 +68,7 @@ docker run --rm -it `
 
 ```bash
 docker rm -f sglang || true && \
-docker pull registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.6.0-alpha5 && \
+docker pull registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.7.2 && \
 docker run --name sglang \
   -it --rm \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
@@ -77,7 +78,7 @@ docker run --name sglang \
   -v /nas/sglang/model_weights:/app/sglang/model_weights \
   -v /nas/sglang/sglang:/app/sglang/sglang \
   -v /nas/sglang/ai:/data \
-  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.6.0-alpha5
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.7.2
 ```
 
 ### 核心参数优化说明
