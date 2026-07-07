@@ -123,6 +123,7 @@ python3.13 -m nuitka \
     --remove-output \
     --output-dir="$DIST_ROOT" \
     --output-filename=jasna \
+    --python-flag=-m \
     --enable-plugin=tk-inter \
     --follow-imports \
     --include-package=jasna \
@@ -138,7 +139,7 @@ python3.13 -m nuitka \
     --include-distribution-metadata=huggingface-hub \
     --nofollow-import-to=pytest \
     --nofollow-import-to=tests \
-    jasna/__main__.py
+    jasna
 
 NUITKA_DIST="$(find "$DIST_ROOT" -maxdepth 1 -type d -name "*.dist" | head -1)"
 if [ -z "$NUITKA_DIST" ]; then
