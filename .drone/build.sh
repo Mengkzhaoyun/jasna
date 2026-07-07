@@ -18,6 +18,7 @@ DIST_ROOT="$SRC_DIR/dist_linux"
 DIST_DIR="$DIST_ROOT/jasna"
 
 cd "$SRC_DIR"
+git config --global --add safe.directory "$SRC_DIR" || true
 
 APPLIED_PATCHES=()
 PROTECTION_STUB_CREATED=0
@@ -137,7 +138,7 @@ python3.13 -m nuitka \
     --include-distribution-metadata=huggingface-hub \
     --nofollow-import-to=pytest \
     --nofollow-import-to=tests \
-    -m jasna
+    jasna/__main__.py
 
 NUITKA_DIST="$(find "$DIST_ROOT" -maxdepth 1 -type d -name "*.dist" | head -1)"
 if [ -z "$NUITKA_DIST" ]; then
