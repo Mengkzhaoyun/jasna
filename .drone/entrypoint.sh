@@ -32,6 +32,10 @@ set -e
 # 支持的视频扩展名
 VIDEO_EXTS="mp4 mkv avi mov wmv flv webm ts"
 
+if [ -d "/app/sglang" ]; then
+	cd /app/sglang
+fi
+
 bitrate_to_kbps() {
 	local value="${1:-}"
 	value="${value// /}"
@@ -40,15 +44,15 @@ bitrate_to_kbps() {
 	fi
 
 	case "$value" in
-		*[Mm])
-			echo "$(( ${value%[Mm]} * 1000 ))"
-			;;
-		*[Kk])
-			echo "${value%[Kk]}"
-			;;
-		*)
-			echo "$value"
-			;;
+	*[Mm])
+		echo "$((${value%[Mm]} * 1000))"
+		;;
+	*[Kk])
+		echo "${value%[Kk]}"
+		;;
+	*)
+		echo "$value"
+		;;
 	esac
 }
 
@@ -87,7 +91,7 @@ probe_video_bitrate_kbps() {
 		return 1
 	fi
 
-	echo "$(( (bitrate + 999) / 1000 ))"
+	echo "$(((bitrate + 999) / 1000))"
 }
 
 # ---- warmup 子命令 ----
@@ -98,14 +102,22 @@ if [ "$1" = "warmup" ]; then
 	BATCH_SIZE="${BATCH_SIZE:-4}"
 	DETECTION_MODEL="${DETECTION_MODEL:-rfdetr-v5}"
 	RESTORATION_MODEL="${RESTORATION_MODEL:-model_weights/lada_mosaic_restoration_model_generic_v1.2.pth}"
-	DETECTION_MODEL_PATH="${DETECTION_MODEL_PATH:-model_weights/${DETECTION_MODEL}.onnx}"
+	if [ -z "${DETECTION_MODEL_PATH:-}" ]; then
+		if [ -f "model_weights/${DETECTION_MODEL}.onnx" ]; then
+			DETECTION_MODEL_PATH="model_weights/${DETECTION_MODEL}.onnx"
+		elif [ -f "model_weights/${DETECTION_MODEL}.pt" ]; then
+			DETECTION_MODEL_PATH="model_weights/${DETECTION_MODEL}.pt"
+		else
+			DETECTION_MODEL_PATH="model_weights/${DETECTION_MODEL}.onnx"
+		fi
+	fi
 
 	echo "============================================"
 	echo " sglang TensorRT Engine Warmup"
 	echo "============================================"
-	echo " Clip Size:         ${CLIP_SIZE}"
 	echo " Batch Size:        ${BATCH_SIZE}"
 	echo " Detection Model:   ${DETECTION_MODEL}"
+	echo " Detection Path:    ${DETECTION_MODEL_PATH}"
 	echo " Restoration Model: ${RESTORATION_MODEL}"
 	echo "============================================"
 	echo ""
@@ -120,7 +132,6 @@ if [ "$1" = "warmup" ]; then
     "fp16": true,
     "basicvsrpp": true,
     "basicvsrpp_model_path": "${RESTORATION_MODEL}",
-    "basicvsrpp_max_clip_size": ${CLIP_SIZE},
     "detection": true,
     "detection_model_name": "${DETECTION_MODEL}",
     "detection_model_path": "${DETECTION_MODEL_PATH}",
