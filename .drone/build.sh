@@ -102,7 +102,7 @@ source "$VENV_DIR/bin/activate"
 pip install --cache-dir "$SRC_DIR/.pip_cache" --no-build-isolation \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     --extra-index-url https://pypi.nvidia.com \
-    ".[dev,nvidia]"
+    ".[dev]"
 
 echo ">>> 4. 生成 Nuitka standalone 二进制..."
 NCCL_LIB=$(find /usr/lib /usr/local/lib/python3.13/site-packages/nvidia/nccl/lib -name "libnccl.so.2" 2>/dev/null | head -1 || true)
