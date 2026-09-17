@@ -100,7 +100,7 @@ if [ "$1" = "warmup" ]; then
 
 	CLIP_SIZE="${MAX_CLIP_SIZE:-150}"
 	BATCH_SIZE="${BATCH_SIZE:-4}"
-	DETECTION_MODEL="${DETECTION_MODEL:-rfdetr-v5}"
+	DETECTION_MODEL="${DETECTION_MODEL:-rfdetr-v6-large}"
 	RESTORATION_MODEL="${RESTORATION_MODEL:-model_weights/lada_mosaic_restoration_model_generic_v1.2.pth}"
 	if [ -z "${DETECTION_MODEL_PATH:-}" ]; then
 		if [ -f "model_weights/${DETECTION_MODEL}.onnx" ]; then
@@ -160,11 +160,12 @@ CODEC="${CODEC:-hevc}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
 BATCH_SIZE="${BATCH_SIZE:-4}"
+DETECTION_MODEL="${DETECTION_MODEL:-rfdetr-v6-large}"
 MAX_CLIP_SIZE="${MAX_CLIP_SIZE:-150}"
 TEMPORAL_OVERLAP="${TEMPORAL_OVERLAP:-16}"
 ENABLE_CROSSFADE="${ENABLE_CROSSFADE:-true}"
 DENOISE="${DENOISE:-low}"
-DETECTION_SCORE_THRESHOLD="${DETECTION_SCORE_THRESHOLD:-0.25}"
+DETECTION_SCORE_THRESHOLD="${DETECTION_SCORE_THRESHOLD:-}"
 FP16="${FP16:-true}"
 COMPILE_BASICVSRPP="${COMPILE_BASICVSRPP:-true}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
@@ -177,6 +178,7 @@ POST_COMPRESS_BITRATE="${POST_COMPRESS_BITRATE:-}"
 
 JASNA_OPTS=""
 [ -n "$BATCH_SIZE" ] && JASNA_OPTS="$JASNA_OPTS --batch-size $BATCH_SIZE"
+[ -n "$DETECTION_MODEL" ] && JASNA_OPTS="$JASNA_OPTS --detection-model $DETECTION_MODEL"
 [ -n "$MAX_CLIP_SIZE" ] && JASNA_OPTS="$JASNA_OPTS --max-clip-size $MAX_CLIP_SIZE"
 [ -n "$TEMPORAL_OVERLAP" ] && JASNA_OPTS="$JASNA_OPTS --temporal-overlap $TEMPORAL_OVERLAP"
 [ "$ENABLE_CROSSFADE" = "true" ] && JASNA_OPTS="$JASNA_OPTS --enable-crossfade"
@@ -190,6 +192,7 @@ echo "============================================"
 echo " sglang 批量处理模式"
 echo "============================================"
 echo " 扫描目录: ${SCAN_DIR}"
+echo " 检测模型: ${DETECTION_MODEL}"
 echo " 编码器:   ${CODEC}"
 echo " NVENC:    ${ENCODER_SETTINGS}"
 if [ "$PRESERVE_LOW_BITRATE" = "true" ] && [ -n "$TARGET_BITRATE_KBPS" ]; then
