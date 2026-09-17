@@ -134,9 +134,8 @@ python3.13 -m nuitka \
     --include-distribution-metadata=torch \
     --include-distribution-metadata=torchvision \
     --include-distribution-metadata=tensorrt \
-    --include-distribution-metadata=torch-tensorrt \
+    --include-distribution-metadata=torch_tensorrt \
     --include-distribution-metadata=diffusers \
-    --include-distribution-metadata=transformers \
     --include-distribution-metadata=huggingface-hub \
     --nofollow-import-to=pytest \
     --nofollow-import-to=tests \
