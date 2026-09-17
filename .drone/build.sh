@@ -102,7 +102,7 @@ source "$VENV_DIR/bin/activate"
 pip install --cache-dir "$SRC_DIR/.pip_cache" --no-build-isolation \
     --extra-index-url https://download.pytorch.org/whl/cu130 \
     --extra-index-url https://pypi.nvidia.com \
-    ".[dev]"
+    ".[dev,nvidia]"
 
 echo ">>> 4. 生成 Nuitka standalone 二进制..."
 NCCL_LIB=$(find /usr/lib /usr/local/lib/python3.13/site-packages/nvidia/nccl/lib -name "libnccl.so.2" 2>/dev/null | head -1 || true)
@@ -112,6 +112,7 @@ export CUDA_VISIBLE_DEVICES=""
 mkdir -p model_weights assets
 touch model_weights/lada_mosaic_restoration_model_generic_v1.2.pth 2>/dev/null || true
 touch model_weights/rfdetr-v5.onnx 2>/dev/null || true
+touch model_weights/rfdetr-v6.onnx 2>/dev/null || true
 touch model_weights/lada_mosaic_detection_model_v4_fast.pt 2>/dev/null || true
 touch assets/test_clip1_1080p.mp4 2>/dev/null || true
 touch assets/test_clip1_2160p.mp4 2>/dev/null || true
