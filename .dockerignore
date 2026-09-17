@@ -4,8 +4,7 @@
 !README.md
 !patches
 !patches/**
-!jasna/protection/keytool/wheels
+!jasna
+!jasna/**
 !.drone
-!.drone/entrypoint.sh
-!dist_jasna
-!dist_jasna/**
+!.drone/**

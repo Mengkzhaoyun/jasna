@@ -33,6 +33,12 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 WORKDIR /app/jasna
 COPY . /app/jasna
 
+# 准备 protection 公共构建 stub
+RUN if [ ! -f /app/jasna/jasna/protection/__init__.py ]; then \
+        mkdir -p /app/jasna/jasna/protection && \
+        cp /app/jasna/.drone/protection_stub.py /app/jasna/jasna/protection/__init__.py; \
+    fi
+
 # 极速安装当前版本 jasna（无依赖重复下载）并创建 sglang 兼容入口
 RUN pip install --no-cache-dir --no-deps . && \
     mkdir -p /app/sglang/model_weights && \
