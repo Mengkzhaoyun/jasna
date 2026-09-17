@@ -14,7 +14,7 @@ env:
 jobs:
   jasna-runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
 
     steps:
       - name: Free Disk Space
@@ -42,34 +42,18 @@ jobs:
           username: ${{ secrets.REGISTRY_USER_ALIYUN }}
           password: ${{ secrets.REGISTRY_PASSWORD_ALIYUN }}
 
-      - name: Compile Binary Using Builder Environment
-        run: |
-          docker pull ${{ env.GHCR_IMAGE_NAME }}:${{ env.JASNA_VERSION }}-build
-          docker run --rm \
-            -v ${{ github.workspace }}:/app/jasna \
-            -w /app/jasna \
-            ${{ env.GHCR_IMAGE_NAME }}:${{ env.JASNA_VERSION }}-build \
-            /bin/bash .drone/build.sh
-
-          # 提取编译产物
-          cp -r ./dist_linux/jasna ./dist_jasna
-
-          # 删除 build 镜像，释放磁盘空间给后续 runtime 构建
-          docker rmi ${{ env.GHCR_IMAGE_NAME }}:${{ env.JASNA_VERSION }}-build
-          docker system prune -f
-
       - name: Build and push jasna runtime image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./.drone/dockerfile
+          file: .drone/dockerfile
           platforms: linux/amd64
           push: true
           provenance: false
           tags: |
             ${{ env.ALIYUN_IMAGE_NAME }}:${{ env.BUILD_VERSION }}-jasna-${{ env.JASNA_VERSION }}
           build-args: |
-            BASE=nvidia/cuda:${{ env.BUILD_VERSION }}-runtime-ubuntu24.04
+            BASE=${{ env.GHCR_IMAGE_NAME }}:${{ env.JASNA_VERSION }}-build
             AUTHOR=${{ github.repository_owner }}
             VERSION=${{ env.BUILD_VERSION }}-jasna-${{ env.JASNA_VERSION }}
 

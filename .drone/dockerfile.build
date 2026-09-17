@@ -18,8 +18,8 @@ RUN apt-get update && apt-get install -y --allow-change-held-packages --no-insta
     libavformat-dev libavcodec-dev libavutil-dev \
     libswscale-dev libswresample-dev \
     libgl1 libglib2.0-0 \
-    tk-dev tcl-dev \
-    libnccl2=2.28.9-1+cuda13.0 libnccl-dev=2.28.9-1+cuda13.0 \
+    ffmpeg mkvtoolnix \
+    libxml2 librsvg2-2 libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
 # 安装预编译的 Python 3.13 (极速且绕过 PPA 避免网络问题)
@@ -67,9 +67,9 @@ RUN pip install --no-cache-dir mmengine==0.10.7 && \
 
 # 安装构建相关的辅助依赖与应用运行依赖 (缓存到镜像，避免每次 build.sh 重新下载几百兆文件)
 RUN pip install --no-cache-dir \
-    "nuitka>=2.4" cffi "cryptography>=42" \
-    "av>=18,<19" numpy psutil diffusers accelerate huggingface-hub python-vlc==3.0.21203 \
-    "opencv-python<5" Pillow tqdm "customtkinter==6.0.0" tkinterdnd2 ultralytics nvidia-vfx onnx \
+    cffi "cryptography>=42" \
+    "av>=18,<19" numpy psutil diffusers accelerate huggingface-hub \
+    "opencv-python<5" Pillow tqdm ultralytics nvidia-vfx onnx \
     --extra-index-url https://pypi.nvidia.com && \
     echo "/usr/local/lib/python3.13/site-packages/nvidia/nccl/lib" > /etc/ld.so.conf.d/nccl-pip.conf && \
     echo "/usr/local/lib/python3.13/site-packages/torch/lib" > /etc/ld.so.conf.d/torch.conf && \

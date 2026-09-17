@@ -101,6 +101,11 @@ if multiprocessing.parent_process() is None:
             from jasna.main import main
 
             main()
+        elif argv0_stem in ("jasna-cli", "sglang") or not os.environ.get("DISPLAY"):
+            from jasna.main import build_parser
+
+            build_parser().print_help()
+            raise SystemExit(0)
         else:
             _preload_native_libs()
             from jasna.gui import run_gui

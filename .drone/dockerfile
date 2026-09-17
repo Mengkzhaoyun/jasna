@@ -1,7 +1,8 @@
 # ============================================================
-# Runtime — 精简运行环境
+# Runtime — 基于 Builder 基础环境的极速精简运行镜像
+# 彻底移除 Nuitka 编译流程，直接在 Python 容器内高效运行
 # ============================================================
-ARG BASE=nvidia/cuda:13.0.3-runtime-ubuntu24.04
+ARG BASE=ghcr.io/mengkzhaoyun/jasna:v0.10.0-build
 FROM ${BASE}
 
 ARG AUTHOR
@@ -19,35 +20,25 @@ ENV TARGET_BITRATE=5M
 ENV EXTRA_ARGS=
 ENV YOLO_CONFIG_DIR=/tmp/Ultralytics
 
-# 仅安装运行时依赖 (无 Python 与构建工具)
-RUN sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true && \
-    sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true && \
-    sed -i 's/archive.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true && \
-    sed -i 's/security.ubuntu.com/mirrors.aliyun.com/g' /etc/apt/sources.list 2>/dev/null || true && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates software-properties-common \
-    # 多媒体
+# 安装多媒体命令行工具与运行时组件
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg mkvtoolnix \
-    # 显示 / 渲染
-    libgl1 libglib2.0-0 libdrm2 libx11-6 \
-    # VA-API
-    libva2 libva-drm2 libva-x11-2 \
-    # 图像 / 图形 / XML
     libxml2 librsvg2-2 libcairo2 \
     && rm -rf /var/lib/apt/lists/*
 
-# 修复 Runtime 镜像缺少 libnpp*.so 软链接的问题
+# 确保 CUDA 库软链接与环境变量正确
 RUN for f in /usr/local/cuda/lib64/libnpp*.so.13; do ln -s "$f" "${f%.13}" 2>/dev/null || true; done
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 
-# 从外部宿主机复制被提取出来的打包编译产物
-COPY ./dist_jasna /app/sglang
-RUN mv /app/sglang/jasna /app/sglang/sglang 2>/dev/null || true
+WORKDIR /app/jasna
+COPY . /app/jasna
 
-WORKDIR /app/sglang
-
-# 模型权重目录
-RUN mkdir -p /app/sglang/model_weights
+# 极速安装当前版本 jasna（无依赖重复下载）并创建 sglang 兼容入口
+RUN pip install --no-cache-dir --no-deps . && \
+    mkdir -p /app/sglang/model_weights && \
+    printf '#!/bin/bash\nexec python3.13 -m jasna "$@"\n' > /app/sglang/sglang && \
+    chmod +x /app/sglang/sglang && \
+    ln -sf /app/sglang/sglang /usr/local/bin/sglang
 
 # 入口脚本
 COPY .drone/entrypoint.sh /usr/local/bin/entrypoint.sh
