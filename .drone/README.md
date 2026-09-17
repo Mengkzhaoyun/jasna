@@ -106,6 +106,30 @@ Jasna 输出 -> FFmpeg 重新解码整片 -> hevc_nvenc 二次压缩 -> 输出
 
 这个二阶段会多一次完整视频读写和解码/编码调度，所以经常表现为总耗时很长、GPU 利用率低。现在默认关闭后压缩；只有显式设置 `POST_COMPRESS_BITRATE=5M` 时才会启用它作为兜底实验。
 
+### 模型手动下载 (离线/网络受限环境)
+
+Jasna 容器运行依赖挂载目录（如 `/nas/sglang/model_weights`）中的模型权重文件。如果生产部署环境无法联网下载，可提前在宿主机使用 `curl` 准备以下模型：
+
+```bash
+# 假设您的挂载目录是 /nas/sglang/model_weights
+mkdir -p /nas/sglang/model_weights
+cd /nas/sglang/model_weights
+
+# 1. 核心去马赛克修复模型 (必须)
+# (如直连 HuggingFace 失败可直接使用国内镜像加速源)
+curl -L -O https://hf-mirror.com/ladaapp/lada/resolve/main/lada_mosaic_restoration_model_generic_v1.2.pth
+
+# 2. 最新 RF-DETR v6 高清/4K 检测模型 (推荐，检出率更优)
+# (如遇直连 GitHub 较慢，可在链接前添加 ghproxy 代理，例如: https://ghproxy.net/https://github.com/...)
+curl -L -O https://ghproxy.net/https://github.com/Kruk2/jasna/releases/download/0.1/rfdetr-v6-large.onnx
+
+# 3. 稳定版 RF-DETR v5 检测模型 (通用兼容，可选)
+curl -L -O https://ghproxy.net/https://github.com/Kruk2/jasna/releases/download/v0.7.1/rfdetr-v5.onnx
+
+# 4. YOLO v4 极速轻量检测模型 (二次元/低显存可选)
+curl -L -O https://hf-mirror.com/ladaapp/lada/resolve/main/lada_mosaic_detection_model_v4_fast.pt
+```
+
 ## Video2X (480p/720p 视频增强)
 
 对于 480p 或 720p 的真人视频资源，可以使用 Video2X 增强并放大至 1080p。相关镜像与详细配置请参考：
