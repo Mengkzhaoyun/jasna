@@ -91,6 +91,65 @@ class TestEstimateStartFrame:
 # ---------------------------------------------------------------------------
 
 class TestDecodeDetectLoop:
+    def test_segment_pass_trims_at_end_and_detects_only_exact_effect_frames(self):
+        frames_t = torch.arange(6 * 3 * 8 * 8, dtype=torch.int64).reshape(6, 3, 8, 8).to(torch.uint8)
+        reader = _mock_reader([(frames_t, [60, 61, 62, 63, 64, 65])])
+        clip_queue = FrameQueue(max_frames=999)
+        metadata_queue = Queue(maxsize=999)
+        frame_shape = []
+
+        from jasna.pipeline_processing import BatchProcessResult
+
+        def _process(**kwargs):
+            for offset, pts in enumerate(kwargs["pts_list"]):
+                metadata_queue.put(FrameMeta(kwargs["start_frame_idx"] + offset, pts))
+            return BatchProcessResult(
+                next_frame_idx=kwargs["start_frame_idx"] + len(kwargs["pts_list"]),
+                clips_emitted=0,
+            )
+
+        with (
+            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+            patch("jasna.pipeline_threads.torch.inference_mode", return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock(return_value=False))),
+            patch("jasna.pipeline_threads.process_frame_batch", side_effect=_process) as process,
+            patch("jasna.pipeline_threads.finalize_processing") as finalize,
+        ):
+            decode_detect_loop(
+                input_video="fake.mkv",
+                batch_size=6,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(num_frames=100, fps=24),
+                detection_model=MagicMock(),
+                max_clip_size=60,
+                temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
+                enable_crossfade=True,
+                scene_detection=False,
+                blend_buffer=BlendBuffer(device=torch.device("cpu")),
+                crop_buffers={},
+                clip_queue=clip_queue,
+                metadata_queue=metadata_queue,
+                error_holder=[],
+                frame_shape=frame_shape,
+                seek_ts=2.5,
+                end_pts=64,
+                effect_ranges=((61, 63),),
+            )
+
+        assert process.call_count == 1
+        assert process.call_args.kwargs["pts_list"] == [61, 62]
+        assert finalize.call_count == 1
+        metas = []
+        while True:
+            item = metadata_queue.get_nowait()
+            if item is _SENTINEL:
+                break
+            metas.append(item)
+        assert [meta.pts for meta in metas] == [60, 61, 62, 63]
+        assert [meta.apply_effect for meta in metas] == [False, True, True, False]
+
     def test_cancel_event_breaks_loop(self):
         cancel = threading.Event()
         frames_t = torch.randint(0, 256, (2, 3, 8, 8), dtype=torch.uint8)
@@ -131,7 +190,10 @@ class TestDecodeDetectLoop:
                 detection_model=MagicMock(),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 enable_crossfade=True,
+                scene_detection=False,
                 blend_buffer=BlendBuffer(device=torch.device("cpu")),
                 crop_buffers={},
                 clip_queue=clip_queue,
@@ -170,7 +232,10 @@ class TestDecodeDetectLoop:
                 detection_model=MagicMock(),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 enable_crossfade=True,
+                scene_detection=False,
                 blend_buffer=BlendBuffer(device=torch.device("cpu")),
                 crop_buffers={},
                 clip_queue=clip_queue,
@@ -219,7 +284,10 @@ class TestDecodeDetectLoop:
                 detection_model=MagicMock(),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 enable_crossfade=True,
+                scene_detection=False,
                 blend_buffer=BlendBuffer(device=torch.device("cpu")),
                 crop_buffers={},
                 clip_queue=clip_queue,
@@ -538,6 +606,41 @@ class TestBlendEncodeLoop:
 
         assert len(writer.written) == 1
 
+    def test_blend_frame_receives_the_source_frame(self):
+        # The per-region VR reprojection now lives inside BlendBuffer, so the
+        # loop simply hands the untouched source frame to blend_frame.
+        original = torch.randint(0, 256, (1, 3, 8, 8), dtype=torch.uint8)
+        blended_out = torch.full_like(original[0], 30)
+        reader = _mock_reader([(original, [0])])
+        blend_buffer = MagicMock()
+        blend_buffer.is_frame_ready.return_value = True
+        blend_buffer.blend_frame.return_value = blended_out
+        metadata_queue = Queue()
+        metadata_queue.put(FrameMeta(frame_idx=0, pts=0))
+        metadata_queue.put(_SENTINEL)
+        writer = _RecordingWriter()
+
+        with (
+            patch("jasna.pipeline_threads.NvidiaVideoReader", return_value=reader),
+            patch("jasna.pipeline_threads.torch.cuda.set_device"),
+        ):
+            blend_encode_loop(
+                input_video="fake.mkv",
+                batch_size=1,
+                device=torch.device("cpu"),
+                metadata=_fake_metadata(),
+                blend_buffer=blend_buffer,
+                encode_queue=FrameQueue(max_frames=8),
+                metadata_queue=metadata_queue,
+                error_holder=[],
+                frame_writer=writer,
+            )
+
+        blend_buffer.blend_frame.assert_called_once()
+        assert blend_buffer.blend_frame.call_args.args[0] == 0
+        assert torch.equal(blend_buffer.blend_frame.call_args.args[1], original[0])
+        assert torch.equal(writer.written[0][0], blended_out)
+
 
 # ---------------------------------------------------------------------------
 # _OfflineFrameWriter
@@ -565,6 +668,17 @@ class TestOfflineFrameWriter:
         from jasna.pipeline import _OfflineFrameWriter
         writer = _OfflineFrameWriter(MagicMock(), [0.0])
         writer.after_write(1)
+
+    def test_write_can_bypass_lut_for_bridge_frame(self):
+        from jasna.pipeline import _OfflineFrameWriter
+        mock_enc = MagicMock()
+        mock_enc.__enter__ = MagicMock(return_value=mock_enc)
+        writer = _OfflineFrameWriter(mock_enc, [0.0])
+        frame = torch.zeros(3, 8, 8)
+
+        writer.write(frame, pts=10, apply_lut=False)
+
+        mock_enc.encode.assert_called_once_with(frame, 10, apply_lut=False)
 
     def test_close_exits_ctx(self):
         from jasna.pipeline import _OfflineFrameWriter
@@ -617,6 +731,19 @@ class TestStreamingFrameWriter:
         mock_server.update_production.assert_called_once_with(5)
         mock_server.wait_for_demand.assert_called_once()
 
+    def test_after_write_propagates_encoder_failure(self):
+        from jasna.streaming_pipeline import _StreamingFrameWriter
+        mock_enc = MagicMock()
+        mock_enc.raise_if_failed.side_effect = RuntimeError("writer failed")
+        mock_server = MagicMock()
+        mock_server.frames_per_segment.return_value = 120
+        writer = _StreamingFrameWriter(mock_enc, mock_server, start_segment=5)
+
+        with pytest.raises(RuntimeError, match="writer failed"):
+            writer.after_write(1)
+
+        mock_server.update_production.assert_not_called()
+
     def test_after_write_segment_calculation(self):
         from jasna.streaming_pipeline import _StreamingFrameWriter
         mock_enc = MagicMock()
@@ -667,6 +794,8 @@ class TestRunStreamingPass:
         mock_pipeline = MagicMock()
         mock_pipeline.max_clip_size = 60
         mock_pipeline.temporal_overlap = 8
+        mock_pipeline.max_detection_gap = 0
+        mock_pipeline.min_detection_duration = 0
         mock_pipeline.enable_crossfade = True
         mock_pipeline.batch_size = 2
         mock_pipeline.input_video = "fake.mkv"
@@ -687,7 +816,7 @@ class TestRunStreamingPass:
 
         mock_server = MagicMock()
         mock_server.video_change = threading.Event()
-        mock_server.consume_seek.return_value = None
+        mock_server.consume_seek_for_pass.return_value = None
         mock_server.frames_per_segment.return_value = 120
         mock_enc = MagicMock()
         cancel = threading.Event()
@@ -734,6 +863,8 @@ class TestRunStreamingPass:
         mock_pipeline = MagicMock()
         mock_pipeline.max_clip_size = 60
         mock_pipeline.temporal_overlap = 8
+        mock_pipeline.max_detection_gap = 0
+        mock_pipeline.min_detection_duration = 0
         mock_pipeline.enable_crossfade = True
         mock_pipeline.batch_size = 2
         mock_pipeline.input_video = "fake.mkv"
@@ -754,7 +885,7 @@ class TestRunStreamingPass:
 
         mock_server = MagicMock()
         mock_server.video_change = threading.Event()
-        mock_server.consume_seek.return_value = 10
+        mock_server.consume_seek_for_pass.return_value = 10
         mock_server.frames_per_segment.return_value = 120
         mock_enc = MagicMock()
         cancel = threading.Event()
@@ -910,6 +1041,31 @@ class TestStreamingLoop:
         assert call_count[0] == 2
         enc.flush_and_restart.assert_called_once_with(start_number=5)
 
+    def test_seek_to_segment_zero_restarts_encoder(self):
+        from jasna.streaming_pipeline import _streaming_loop
+        pipeline, server, enc = self._make_mocks()
+
+        call_count = [0]
+
+        def _fake_pass(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 0
+            server.video_change.set()
+            return None
+
+        with patch("jasna.streaming_pipeline._run_streaming_pass", side_effect=_fake_pass):
+            _streaming_loop(
+                pipeline=pipeline,
+                device=torch.device("cpu"),
+                metadata=MagicMock(),
+                hls_server=server,
+                streaming_encoder=enc,
+            )
+
+        enc.start.assert_called_once_with(start_number=0)
+        enc.flush_and_restart.assert_called_once_with(start_number=0)
+
     def test_completion_then_seek(self):
         from jasna.streaming_pipeline import _streaming_loop
         pipeline, server, enc = self._make_mocks()
@@ -991,6 +1147,8 @@ class TestPipelineRunStreamingWrapper:
                 device=torch.device("cpu"),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 fp16=True,
             )
 

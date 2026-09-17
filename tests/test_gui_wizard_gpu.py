@@ -30,6 +30,13 @@ def _make_fake_torch(
 
 def _call_check_gpu(monkeypatch, fake_torch) -> tuple[bool, str]:
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    import jasna.accelerator as accelerator
+
+    monkeypatch.setattr(
+        accelerator,
+        "vendor_for_device",
+        lambda _device: accelerator.AcceleratorVendor.NVIDIA,
+    )
     stub = types.SimpleNamespace()
     return FirstRunWizard._check_gpu(stub)
 
@@ -80,4 +87,4 @@ def test_check_gpu_fails_when_no_cuda(monkeypatch):
     fake_torch = _make_fake_torch(False)
     passed, msg = _call_check_gpu(monkeypatch, fake_torch)
     assert passed is False
-    assert "No CUDA device" in msg
+    assert "compatible GPU" in msg

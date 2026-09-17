@@ -1,10 +1,14 @@
 """Control bar - bottom playback controls and progress display."""
 
+import logging
+
 import customtkinter as ctk
 from jasna.gui.theme import Colors, Fonts, Sizing
+from jasna.gui.components import Tooltip
 from jasna.gui.locales import t
 from jasna.gui.system_stats import SystemStats
-from jasna.gui.settings_panel import Tooltip
+
+logger = logging.getLogger(__name__)
 
 
 _METRIC_WIDTH = 48
@@ -108,7 +112,7 @@ class _SystemMetric(ctk.CTkFrame):
                 try:
                     self.after_cancel(self._anim_after_id)
                 except Exception:
-                    pass
+                    logger.debug("after_cancel failed on progress reset", exc_info=True)
                 self._anim_after_id = None
             self._set_bar_value(0.0, _color_for_percent(0))
             return
@@ -125,7 +129,7 @@ class _SystemMetric(ctk.CTkFrame):
             try:
                 self.after_cancel(self._anim_after_id)
             except Exception:
-                pass
+                logger.debug("after_cancel failed on progress animation restart", exc_info=True)
             self._anim_after_id = None
 
         steps = 6
@@ -365,7 +369,7 @@ class ControlBar(ctk.CTkFrame):
     def set_start_enabled(self, enabled: bool, disabled_tooltip: str = ""):
         if enabled:
             if self._start_disabled_tooltip is not None:
-                self._start_disabled_tooltip._hide()
+                self._start_disabled_tooltip.hide()
                 self._start_btn.unbind("<Enter>")
                 self._start_btn.unbind("<Leave>")
                 self._start_disabled_tooltip = None
@@ -373,7 +377,7 @@ class ControlBar(ctk.CTkFrame):
         else:
             self._start_btn.configure(state="disabled", fg_color=Colors.BORDER_LIGHT, hover_color=Colors.BORDER_LIGHT)
             if self._start_disabled_tooltip is not None:
-                self._start_disabled_tooltip._hide()
+                self._start_disabled_tooltip.hide()
                 self._start_btn.unbind("<Enter>")
                 self._start_btn.unbind("<Leave>")
             if disabled_tooltip:

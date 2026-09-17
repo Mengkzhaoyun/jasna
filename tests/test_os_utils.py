@@ -90,12 +90,8 @@ def test_check_required_executables_uses_expected_version_commands(monkeypatch) 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         exe = os_utils.Path(cmd[0]).name
-        if exe == "ffmpeg":
-            return type("R", (), {"returncode": 0, "stdout": "ffmpeg version 8.0.0", "stderr": ""})()
         if exe == "ffprobe":
             return type("R", (), {"returncode": 0, "stdout": "ffprobe version 8.1.0", "stderr": ""})()
-        if exe == "mkvmerge":
-            return type("R", (), {"returncode": 0, "stdout": "mkvmerge v82.0", "stderr": ""})()
         raise AssertionError(f"Unexpected exe {exe!r}")
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
@@ -104,28 +100,7 @@ def test_check_required_executables_uses_expected_version_commands(monkeypatch) 
 
     assert calls == [
         ["/fake/ffprobe", "-version"],
-        ["/fake/ffmpeg", "-version"],
-        ["/fake/mkvmerge", "--version"],
     ]
-
-
-def test_check_required_executables_skips_ffmpeg_when_disabled(monkeypatch) -> None:
-    monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/fake/{exe}")
-
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, **kwargs):
-        calls.append(list(cmd))
-        exe = os_utils.Path(cmd[0]).name
-        if exe == "mkvmerge":
-            return type("R", (), {"returncode": 0, "stdout": "mkvmerge v82.0", "stderr": ""})()
-        raise AssertionError(f"Unexpected exe {exe!r}")
-
-    monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
-
-    os_utils.check_required_executables(disable_ffmpeg_check=True)
-
-    assert calls == [["/fake/mkvmerge", "--version"]]
 
 
 def test_check_required_executables_logs_stdout_stderr_when_exe_fails(monkeypatch, caplog) -> None:
@@ -134,11 +109,7 @@ def test_check_required_executables_logs_stdout_stderr_when_exe_fails(monkeypatc
     def fake_run(cmd, **kwargs):
         exe = os_utils.Path(cmd[0]).name
         if exe == "ffprobe":
-            return type("R", (), {"returncode": 0, "stdout": "ffprobe version 8.0.0", "stderr": ""})()
-        if exe == "ffmpeg":
-            return type("R", (), {"returncode": 1, "stdout": "ffmpeg stdout", "stderr": "ffmpeg stderr"})()
-        if exe == "mkvmerge":
-            return type("R", (), {"returncode": 0, "stdout": "mkvmerge v82.0", "stderr": ""})()
+            return type("R", (), {"returncode": 1, "stdout": "ffprobe stdout", "stderr": "ffprobe stderr"})()
         raise AssertionError(f"Unexpected exe {exe!r}")
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
@@ -147,20 +118,16 @@ def test_check_required_executables_logs_stdout_stderr_when_exe_fails(monkeypatc
         with pytest.raises(SystemExit):
             os_utils.check_required_executables()
 
-    assert any("ffmpeg failed" in rec.message and "ffmpeg stdout" in rec.message and "ffmpeg stderr" in rec.message for rec in caplog.records)
+    assert any("ffprobe failed" in rec.message and "ffprobe stdout" in rec.message and "ffprobe stderr" in rec.message for rec in caplog.records)
 
 
-def test_check_required_executables_errors_on_old_ffmpeg(monkeypatch, capsys) -> None:
+def test_check_required_executables_errors_on_old_ffprobe(monkeypatch, capsys) -> None:
     monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/fake/{exe}")
 
     def fake_run(cmd, **kwargs):
         exe = os_utils.Path(cmd[0]).name
         if exe == "ffprobe":
-            return type("R", (), {"returncode": 0, "stdout": "ffprobe version 8.0.0", "stderr": ""})()
-        if exe == "ffmpeg":
-            return type("R", (), {"returncode": 0, "stdout": "ffmpeg version 7.1.0", "stderr": ""})()
-        if exe == "mkvmerge":
-            return type("R", (), {"returncode": 0, "stdout": "mkvmerge v82.0", "stderr": ""})()
+            return type("R", (), {"returncode": 0, "stdout": "ffprobe version 7.1.0", "stderr": ""})()
         raise AssertionError(f"Unexpected exe {exe!r}")
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
@@ -173,17 +140,13 @@ def test_check_required_executables_errors_on_old_ffmpeg(monkeypatch, capsys) ->
     assert "major version must be exactly 8" in captured.out
 
 
-def test_check_required_executables_errors_on_newer_ffmpeg(monkeypatch, capsys) -> None:
+def test_check_required_executables_errors_on_newer_ffprobe(monkeypatch, capsys) -> None:
     monkeypatch.setattr(os_utils.shutil, "which", lambda exe: f"/fake/{exe}")
 
     def fake_run(cmd, **kwargs):
         exe = os_utils.Path(cmd[0]).name
         if exe == "ffprobe":
-            return type("R", (), {"returncode": 0, "stdout": "ffprobe version 8.0.0", "stderr": ""})()
-        if exe == "ffmpeg":
-            return type("R", (), {"returncode": 0, "stdout": "ffmpeg version 9.0.0", "stderr": ""})()
-        if exe == "mkvmerge":
-            return type("R", (), {"returncode": 0, "stdout": "mkvmerge v82.0", "stderr": ""})()
+            return type("R", (), {"returncode": 0, "stdout": "ffprobe version 9.0.0", "stderr": ""})()
         raise AssertionError(f"Unexpected exe {exe!r}")
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
@@ -203,10 +166,6 @@ def test_check_required_executables_errors_when_version_cannot_be_detected(monke
         exe = os_utils.Path(cmd[0]).name
         if exe == "ffprobe":
             return type("R", (), {"returncode": 0, "stdout": "ffprobe version N-113224-gdeadbeef", "stderr": ""})()
-        if exe == "ffmpeg":
-            return type("R", (), {"returncode": 0, "stdout": "ffmpeg version N-113224-gdeadbeef", "stderr": ""})()
-        if exe == "mkvmerge":
-            return type("R", (), {"returncode": 0, "stdout": "mkvmerge v82.0", "stderr": ""})()
         raise AssertionError(f"Unexpected exe {exe!r}")
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
@@ -349,17 +308,19 @@ def test_find_executable_prefers_bundled_when_frozen(monkeypatch, tmp_path) -> N
     assert os_utils.find_executable("ffmpeg") == str(ffmpeg)
 
 
-def test_find_executable_finds_bundled_mkvmerge_recursive(monkeypatch, tmp_path) -> None:
+def test_find_executable_bundled_wins_over_system_path(monkeypatch, tmp_path) -> None:
+    # A frozen release ships its own ffmpeg; it must use those even when a different
+    # copy is on the user's PATH (otherwise a wrong-version system ffmpeg would be picked).
     monkeypatch.setattr(os_utils.sys, "frozen", True, raising=False)
     monkeypatch.setattr(os_utils.sys, "executable", str(tmp_path / "jasna"), raising=False)
-    monkeypatch.setattr(os_utils.shutil, "which", lambda exe: None)
+    monkeypatch.setattr(os_utils.shutil, "which", lambda exe: "/usr/bin/ffmpeg")
     monkeypatch.setattr(os_utils, "_bundled_exe_filename", lambda name: name)
 
-    mkvmerge = tmp_path / "mkvtoolnix" / "nested" / "mkvmerge"
-    mkvmerge.parent.mkdir(parents=True, exist_ok=True)
-    mkvmerge.write_bytes(b"")
+    ffmpeg = tmp_path / "tools" / "ffmpeg"
+    ffmpeg.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg.write_bytes(b"")
 
-    assert os_utils.find_executable("mkvmerge") == str(mkvmerge)
+    assert os_utils.find_executable("ffmpeg") == str(ffmpeg)
 
 
 def test_check_sysmem_fallback_returns_true_when_prefer_no_sysmem(monkeypatch) -> None:
@@ -423,7 +384,7 @@ def test_check_sysmem_fallback_returns_na_on_non_windows(monkeypatch) -> None:
     assert info == "N/A"
 
 
-def test_check_nvidia_gpu_returns_name_when_available_and_compute_ok(monkeypatch) -> None:
+def test_check_supported_gpu_returns_name_when_available_and_compute_ok(monkeypatch) -> None:
     import types
 
     fake_torch = types.SimpleNamespace(
@@ -434,24 +395,24 @@ def test_check_nvidia_gpu_returns_name_when_available_and_compute_ok(monkeypatch
         )
     )
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
-    ok, result = os_utils.check_nvidia_gpu()
+    ok, result = os_utils.check_supported_gpu()
     assert ok is True
     assert result == "RTX 4090"
 
 
-def test_check_nvidia_gpu_returns_no_cuda_when_unavailable(monkeypatch) -> None:
+def test_check_supported_gpu_returns_no_cuda_when_unavailable(monkeypatch) -> None:
     import types
 
     fake_torch = types.SimpleNamespace(
         cuda=types.SimpleNamespace(is_available=lambda: False)
     )
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
-    ok, result = os_utils.check_nvidia_gpu()
+    ok, result = os_utils.check_supported_gpu()
     assert ok is False
     assert result == "no_cuda"
 
 
-def test_check_nvidia_gpu_returns_compute_too_low_when_below_min(monkeypatch) -> None:
+def test_check_supported_gpu_returns_compute_too_low_when_below_min(monkeypatch) -> None:
     import types
 
     fake_torch = types.SimpleNamespace(
@@ -462,12 +423,12 @@ def test_check_nvidia_gpu_returns_compute_too_low_when_below_min(monkeypatch) ->
         )
     )
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
-    ok, result = os_utils.check_nvidia_gpu()
+    ok, result = os_utils.check_supported_gpu()
     assert ok is False
     assert result == ("compute_too_low", 6, 1)
 
 
-def test_check_nvidia_gpu_returns_ok_at_exactly_min_compute(monkeypatch) -> None:
+def test_check_supported_gpu_returns_ok_at_exactly_min_compute(monkeypatch) -> None:
     import types
 
     fake_torch = types.SimpleNamespace(
@@ -478,62 +439,61 @@ def test_check_nvidia_gpu_returns_ok_at_exactly_min_compute(monkeypatch) -> None
         )
     )
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
-    ok, result = os_utils.check_nvidia_gpu()
+    ok, result = os_utils.check_supported_gpu()
     assert ok is True
     assert result == "RTX 2070"
+
+
+def test_nvidia_compatibility_alias_is_not_exposed() -> None:
+    assert not hasattr(os_utils, "check_nvidia_gpu")
 
 
 def test_min_gpu_compute_constant() -> None:
     assert os_utils.MIN_GPU_COMPUTE == (7, 5)
 
 
-def test_check_gpu_driver_version_passes_when_580(monkeypatch) -> None:
+def test_min_driver_version_is_platform_specific() -> None:
+    import sys
+    assert os_utils.MIN_DRIVER_VERSION == (580 if sys.platform == "linux" else 610)
+
+
+def test_check_gpu_driver_version_passes_at_minimum(monkeypatch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
+    version = f"{os_utils.MIN_DRIVER_VERSION}.00"
 
     def fake_run(cmd, **kwargs):
-        return type("R", (), {"returncode": 0, "stdout": "580.65\n", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": f"{version}\n", "stderr": ""})()
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
     ok, info = os_utils.check_gpu_driver_version()
     assert ok is True
-    assert info == "580.65"
+    assert info == version
 
 
-def test_check_gpu_driver_version_passes_when_590(monkeypatch) -> None:
+def test_check_gpu_driver_version_passes_when_newer(monkeypatch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
 
     def fake_run(cmd, **kwargs):
-        return type("R", (), {"returncode": 0, "stdout": "590.18\n", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": "611.12\n", "stderr": ""})()
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
     ok, info = os_utils.check_gpu_driver_version()
     assert ok is True
-    assert info == "590.18"
+    assert info == "611.12"
 
 
-def test_check_gpu_driver_version_passes_when_600(monkeypatch) -> None:
+def test_check_gpu_driver_version_fails_below_minimum(monkeypatch) -> None:
     monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
+    below = f"{os_utils.MIN_DRIVER_VERSION - 1}.99"
 
     def fake_run(cmd, **kwargs):
-        return type("R", (), {"returncode": 0, "stdout": "600.01\n", "stderr": ""})()
-
-    monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
-    ok, info = os_utils.check_gpu_driver_version()
-    assert ok is True
-    assert info == "600.01"
-
-
-def test_check_gpu_driver_version_fails_when_old(monkeypatch) -> None:
-    monkeypatch.setattr(os_utils, "find_executable", lambda name: "/fake/nvidia-smi")
-
-    def fake_run(cmd, **kwargs):
-        return type("R", (), {"returncode": 0, "stdout": "566.36\n", "stderr": ""})()
+        return type("R", (), {"returncode": 0, "stdout": f"{below}\n", "stderr": ""})()
 
     monkeypatch.setattr(os_utils.subprocess, "run", fake_run)
     ok, info = os_utils.check_gpu_driver_version()
     assert ok is False
-    assert "566.36" in info
-    assert "580" in info
+    assert below in info
+    assert str(os_utils.MIN_DRIVER_VERSION) in info
 
 
 def test_check_gpu_driver_version_fails_when_nvidia_smi_not_found(monkeypatch) -> None:
@@ -631,4 +591,3 @@ def test_check_ascii_install_path_uses_executable_when_frozen(monkeypatch, tmp_p
     monkeypatch.setattr(os_utils.sys, "executable", str(exe_path), raising=False)
     ok, info = os_utils.check_ascii_install_path()
     assert ok is True
-

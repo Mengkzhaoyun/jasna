@@ -11,25 +11,27 @@ from jasna._frozen import is_frozen
 logger = logging.getLogger(__name__)
 
 MIN_GPU_COMPUTE = (7, 5)
-MIN_DRIVER_VERSION = 580
+MIN_DRIVER_VERSION = 580 if sys.platform == "linux" else 610
 
-
-def check_nvidia_gpu() -> tuple[bool, str] | tuple[bool, tuple[str, int, int]]:
-    """Return (True, gpu_name) or (False, "no_cuda") or (False, ("compute_too_low", major, minor))."""
+def check_supported_gpu(
+    device: str = "cuda:0",
+) -> tuple[bool, str] | tuple[bool, tuple[str, int, int]]:
+    """Validate the GPU supported by the current vendor-specific build."""
     try:
         from jasna._suppress_noise import install as _install_noise_filters
         _install_noise_filters()
         import torch
+        from jasna.accelerator import AcceleratorVendor, vendor_for_device
     except ImportError:
         return False, "no_cuda"
     if not torch.cuda.is_available():
         return False, "no_cuda"
-    capability = torch.cuda.get_device_capability(0)
+    if vendor_for_device(device) is AcceleratorVendor.AMD:
+        return True, torch.cuda.get_device_name(device)
+    capability = torch.cuda.get_device_capability(device)
     if capability < MIN_GPU_COMPUTE:
         return False, ("compute_too_low", capability[0], capability[1])
-    return True, torch.cuda.get_device_name(0)
-
-
+    return True, torch.cuda.get_device_name(device)
 def _bundled_exe_filename(name: str) -> str:
     if os.name == "nt" and not name.lower().endswith(".exe"):
         return f"{name}.exe"
@@ -48,17 +50,6 @@ def _find_bundled_executable(name: str) -> Path | None:
     if name in {"ffmpeg", "ffprobe"}:
         p = base / "tools" / exe
         return p if p.is_file() else None
-
-    if name == "mkvmerge":
-        root = base / "mkvtoolnix"
-        direct = root / exe
-        if direct.is_file():
-            return direct
-        if root.is_dir():
-            for candidate in root.rglob(exe):
-                if candidate.is_file():
-                    return candidate
-        return None
 
     return None
 
@@ -120,7 +111,7 @@ def _redirect_std_streams_to_null() -> None:
     First, a stray `print()` or a logging StreamHandler writing to the real stream raises
     `OSError: [WinError 6] The handle is invalid` — repointing sys.* at NUL discards those
     writes. Second — and this is what randomly fails the system check and later crashes
-    ffprobe/mkvmerge — `subprocess.Popen` calls `GetStdHandle()` for every stream the
+    ffprobe — `subprocess.Popen` calls `GetStdHandle()` for every stream the
     caller left as None (our tools run with stdout/stderr=PIPE but stdin unset), then
     `DuplicateHandle`s that dangling handle and dies with `[WinError 6]`/`[WinError 50]`.
     Repointing the OS std handles at NUL gives each child a valid, inheritable handle to
@@ -158,7 +149,7 @@ def subprocess_no_window_kwargs() -> dict:
     """Popen/run kwargs that suppress a child's console window on Windows.
 
     The GUI drops its own console (FreeConsole), so a console-subsystem child like
-    ffmpeg/ffprobe/mkvmerge would otherwise pop its own cmd window. We capture their output
+    ffmpeg/ffprobe would otherwise pop its own cmd window. We capture their output
     via pipes, so they never need an inherited console. No-op (empty) off Windows."""
     if os.name != "nt":
         return {}
@@ -197,17 +188,13 @@ FFMPEG_DOWNLOAD_LINKS = (
 )
 
 
-def check_required_executables(disable_ffmpeg_check: bool = False) -> None:
+def check_required_executables() -> None:
     """Check that required external tools are available in PATH and callable."""
     missing: list[str] = []
     wrong_version: list[str] = []
     checks = {
         "ffprobe": ["-version"],
-        "ffmpeg": ["-version"],
-        "mkvmerge": ["--version"],
     }
-    if disable_ffmpeg_check:
-        checks = {k: v for k, v in checks.items() if k != "ffprobe" and k != "ffmpeg"}
     for exe, args in checks.items():
         exe_path = find_executable(exe)
         if exe_path is None:
@@ -235,7 +222,7 @@ def check_required_executables(disable_ffmpeg_check: bool = False) -> None:
             missing.append(exe)
             continue
 
-        if exe in {"ffprobe", "ffmpeg"}:
+        if exe == "ffprobe":
             try:
                 major = _parse_ffmpeg_major_version((completed.stdout or "") + (completed.stderr or ""))
             except ValueError:
@@ -250,13 +237,13 @@ def check_required_executables(disable_ffmpeg_check: bool = False) -> None:
         logger.info("%s", msg)
         print("Please install them and ensure they are available in your system PATH and runnable.")
         logger.info("Please install them and ensure they are available in your system PATH and runnable.")
-        if "ffmpeg" in missing or "ffprobe" in missing:
+        if "ffprobe" in missing:
             print(FFMPEG_DOWNLOAD_LINKS)
             logger.info("%s", FFMPEG_DOWNLOAD_LINKS)
         sys.exit(1)
     if wrong_version:
         msg = (
-            "Error: ffmpeg/ffprobe major version must be exactly 8 (or detectable as 8): "
+            "Error: ffprobe major version must be exactly 8 (or detectable as 8): "
             + ", ".join(wrong_version)
         )
         print(msg)
@@ -310,6 +297,17 @@ def check_windows_nvidia_sysmem_fallback_policy() -> tuple[bool, str]:
 
 
 def check_gpu_driver_version() -> tuple[bool, str]:
+    try:
+        import torch
+
+        hip_version = getattr(torch.version, "hip", None)
+        if hip_version:
+            if not torch.cuda.is_available():
+                return False, f"ROCm {hip_version} is installed but no AMD GPU is available"
+            return True, f"ROCm {hip_version}"
+    except ImportError:
+        pass
+
     nvidia_smi = find_executable("nvidia-smi")
     if not nvidia_smi:
         return False, "nvidia-smi not found"
@@ -359,4 +357,3 @@ def get_user_config_dir(app_name: str) -> Path:
     if xdg:
         return Path(xdg) / app_name
     return Path.home() / ".config" / app_name
-

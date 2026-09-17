@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from contextlib import nullcontext
@@ -8,9 +9,12 @@ from pathlib import Path
 import customtkinter as ctk
 from PIL import Image
 
+from jasna.gui import scaling
 from jasna.gui.locales import t
 from jasna.gui.models import AppSettings
 from jasna.gui.theme import Colors, Fonts, Sizing
+
+logger = logging.getLogger(__name__)
 
 
 def interactive_output_path(input_path: Path, output_folder: str, output_pattern: str) -> Path:
@@ -79,8 +83,10 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         self._photo = None
 
         image_size = _read_image_size(self._paths[0])
-        screen_size = (self.winfo_screenwidth(), self.winfo_screenheight())
-        self._window_w, self._window_h, self._preview_w, self._preview_h = _dialog_geometry_for_image(image_size, screen_size)
+        # Logical screen: the geometry it returns feeds both geometry() and CTk widget
+        # sizes, which are multiplied by the scaling factor again at render time.
+        logical_screen = scaling.to_logical(self, *scaling.screen_rect(self)[2:])
+        self._window_w, self._window_h, self._preview_w, self._preview_h = _dialog_geometry_for_image(image_size, logical_screen)
 
         self._requests: queue.Queue[tuple[int, int, int] | None] = queue.Queue()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
@@ -239,11 +245,10 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         self._refresh_header()
 
     def _center(self, master) -> None:
-        self.geometry(f"{self._window_w}x{self._window_h}")
         self.update_idletasks()
-        x = master.winfo_rootx() + (master.winfo_width() - self._window_w) // 2
-        y = master.winfo_rooty() + (master.winfo_height() - self._window_h) // 2
-        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        scaling.place_centered_on_parent(
+            self, master, *scaling.to_physical(self, self._window_w, self._window_h)
+        )
 
     def _refresh_header(self) -> None:
         path = self._paths[self._index]
@@ -323,7 +328,7 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
                 from jasna.gui.processor import _cleanup_torch
                 _cleanup_torch(torch)
             except Exception:
-                pass
+                logger.warning("Torch cleanup failed during render worker teardown", exc_info=True)
 
     def _ensure_session(self, detector, restorer):
         if detector is not None and restorer is not None:
@@ -334,7 +339,7 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         from jasna._suppress_noise import install as _install_noise_filters
         from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
         from jasna.engine_paths import SD15_DIR
-        from jasna.mosaic.detection_registry import build_detection_model, coerce_detection_model_name, detection_model_weights_path
+        from jasna.mosaic.detection_registry import build_detection_model, coerce_detection_model_name, require_detection_model_weights
         from jasna.restorer.sd15_download import bundle_present
         from jasna.restorer.sd15_inpaint_restorer import Sd15InpaintRestorer
 
@@ -345,7 +350,7 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         settings = self._settings
         self._device = torch.device("cuda:0")
         det_name = coerce_detection_model_name(str(settings.detection_model))
-        detection_model_path = detection_model_weights_path(det_name)
+        detection_model_path = require_detection_model_weights(det_name)
         ensure_engines_compiled(
             EngineCompilationRequest(
                 device=str(self._device),
@@ -450,7 +455,7 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         try:
             self.after(0, callback)
         except Exception:
-            pass
+            logger.debug("Failed to schedule callback (widget gone)", exc_info=True)
 
     def _close(self) -> None:
         self._closed = True

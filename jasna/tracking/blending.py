@@ -3,13 +3,47 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from jasna.accelerator import is_nvidia_device
+
 _KERNEL_CACHE: dict[tuple[str, torch.dtype, str, int], torch.Tensor] = {}
 
 BLEND_DILATION_RATIO = 0.028
 BLEND_FALLOFF_RATIO = 0.028
 
 
-def _box_kernel(device: torch.device, dtype: torch.dtype, axis: str, size: int) -> torch.Tensor:
+def _moving_average(x: torch.Tensor, size: int, dim: int) -> torch.Tensor:
+    """Moving average without creating a shape-specific convolution problem."""
+    prefix = x.cumsum(dim=dim)
+    zero_shape = list(prefix.shape)
+    zero_shape[dim] = 1
+    prefix = torch.cat((prefix.new_zeros(zero_shape), prefix), dim=dim)
+    leading = prefix.narrow(dim, size, prefix.shape[dim] - size)
+    trailing = prefix.narrow(dim, 0, prefix.shape[dim] - size)
+    return (leading - trailing) / size
+
+
+def _prefix_box_blur(x: torch.Tensor, kernel_h: int, kernel_w: int) -> torch.Tensor:
+    # Kernels are clamped so reflect padding stays valid for small inputs.
+    kh = min(kernel_h, 2 * x.shape[0] - 1)
+    kw = min(kernel_w, 2 * x.shape[1] - 1)
+    pad_h = kh // 2
+    pad_w = kw // 2
+    padded = F.pad(
+        x.unsqueeze(0).unsqueeze(0),
+        (pad_w, pad_w, pad_h, pad_h),
+        mode="reflect",
+    )
+    blurred = _moving_average(padded, kw, dim=-1)
+    blurred = _moving_average(blurred, kh, dim=-2)
+    return blurred.squeeze(0).squeeze(0)
+
+
+def _box_kernel(
+    device: torch.device,
+    dtype: torch.dtype,
+    axis: str,
+    size: int,
+) -> torch.Tensor:
     cache_key = (str(device), dtype, axis, size)
     kernel = _KERNEL_CACHE.get(cache_key)
     if kernel is None:
@@ -19,17 +53,23 @@ def _box_kernel(device: torch.device, dtype: torch.dtype, axis: str, size: int) 
     return kernel
 
 
-def _box_blur(x: torch.Tensor, kernel_h: int, kernel_w: int) -> torch.Tensor:
-    # Separable box blur: a uniform KhxKw kernel = 1xKw then Khx1, cost O(Kh*Kw) -> O(Kh+Kw).
-    # Kernels are clamped so reflect padding stays valid for small inputs.
+def _conv_box_blur(x: torch.Tensor, kernel_h: int, kernel_w: int) -> torch.Tensor:
     kh = min(kernel_h, 2 * x.shape[0] - 1)
     kw = min(kernel_w, 2 * x.shape[1] - 1)
-    pad_h = kh // 2
-    pad_w = kw // 2
-    x4d = F.pad(x.unsqueeze(0).unsqueeze(0), (pad_w, pad_w, pad_h, pad_h), mode="reflect")
-    x4d = F.conv2d(x4d, _box_kernel(x.device, x.dtype, "w", kw))
-    x4d = F.conv2d(x4d, _box_kernel(x.device, x.dtype, "h", kh))
-    return x4d.squeeze(0).squeeze(0)
+    padded = F.pad(
+        x.unsqueeze(0).unsqueeze(0),
+        (kw // 2, kw // 2, kh // 2, kh // 2),
+        mode="reflect",
+    )
+    blurred = F.conv2d(padded, _box_kernel(x.device, x.dtype, "w", kw))
+    blurred = F.conv2d(blurred, _box_kernel(x.device, x.dtype, "h", kh))
+    return blurred.squeeze(0).squeeze(0)
+
+
+def _box_blur(x: torch.Tensor, kernel_h: int, kernel_w: int) -> torch.Tensor:
+    if is_nvidia_device(x.device):
+        return _conv_box_blur(x, kernel_h, kernel_w)
+    return _prefix_box_blur(x, kernel_h, kernel_w)
 
 
 def create_blend_mask(

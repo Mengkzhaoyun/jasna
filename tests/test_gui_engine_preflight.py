@@ -3,15 +3,29 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
 import torch
 
 from jasna.gui.engine_preflight import run_engine_preflight
 from jasna.gui.models import AppSettings
 
 
+@pytest.fixture(autouse=True)
+def _use_nvidia_preflight_by_default(monkeypatch):
+    import jasna.accelerator as accelerator
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda _device: False)
+
+
 def _touch(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("x", encoding="utf-8")
+
+
+def test_engine_preflight_defers_torch_import() -> None:
+    import jasna.gui.engine_preflight as module
+
+    assert "torch" not in module.__dict__
 
 
 def test_preflight_detects_missing_engines(monkeypatch, tmp_path: Path) -> None:
@@ -43,6 +57,28 @@ def test_preflight_no_warning_when_all_expected_engines_exist(monkeypatch, tmp_p
     assert res.missing == ()
 
 
+def test_preflight_uses_fixed_batch_path_for_rfdetr_v5(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "model_weights").mkdir(parents=True, exist_ok=True)
+
+    settings = AppSettings(
+        detection_model="rfdetr-v5",
+        batch_size=8,
+        compile_basicvsrpp=False,
+    )
+
+    result = run_engine_preflight(settings)
+
+    requirement = next(
+        item for item in result.requirements if item.key == "rfdetr"
+    )
+    assert ".bs4." in requirement.paths[0].name
+    assert ".bs1-" not in requirement.paths[0].name
+
+
 def test_preflight_basicvsrpp_missing_then_found(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / "model_weights").mkdir(parents=True, exist_ok=True)
@@ -64,6 +100,7 @@ def test_preflight_basicvsrpp_missing_then_found(monkeypatch, tmp_path: Path) ->
 
 
 def test_get_onnx_tensorrt_engine_path_matches_compile_return_when_present(monkeypatch, tmp_path: Path) -> None:
+    pytest.importorskip("tensorrt")
     monkeypatch.chdir(tmp_path)
     (tmp_path / "model_weights").mkdir(parents=True, exist_ok=True)
 
@@ -117,3 +154,22 @@ def test_preflight_uses_yolo_engine_name_when_selected(monkeypatch, tmp_path: Pa
     suffix = ".fp16.win.engine" if os.name == "nt" else ".fp16.linux.engine"
     assert yolo_req.paths == (Path("model_weights") / f"lada_mosaic_detection_model_v4_fast{suffix}",)
 
+
+def test_amd_preflight_has_no_engine_requirements(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "model_weights").mkdir(parents=True, exist_ok=True)
+
+    import jasna.accelerator as accelerator
+
+    # AMD runs RF-DETR (rfdetr torch model) and YOLO through PyTorch and skips
+    # BasicVSR++ TensorRT, so nothing needs precompiling.
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda _device: True)
+
+    result = run_engine_preflight(AppSettings(compile_basicvsrpp=True))
+
+    assert result.requirements == ()
+    assert result.missing == ()
+    assert result.should_warn_first_run_slow is False

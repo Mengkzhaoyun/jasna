@@ -9,7 +9,7 @@ import torch
 from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
 from jasna.benchmark.lada_yolo_detection_speed import benchmark_lada_yolo_detection_speed
 from jasna.benchmark.rfdetr_detection_speed import benchmark_rfdetr_detection_speed
-from jasna.os_utils import check_nvidia_gpu, check_required_executables
+from jasna.os_utils import check_required_executables, check_supported_gpu
 
 BENCHMARK_VIDEO_DEFAULTS: list[Path] = [
     Path("assets/test_clip1_1080p.mp4"),
@@ -29,7 +29,7 @@ def run_benchmarks(
     batch_size: int = 4,
     fp16: bool = True,
     benchmark_videos: list[Path],
-    detection_score_threshold: float = 0.2,
+    detection_score_threshold: float | None = None,
     restoration_model_path: Path | None = None,
     compile_basicvsrpp: bool = True,
     benchmark_filter: str | None = None,
@@ -97,11 +97,11 @@ def _print_results_table(
 
 
 def run_benchmark_cli(args: Namespace) -> None:
-    check_required_executables(disable_ffmpeg_check=args.disable_ffmpeg_check)
-    gpu_ok, gpu_result = check_nvidia_gpu()
+    check_required_executables()
+    gpu_ok, gpu_result = check_supported_gpu(str(args.device))
     if not gpu_ok:
         if gpu_result == "no_cuda":
-            print("Error: No CUDA device. An NVIDIA GPU with compute capability 7.5+ is required.")
+            print("Error: No compatible GPU was found for this Jasna build.")
         else:
             _, major, minor = gpu_result
             print(f"Error: Compute capability 7.5+ required (GPU: {major}.{minor}).")
@@ -114,8 +114,12 @@ def run_benchmark_cli(args: Namespace) -> None:
         batch_size=int(args.batch_size),
         fp16=bool(args.fp16),
         benchmark_videos=benchmark_videos,
-        detection_score_threshold=float(args.detection_score_threshold),
+        detection_score_threshold=(
+            None
+            if args.detection_score_threshold is None
+            else float(args.detection_score_threshold)
+        ),
         restoration_model_path=Path(args.restoration_model_path),
         compile_basicvsrpp=bool(args.compile_basicvsrpp),
-        benchmark_filter=getattr(args, 'benchmark_filter', None),
+        benchmark_filter=getattr(args, "benchmark_filter", None),
     )

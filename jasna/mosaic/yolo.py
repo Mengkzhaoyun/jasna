@@ -8,15 +8,29 @@ import torch
 import torch.nn.functional as F
 from ultralytics.utils import nms, ops
 
+from jasna.accelerator import is_nvidia_device
+from jasna.media.resize_normalize import ResizeNormalizer
 from jasna.mosaic.detections import Detections
-from jasna.mosaic.yolo_tensorrt_compilation import get_yolo_tensorrt_engine_path
-from jasna.trt.trt_runner import TrtRunner
 
 logger = logging.getLogger(__name__)
 
 
 _YOLO_LETTERBOX_PAD_VALUE = 114.0 / 255.0
 _MASK_MAX_SIDE = 256
+
+
+def get_yolo_tensorrt_engine_path(*args, **kwargs):
+    from jasna.mosaic.yolo_tensorrt_compilation import (
+        get_yolo_tensorrt_engine_path as resolve,
+    )
+
+    return resolve(*args, **kwargs)
+
+
+def TrtRunner(*args, **kwargs):
+    from jasna.trt.trt_runner import TrtRunner as Runner
+
+    return Runner(*args, **kwargs)
 
 
 def _mask_hw_for_frame(target_hw: tuple[int, int]) -> tuple[int, int]:
@@ -26,6 +40,16 @@ def _mask_hw_for_frame(target_hw: tuple[int, int]) -> tuple[int, int]:
     mh = max(1, int(round(h * scale)))
     mw = max(1, int(round(w * scale)))
     return mh, mw
+
+
+def _letterbox_geometry(
+    height: int, width: int, new_shape: tuple[int, int]
+) -> tuple[float, int, int, int, int]:
+    new_h, new_w = (int(new_shape[0]), int(new_shape[1]))
+    gain = min(new_h / height, new_w / width)
+    unpad_w = int(round(width * gain))
+    unpad_h = int(round(height * gain))
+    return gain, (new_w - unpad_w) // 2, (new_h - unpad_h) // 2, unpad_w, unpad_h
 
 
 def _letterbox_normalized_bchw(
@@ -58,6 +82,43 @@ def _letterbox_normalized_bchw(
 
     ratio_pad = ((float(gain), float(gain)), (int(left), int(top)))
     return x, ratio_pad
+
+
+def _batched_nms_keep(
+    boxes_xyxy: torch.Tensor,
+    scores: torch.Tensor,
+    classes: torch.Tensor,
+    *,
+    score_threshold: float,
+    iou_threshold: float,
+    max_det: int,
+) -> torch.Tensor:
+    """Return a GPU boolean keep mask for confidence-sorted batched boxes."""
+    _, count, _ = boxes_xyxy.shape
+    x1, y1, x2, y2 = boxes_xyxy.unbind(dim=-1)
+    areas = (x2 - x1).clamp_min(0) * (y2 - y1).clamp_min(0)
+    inter_w = (
+        torch.minimum(x2[:, :, None], x2[:, None, :])
+        - torch.maximum(x1[:, :, None], x1[:, None, :])
+    ).clamp_min(0)
+    inter_h = (
+        torch.minimum(y2[:, :, None], y2[:, None, :])
+        - torch.maximum(y1[:, :, None], y1[:, None, :])
+    ).clamp_min(0)
+    intersections = inter_w * inter_h
+    unions = areas[:, :, None] + areas[:, None, :] - intersections
+    ious = intersections / unions.clamp_min(torch.finfo(intersections.dtype).eps)
+    overlaps = (ious > iou_threshold) & (classes[:, :, None] == classes[:, None, :])
+
+    alive = scores > score_threshold
+    keep = torch.zeros_like(alive)
+    indexes = torch.arange(count, device=boxes_xyxy.device)
+    for index in range(count):
+        keep_i = alive[:, index]
+        keep[:, index] = keep_i
+        later = indexes > index
+        alive &= ~(keep_i[:, None] & overlaps[:, index] & later[None, :])
+    return keep & (keep.cumsum(dim=1) <= max_det)
 
 
 class YoloMosaicDetectionModel:
@@ -100,11 +161,11 @@ class YoloMosaicDetectionModel:
             raise ValueError(f"imgsz must be > 0, got {imgsz}")
         self.stride = 32
         self.end2end = False
-        self.runner: TrtRunner | None = None
+        self.runner = None
         self.input_dtype = torch.float16 if self.fp16 else torch.float32
 
         runtime_path = self.model_path
-        if self.device.type == "cuda":
+        if is_nvidia_device(self.device):
             runtime_path = get_yolo_tensorrt_engine_path(self.model_path, fp16=self.fp16)
             if not runtime_path.exists():
                 raise FileNotFoundError(
@@ -143,7 +204,34 @@ class YoloMosaicDetectionModel:
                 self.stride = int(stride_attr)
             self.model.eval()
         self._empty_masks_cache: dict[tuple[int, int], torch.Tensor] = {}
+        resizer = ResizeNormalizer(
+            device=self.device,
+            dtype=self.input_dtype,
+            mean=(0.0, 0.0, 0.0),
+            std=(1.0, 1.0, 1.0),
+            fill=(_YOLO_LETTERBOX_PAD_VALUE,) * 3,
+        )
+        self._resizer = resizer if resizer.available else None
         logger.info("YOLO detection model loaded: %s (batch_size=%d)", runtime_path, self.batch_size)
+
+    def _preprocess(
+        self, frames_uint8_bchw: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[tuple[float, float], tuple[int, int]]]:
+        if self._resizer is not None and frames_uint8_bchw.dtype is torch.uint8:
+            _, _, h, w = frames_uint8_bchw.shape
+            gain, left, top, unpad_w, unpad_h = _letterbox_geometry(h, w, (self.imgsz, self.imgsz))
+            x = self._resizer.run(
+                frames_uint8_bchw,
+                out_hw=(self.imgsz, self.imgsz),
+                content=(left, top, unpad_w, unpad_h),
+            )
+            return x, ((float(gain), float(gain)), (int(left), int(top)))
+
+        x = frames_uint8_bchw.to(device=self.device, dtype=self.input_dtype, non_blocking=True)
+        x = x / 255.0
+        return _letterbox_normalized_bchw(
+            x, new_shape=(self.imgsz, self.imgsz), stride=self.stride
+        )
 
     def close(self) -> None:
         if self.runner is not None:
@@ -160,15 +248,9 @@ class YoloMosaicDetectionModel:
             self._empty_masks_cache[key] = t
         return t
 
-    def __call__(self, frames_uint8_bchw: torch.Tensor, *, target_hw: tuple[int, int]) -> Detections:
-        x = frames_uint8_bchw.to(device=self.device, dtype=self.input_dtype, non_blocking=True)
-        x /= 255.0
-        x, ratio_pad = _letterbox_normalized_bchw(
-            x,
-            new_shape=(self.imgsz, self.imgsz),
-            stride=self.stride,
-        )
-
+    def _forward_raw(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
         with torch.inference_mode():
             if self.runner is not None:
                 outs = self.runner.infer({self._input_name: x})
@@ -181,8 +263,29 @@ class YoloMosaicDetectionModel:
         if not isinstance(raw, (tuple, list)) or len(raw) < 2:
             raise RuntimeError(f"Unexpected YOLO output type/shape: {type(raw)}")
 
-        pred_raw = raw[0] if not isinstance(raw[0], tuple) else raw[0][0]
-        protos = raw[1]
+        primary = raw[0]
+        pred_raw = primary[0] if isinstance(primary, (tuple, list)) else primary
+        protos = None
+        candidates = (
+            list(primary[1:])
+            if isinstance(primary, (tuple, list))
+            else []
+        )
+        candidates.extend(raw[1:])
+        for candidate in candidates:
+            if isinstance(candidate, torch.Tensor) and candidate.ndim == 4:
+                protos = candidate
+                break
+            if isinstance(candidate, dict):
+                candidate_proto = candidate.get("proto")
+                if (
+                    isinstance(candidate_proto, torch.Tensor)
+                    and candidate_proto.ndim == 4
+                ):
+                    protos = candidate_proto
+                    break
+        if not isinstance(pred_raw, torch.Tensor) or protos is None:
+            raise RuntimeError("Unexpected YOLO segmentation output layout")
         if protos.ndim == 4 and protos.shape[1] not in {8, 16, 32, 64, 128} and protos.shape[-1] in {8, 16, 32, 64, 128}:
             protos = protos.permute(0, 3, 1, 2).contiguous()
 
@@ -191,6 +294,78 @@ class YoloMosaicDetectionModel:
 
         mask_dim = int(protos.shape[1]) if protos.ndim == 4 else 0
         nc = int(pred_raw.shape[1]) - 4 - mask_dim
+        return pred_raw, protos, nc
+
+    @torch.inference_mode()
+    def scan_scores_masks(
+        self, frames_uint8_bchw: torch.Tensor, *, mask_hw: tuple[int, int]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """GPU-only fast path for whole-video scanning: per-frame best score
+        (B,) float32 and merged, box-cropped low-res mask
+        (B, mask_h, mask_w) bool, with class-aware NMS and no host
+        synchronization."""
+
+        _, _, src_h, src_w = frames_uint8_bchw.shape
+        x, ratio_pad = self._preprocess(frames_uint8_bchw)
+        pred_raw, protos, nc = self._forward_raw(x)
+
+        per_anchor, anchor_classes = pred_raw[
+            :, 4 : 4 + max(1, nc), :
+        ].max(dim=1)  # (B, A)
+        scores = per_anchor.amax(dim=1).float()  # (B,)
+
+        mask_dim = int(protos.shape[1])
+        k = min(self.max_det * 4, per_anchor.shape[1])
+        top_conf, top_idx = per_anchor.topk(k, dim=1)  # (B, K)
+        top_classes = anchor_classes.gather(1, top_idx)
+        coeffs = pred_raw[:, 4 + nc :, :].gather(
+            2, top_idx[:, None, :].expand(-1, mask_dim, -1)
+        )  # (B, mask_dim, K)
+        anchor_masks = (
+            torch.einsum("bmk,bmhw->bkhw", coeffs.float(), protos.float()).sigmoid() > 0.5
+        )
+        boxes_xywh = pred_raw[:, :4, :].gather(
+            2, top_idx[:, None, :].expand(-1, 4, -1)
+        ).transpose(1, 2)
+        box_x, box_y, box_w, box_h = boxes_xywh.unbind(dim=-1)
+        ph, pw = anchor_masks.shape[-2:]
+        x1 = (box_x - box_w / 2) * (pw / float(self.imgsz))
+        y1 = (box_y - box_h / 2) * (ph / float(self.imgsz))
+        x2 = (box_x + box_w / 2) * (pw / float(self.imgsz))
+        y2 = (box_y + box_h / 2) * (ph / float(self.imgsz))
+        boxes_xyxy = torch.stack((x1, y1, x2, y2), dim=-1)
+        valid = _batched_nms_keep(
+            boxes_xyxy,
+            top_conf,
+            top_classes,
+            score_threshold=self.score_threshold,
+            iou_threshold=self.iou_threshold,
+            max_det=self.max_det,
+        )
+        grid_x = torch.arange(pw, device=anchor_masks.device)[None, None, None, :]
+        grid_y = torch.arange(ph, device=anchor_masks.device)[None, None, :, None]
+        anchor_masks &= (
+            (grid_x >= x1[:, :, None, None])
+            & (grid_x < x2[:, :, None, None])
+            & (grid_y >= y1[:, :, None, None])
+            & (grid_y < y2[:, :, None, None])
+        )
+        merged = (anchor_masks & valid[:, :, None, None]).any(dim=1)  # (B, ph, pw)
+
+        (gain, _), (left, top) = ratio_pad
+        sy, sx = ph / float(self.imgsz), pw / float(self.imgsz)
+        top_p = int(round(top * sy))
+        left_p = int(round(left * sx))
+        h_p = max(1, int(round(src_h * gain * sy)))
+        w_p = max(1, int(round(src_w * gain * sx)))
+        merged = merged[:, top_p : top_p + h_p, left_p : left_p + w_p]
+        merged = F.interpolate(merged[:, None].float(), size=mask_hw, mode="area") > 0.0
+        return scores, merged[:, 0]
+
+    @torch.inference_mode()
+    def __call__(self, frames_uint8_bchw: torch.Tensor, *, target_hw: tuple[int, int]) -> Detections:
+        x, ratio_pad = self._preprocess(frames_uint8_bchw)
+        pred_raw, protos, nc = self._forward_raw(x)
         preds = nms.non_max_suppression(
             pred_raw,
             conf_thres=float(self.score_threshold),
@@ -239,4 +414,3 @@ class YoloMosaicDetectionModel:
                 masks_list.append(empty_masks)
 
         return Detections(boxes_xyxy=boxes_list, masks=masks_list)
-

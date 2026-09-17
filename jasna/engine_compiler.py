@@ -24,7 +24,6 @@ class EngineCompilationRequest:
 
     basicvsrpp: bool = False
     basicvsrpp_model_path: str = ""
-    basicvsrpp_max_clip_size: int = 60
 
     detection: bool = False
     detection_model_name: str = ""
@@ -46,17 +45,47 @@ class EngineCompilationResult:
     use_basicvsrpp_tensorrt: bool = False
 
 
-def _basicvsrpp_engines_exist(model_path: str, fp16: bool, max_clip_size: int) -> bool:
+def _basicvsrpp_engines_exist(model_path: str, fp16: bool) -> bool:
     from jasna.engine_paths import all_basicvsrpp_sub_engines_exist
-    return all_basicvsrpp_sub_engines_exist(model_path, fp16, max_clip_size)
+    return all_basicvsrpp_sub_engines_exist(model_path, fp16)
 
 
-def _detection_engine_exists(detection_model_name: str, detection_model_path: str, batch_size: int, fp16: bool) -> bool:
-    from jasna.engine_paths import get_onnx_tensorrt_engine_path, get_yolo_tensorrt_engine_path
+def _detection_engine_exists(
+    detection_model_name: str,
+    detection_model_path: str,
+    batch_size: int,
+    fp16: bool,
+    device: str,
+) -> bool:
+    import torch
 
-    if detection_model_name.startswith("rfdetr"):
-        return get_onnx_tensorrt_engine_path(detection_model_path, batch_size=batch_size, fp16=fp16).exists()
-    if detection_model_name.startswith("lada-yolo"):
+    from jasna.accelerator import is_amd_device
+    from jasna.mosaic.detection_registry import (
+        is_rfdetr_model,
+        is_yolo_model,
+        rfdetr_model_config,
+    )
+
+    resolved_device = torch.device(device)
+    if is_amd_device(resolved_device):
+        # AMD runs both RF-DETR (rfdetr torch model) and YOLO through PyTorch;
+        # there is no compiled engine artifact to check for.
+        return True
+
+    from jasna.engine_paths import (
+        get_onnx_tensorrt_engine_path,
+        get_yolo_tensorrt_engine_path,
+    )
+
+    if is_rfdetr_model(detection_model_name):
+        config = rfdetr_model_config(detection_model_name)
+        return get_onnx_tensorrt_engine_path(
+            detection_model_path,
+            batch_size=config.engine_batch_size(batch_size),
+            fp16=fp16,
+            dynamic_batch=config.dynamic_batch,
+        ).exists()
+    if is_yolo_model(detection_model_name):
         return get_yolo_tensorrt_engine_path(detection_model_path, fp16=fp16).exists()
     return True
 
@@ -87,15 +116,29 @@ def ensure_engines_compiled(
     req: EngineCompilationRequest,
     log_callback: typing.Callable[[str], None] | None = None,
 ) -> EngineCompilationResult:
-    result = EngineCompilationResult()
+    import torch
 
-    need_basicvsrpp = req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
-        req.basicvsrpp_model_path, req.fp16, req.basicvsrpp_max_clip_size
+    from jasna.accelerator import is_amd_device, is_nvidia_device
+
+    result = EngineCompilationResult()
+    device = torch.device(req.device)
+    nvidia = is_nvidia_device(device)
+    amd = is_amd_device(device)
+
+    if req.unet4x and not nvidia:
+        raise RuntimeError("unet-4x currently requires the NVIDIA TensorRT build")
+
+    need_basicvsrpp = nvidia and req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
+        req.basicvsrpp_model_path, req.fp16
     )
     need_detection = req.detection and not _detection_engine_exists(
-        req.detection_model_name, req.detection_model_path, req.detection_batch_size, req.fp16
+        req.detection_model_name,
+        req.detection_model_path,
+        req.detection_batch_size,
+        req.fp16,
+        req.device,
     )
-    need_unet4x = req.unet4x and not _unet4x_engine_exists(req.fp16)
+    need_unet4x = nvidia and req.unet4x and not _unet4x_engine_exists(req.fp16)
 
     if need_unet4x:
         from jasna.engine_paths import unet4x_plaintext_available
@@ -103,7 +146,7 @@ def ensure_engines_compiled(
         if not unet4x_plaintext_available() and not license_store.is_licensed():
             raise RuntimeError("unet-4x is a supporter feature. Enter your license to enable it.")
 
-    if req.basicvsrpp:
+    if req.basicvsrpp and nvidia:
         if not req.fp16:
             result.use_basicvsrpp_tensorrt = False
         elif not need_basicvsrpp:
@@ -112,8 +155,12 @@ def ensure_engines_compiled(
     if not (need_basicvsrpp or need_detection or need_unet4x):
         return result
 
-    logger.info("Spawning engine compilation subprocess...")
-    start_msg = "Compiling TensorRT engines (this may take several minutes)..."
+    logger.info("Spawning GPU model compilation subprocess...")
+    start_msg = (
+        "Preparing MIGraphX model cache (this may take several minutes)..."
+        if amd
+        else "Compiling TensorRT engines (this may take several minutes)..."
+    )
     # The frozen GUI drops its console (FreeConsole), leaving stdout invalid — an
     # unconditional print() there raises WinError 6. Print only on the CLI (no callback).
     if log_callback:
@@ -152,9 +199,9 @@ def ensure_engines_compiled(
     if returncode != 0:
         raise RuntimeError(f"Engine compilation subprocess failed (exit code {returncode})")
 
-    if req.basicvsrpp:
+    if req.basicvsrpp and nvidia:
         result.use_basicvsrpp_tensorrt = _basicvsrpp_engines_exist(
-            req.basicvsrpp_model_path, req.fp16, req.basicvsrpp_max_clip_size
+            req.basicvsrpp_model_path, req.fp16
         )
 
     return result
@@ -169,6 +216,7 @@ def _subprocess_compile(req: EngineCompilationRequest) -> None:
     from jasna._suppress_noise import install as _install_noise_filters
     _install_noise_filters()
     import torch
+    from jasna.accelerator import is_nvidia_device
 
     # The compile subprocess imports torch_tensorrt (-> torch._inductor) directly, without
     # going through jasna.pipeline, so the source-introspection shims aren't installed yet.
@@ -177,22 +225,26 @@ def _subprocess_compile(req: EngineCompilationRequest) -> None:
     patch_frozen_torch()
 
     device = torch.device(req.device)
+    nvidia = is_nvidia_device(device)
 
-    if req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
-        req.basicvsrpp_model_path, req.fp16, req.basicvsrpp_max_clip_size
+    if nvidia and req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
+        req.basicvsrpp_model_path, req.fp16
     ):
         from jasna.restorer.basicvrspp_tenorrt_compilation import compile_mosaic_restoration_model
-        print(f"Compiling BasicVSR++ sub-engines (max_clip_size={req.basicvsrpp_max_clip_size})...")
+        print("Compiling BasicVSR++ sub-engines...")
         compile_mosaic_restoration_model(
             mosaic_restoration_model_path=req.basicvsrpp_model_path,
             device=device,
             fp16=req.fp16,
-            max_clip_size=req.basicvsrpp_max_clip_size,
         )
         print("BasicVSR++ sub-engines compiled.")
 
     if req.detection and not _detection_engine_exists(
-        req.detection_model_name, req.detection_model_path, req.detection_batch_size, req.fp16
+        req.detection_model_name,
+        req.detection_model_path,
+        req.detection_batch_size,
+        req.fp16,
+        req.device,
     ):
         from jasna.mosaic.detection_registry import precompile_detection_engine
         print(f"Compiling detection engine ({req.detection_model_name})...")
@@ -205,7 +257,7 @@ def _subprocess_compile(req: EngineCompilationRequest) -> None:
         )
         print("Detection engine compiled.")
 
-    if req.unet4x and not _unet4x_engine_exists(req.fp16):
+    if nvidia and req.unet4x and not _unet4x_engine_exists(req.fp16):
         from jasna.restorer.unet4x_secondary_restorer import compile_unet4x_engine
         print("Compiling Unet4x engine...")
         compile_unet4x_engine(device, fp16=req.fp16)

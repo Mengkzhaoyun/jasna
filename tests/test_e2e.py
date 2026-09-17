@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+from importlib.util import find_spec
 from fractions import Fraction
 from pathlib import Path
 
@@ -21,11 +22,7 @@ RESTORATION_ENGINE_CLIP10 = Path("model_weights/lada_mosaic_restoration_model_ge
 RFDETR_ONNX = Path("model_weights/rfdetr-v5.onnx")
 
 def _nvvfx_available() -> bool:
-    try:
-        import nvvfx  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    return find_spec("nvvfx") is not None
 
 REQUIRES_NVVFX = pytest.mark.skipif(not _nvvfx_available(), reason="nvvfx (RTX Video Effects) not available")
 REQUIRES_RFDETR = pytest.mark.skipif(not RFDETR_ONNX.exists(), reason="rfdetr-v5 ONNX not found")
@@ -128,7 +125,10 @@ class TestVideoDecoderE2E:
 @REQUIRES_CUDA
 class TestDetectionE2E:
     def test_rfdetr_detection_on_real_frames(self):
-        from jasna.mosaic.detection_registry import detection_model_weights_path
+        from jasna.mosaic.detection_registry import (
+            build_detection_model,
+            detection_model_weights_path,
+        )
 
         model_path = detection_model_weights_path("rfdetr-v5")
         if not model_path.exists():
@@ -136,17 +136,17 @@ class TestDetectionE2E:
         if not model_path.exists():
             pytest.skip("rfdetr-v5 model weights not found")
 
-        from jasna.mosaic.rfdetr import RfDetrMosaicDetectionModel
-
         meta = get_video_meta_data(str(TEST_CLIP))
         from jasna.media.video_decoder import NvidiaVideoReader
 
         device = torch.device("cuda:0")
         bs = 4
-        model = RfDetrMosaicDetectionModel(
-            onnx_path=model_path,
+        model = build_detection_model(
+            "rfdetr-v5",
+            model_path,
             batch_size=bs,
             device=device,
+            score_threshold=0.25,
             fp16=True,
         )
 
@@ -179,8 +179,6 @@ class TestEncoderE2E:
                 metadata=meta,
                 codec="hevc",
                 encoder_settings={},
-                stream_mode=False,
-                working_directory=tmp_path,
             ) as encoder:
                 count = 0
                 for frames, pts_list in reader.frames():
@@ -301,10 +299,11 @@ class TestFullPipelineE2E:
             device=device,
             max_clip_size=60,
             temporal_overlap=temporal_overlap,
+            max_detection_gap=0,
+            min_detection_duration=0,
             enable_crossfade=enable_crossfade,
             fp16=True,
             disable_progress=True,
-            working_directory=tmp_path,
         )
 
         det_spy = _DetectionSpy(pipeline.detection_model)

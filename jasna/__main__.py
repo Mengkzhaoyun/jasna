@@ -1,7 +1,10 @@
+import logging
 import multiprocessing
 import os
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+
+logger = logging.getLogger(__name__)
 
 from jasna import startup_timing  # noqa: F401  captures PROCESS_START near process start
 
@@ -39,26 +42,31 @@ if not is_frozen():
 
 
 def _preload_native_libs():
-    """Import native GPU libraries before tkinter on Linux.
+    """Import native media libraries before tkinter on Linux.
 
-    On Linux, loading Tcl/Tk (via customtkinter) first introduces shared
-    library conflicts that prevent _python_vali and PyNvVideoCodec native
-    extensions from initializing. Importing them before tkinter avoids this.
+    On Linux, loading Tcl/Tk (via customtkinter) first can introduce shared
+    library conflicts that prevent PyAV's bundled libav from initializing.
+    Importing it before tkinter avoids this.
     """
     if sys.platform != "linux":
         return
-    for mod in ("python_vali", "PyNvVideoCodec"):
+    for mod in ("av",):
         try:
             __import__(mod)
         except Exception:
-            pass
+            logger.warning("Native preload of %s failed", mod, exc_info=True)
 
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
 if multiprocessing.parent_process() is None:
-    argv0_stem = Path(sys.argv[0]).stem.lower()
+    argv0_path = (
+        PureWindowsPath(sys.argv[0])
+        if sys.platform == "win32"
+        else Path(sys.argv[0])
+    )
+    argv0_stem = argv0_path.stem.lower()
 
     if sys.platform == "win32":
         if argv0_stem == "jasna-cli":

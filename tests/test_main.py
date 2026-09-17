@@ -49,8 +49,8 @@ def _main_patches(pipeline_side_effect=None):
 
     with (
         patch("jasna.main.check_ascii_install_path", return_value=(True, "C:\\fake")),
-        patch("jasna.main.check_nvidia_gpu", return_value=(True, "Fake GPU")),
-        patch("jasna.main.check_gpu_driver_version", return_value=(True, "590.18")),
+        patch("jasna.main.check_supported_gpu", return_value=(True, "Fake GPU")),
+        patch("jasna.main.check_gpu_driver_version", return_value=(True, "610.18")),
         patch("jasna.main.check_required_executables"),        patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
         patch("jasna.engine_compiler.ensure_engines_compiled", return_value=MagicMock(use_basicvsrpp_tensorrt=False)),
         patch("jasna.pipeline.Pipeline", mock_pipeline_cls),
@@ -81,21 +81,36 @@ class TestBuildParser:
         assert args.max_clip_size == 90
         assert args.temporal_overlap == 8
         assert args.enable_crossfade is True
+        assert args.vr_mode == "auto"
         assert args.denoise == "none"
         assert args.denoise_step == "after_primary"
         assert args.secondary_restoration == "none"
         assert args.codec == "hevc"
+        assert args.cq is None
         assert args.encoder_settings == ""
+        assert args.retarget_high_fps is False
+        assert args.sharpen == 0.0
+        assert args.segments == ""
         assert args.stream is False
         assert args.stream_port == 8765
         assert args.stream_segment_duration == 4.0
         assert args.no_browser is False
         assert args.output_pattern is None
-        assert args.detection_model == "rfdetr-v5"
-        assert args.detection_score_threshold == 0.25
+        assert args.detection_model == "rfdetr-v6"
+        assert args.detection_score_threshold is None
         assert args.benchmark is False
         assert args.post_export_action == "none"
         assert args.post_export_command == ""
+        assert args.post_export_video_command == ""
+        assert args.working_directory is None
+
+    def test_working_directory(self):
+        args = build_parser().parse_args([
+            "--input", "a.mp4",
+            "--output", "b.mp4",
+            "--working-directory", "/fast/scratch",
+        ])
+        assert args.working_directory == "/fast/scratch"
 
     def test_no_fp16(self):
         args = build_parser().parse_args(["--input", "a.mp4", "--output", "b.mp4", "--no-fp16"])
@@ -118,6 +133,7 @@ class TestBuildParser:
         assert args.tvai_model == "iris-2"
         assert args.tvai_scale == 4
         assert args.tvai_workers == 2
+        assert args.tvai_denoise is False
 
     def test_rtx_defaults(self):
         args = build_parser().parse_args(["--input", "a.mp4", "--output", "b.mp4"])
@@ -135,6 +151,14 @@ class TestBuildParser:
         ])
         assert args.post_export_action == "command"
         assert args.post_export_command == "echo done"
+
+    def test_post_export_video_command(self):
+        args = build_parser().parse_args([
+            "--input", "a.mp4",
+            "--output", "b.mp4",
+            "--post-export-video-command", "remux {output}",
+        ])
+        assert args.post_export_video_command == "remux {output}"
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +193,33 @@ class TestOutputPath:
                 main()
 
         assert pipeline_kwargs["output_video"] == out
+
+    def test_post_export_video_command_runs_after_output_closes(self, tmp_path):
+        inp, out, rest, det = _make_model_files(tmp_path)
+        events: list[str] = []
+        pipeline = MagicMock()
+        pipeline.run.side_effect = lambda: events.append("run")
+        pipeline.close.side_effect = lambda: events.append("close")
+
+        with patch(
+            "jasna.post_export_action.run_post_export_video_command",
+            side_effect=lambda *_args: events.append("command"),
+        ) as command:
+            _run_main(
+                _base_argv(
+                    inp,
+                    out,
+                    rest,
+                    det,
+                    ["--post-export-video-command", "remux {output}"],
+                ),
+                pipeline_side_effect=lambda **_kwargs: pipeline,
+            )
+
+        assert events == ["run", "close", "command"]
+        args = command.call_args.args
+        assert args[:3] == ("remux {output}", inp, out)
+        assert callable(args[3])
 
     def test_streaming_without_output_uses_derived(self, tmp_path):
         inp, _, rest, det = _make_model_files(tmp_path)
@@ -217,12 +268,14 @@ class TestSecondaryRestorers:
                 "--tvai-scale", "2",
                 "--tvai-workers", "1",
                 "--tvai-args", "noise=5",
+                "--tvai-denoise",
             ]))
         mock_tvai.assert_called_once()
         kw = mock_tvai.call_args
         assert kw.kwargs["ffmpeg_path"] == "fake_ffmpeg.exe"
         assert kw.kwargs["scale"] == 2
         assert kw.kwargs["num_workers"] == 1
+        assert kw.kwargs["tvai_denoise"] is True
         assert "model=prob-4:scale=2:noise=5" in kw.kwargs["tvai_args"]
 
     def test_unet4x_secondary(self, tmp_path):
@@ -265,6 +318,31 @@ class TestSecondaryRestorers:
 
 
 # ---------------------------------------------------------------------------
+# Detection threshold resolution
+# ---------------------------------------------------------------------------
+
+class TestDetectionThresholdResolution:
+    def test_default_threshold_uses_fast_model_recommended(self, tmp_path):
+        inp, out, rest, det = _make_model_files(tmp_path)
+        pipeline_cls = _run_main(_base_argv(inp, out, rest, det))
+        assert pipeline_cls.call_args.kwargs["detection_score_threshold"] == 0.35
+
+    def test_default_threshold_uses_large_model_recommended(self, tmp_path):
+        inp, out, rest, det = _make_model_files(tmp_path)
+        pipeline_cls = _run_main(
+            _base_argv(inp, out, rest, det, ["--detection-model", "rfdetr-v6-large"])
+        )
+        assert pipeline_cls.call_args.kwargs["detection_score_threshold"] == 0.40
+
+    def test_explicit_threshold_overrides_recommended(self, tmp_path):
+        inp, out, rest, det = _make_model_files(tmp_path)
+        pipeline_cls = _run_main(
+            _base_argv(inp, out, rest, det, ["--detection-score-threshold", "0.5"])
+        )
+        assert pipeline_cls.call_args.kwargs["detection_score_threshold"] == 0.5
+
+
+# ---------------------------------------------------------------------------
 # Detection model discovery
 # ---------------------------------------------------------------------------
 
@@ -282,7 +360,7 @@ class TestDetectionModelDiscovery:
         det.touch()
 
         with patch("jasna.mosaic.detection_registry.discover_available_detection_models", return_value=["rfdetr-v3"]):
-            with patch("jasna.mosaic.detection_registry.detection_model_weights_path", return_value=det):
+            with patch("jasna.mosaic.detection_registry.require_detection_model_weights", return_value=det):
                 _run_main([
                     "jasna",
                     "--input", str(inp),
@@ -294,12 +372,12 @@ class TestDetectionModelDiscovery:
 
     def test_auto_discovery_no_warning_when_model_available(self, tmp_path, capsys):
         inp, out, rest, _ = _make_model_files(tmp_path, create_detection=False)
-        det = tmp_path / "model_weights" / "rfdetr-v5.onnx"
+        det = tmp_path / "model_weights" / "rfdetr-v6.onnx"
         (tmp_path / "model_weights").mkdir(exist_ok=True)
         det.touch()
 
-        with patch("jasna.mosaic.detection_registry.discover_available_detection_models", return_value=["rfdetr-v5"]):
-            with patch("jasna.mosaic.detection_registry.detection_model_weights_path", return_value=det):
+        with patch("jasna.mosaic.detection_registry.discover_available_detection_models", return_value=["rfdetr-v6"]):
+            with patch("jasna.mosaic.detection_registry.require_detection_model_weights", return_value=det):
                 _run_main([
                     "jasna",
                     "--input", str(inp),
@@ -308,6 +386,38 @@ class TestDetectionModelDiscovery:
                 ])
         captured = capsys.readouterr()
         assert "not found in model_weights" not in captured.out
+
+    def test_bundled_model_does_not_emit_missing_warning(self, tmp_path, capsys):
+        inp, out, rest, _ = _make_model_files(tmp_path, create_detection=False)
+        det = tmp_path / "model_weights" / "vr.pt"
+        det.parent.mkdir(exist_ok=True)
+        det.touch()
+
+        with (
+            patch(
+                "jasna.mosaic.detection_registry.discover_available_detection_models",
+                return_value=["rfdetr-v5", "zelefans-vr-yolo-v2"],
+            ),
+            patch(
+                "jasna.mosaic.detection_registry.require_detection_model_weights",
+                return_value=det,
+            ),
+        ):
+            _run_main(
+                [
+                    "jasna",
+                    "--input",
+                    str(inp),
+                    "--output",
+                    str(out),
+                    "--restoration-model-path",
+                    str(rest),
+                    "--detection-model",
+                    "zelefans-vr-yolo-v2",
+                ]
+            )
+
+        assert "not found in model_weights" not in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +463,33 @@ class TestArgForwarding:
         assert pipe["fp16"] is False
 
     def test_encoder_settings_forwarded(self, tmp_path):
-        pipe, _ = self._capture_run(tmp_path, ["--encoder-settings", "cq=22,lookahead=32"])
-        assert pipe["encoder_settings"] == {"cq": 22, "lookahead": 32}
+        pipe, _ = self._capture_run(tmp_path, ["--encoder-settings", "cq=22,rc-lookahead=32"])
+        assert pipe["encoder_settings"] == {"cq": 22, "rc-lookahead": 32}
+
+    def test_default_cq_follows_codec(self, tmp_path):
+        hevc, _ = self._capture_run(tmp_path, [])
+        h264, _ = self._capture_run(tmp_path, ["--codec", "h264"])
+        av1, _ = self._capture_run(tmp_path, ["--codec", "av1"])
+
+        assert hevc["encoder_settings"] == {"cq": 28}
+        assert h264["encoder_settings"] == {"cq": 25}
+        assert av1["encoder_settings"] == {"cq": 35}
+
+    def test_direct_cq_forwarded_unchanged(self, tmp_path):
+        pipe, _ = self._capture_run(tmp_path, ["--codec", "h264", "--cq", "31"])
+
+        assert pipe["encoder_settings"] == {"cq": 31}
+
+    def test_direct_cq_conflicts_with_advanced_cq(self, tmp_path):
+        with pytest.raises(ValueError, match="--cq.*--encoder-settings"):
+            self._capture_run(
+                tmp_path,
+                ["--cq", "28", "--encoder-settings", "cq=22"],
+            )
+
+    def test_direct_cq_validated_for_codec(self, tmp_path):
+        with pytest.raises(ValueError, match=r"h264.*1\.\.51"):
+            self._capture_run(tmp_path, ["--codec", "h264", "--cq", "52"])
 
     def test_batch_size_forwarded(self, tmp_path):
         pipe, _ = self._capture_run(tmp_path, ["--batch-size", "8"])
@@ -368,9 +503,25 @@ class TestArgForwarding:
         pipe, _ = self._capture_run(tmp_path, ["--temporal-overlap", "4", "--max-clip-size", "90"])
         assert pipe["temporal_overlap"] == 4
 
+    def test_vr_mode_forwarded(self, tmp_path):
+        pipe, _ = self._capture_run(tmp_path, ["--vr-mode", "sbs-fisheye"])
+        assert pipe["vr_mode"] == "sbs-fisheye"
+
     def test_no_progress_forwarded(self, tmp_path):
         pipe, _ = self._capture_run(tmp_path, ["--no-progress"])
         assert pipe["disable_progress"] is True
+
+    def test_retarget_high_fps_forwarded(self, tmp_path):
+        pipe, _ = self._capture_run(tmp_path, ["--retarget-high-fps"])
+        assert pipe["retarget_high_fps"] is True
+
+    def test_scene_detection_on_by_default(self, tmp_path):
+        pipe, _ = self._capture_run(tmp_path, [])
+        assert pipe["scene_detection"] is True
+
+    def test_no_scene_detection_forwarded(self, tmp_path):
+        pipe, _ = self._capture_run(tmp_path, ["--no-scene-detection"])
+        assert pipe["scene_detection"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +677,41 @@ class TestFolderBatchProgress:
         inp, out, rest, det = _make_model_files(tmp_path)
         _run_main(_base_argv(inp, out, rest, det))
         assert "Processing" not in capsys.readouterr().out
+
+    def test_post_export_video_command_failure_continues_folder_and_exits_1(
+        self, tmp_path, capsys
+    ):
+        in_dir = tmp_path / "in"
+        in_dir.mkdir()
+        (in_dir / "a.mp4").touch()
+        (in_dir / "b.mp4").touch()
+        rest = tmp_path / "restore.pth"
+        rest.touch()
+        det = tmp_path / "det.onnx"
+        det.touch()
+        argv = [
+            "jasna",
+            "--input", str(in_dir),
+            "--output", str(tmp_path / "out"),
+            "--restoration-model-path", str(rest),
+            "--detection-model-path", str(det),
+            "--post-export-video-command", "remux {output}",
+        ]
+
+        from jasna.post_export_action import PostExportVideoCommandError
+
+        command = MagicMock(
+            side_effect=[PostExportVideoCommandError("exit code 7"), None]
+        )
+        with patch(
+            "jasna.post_export_action.run_post_export_video_command", command
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _run_main(argv)
+
+        assert exc.value.code == 1
+        assert command.call_count == 2
+        assert "Error post-processing a.mp4" in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------
@@ -741,8 +927,8 @@ class TestCleanup:
 
         with (
             patch("jasna.main.check_ascii_install_path", return_value=(True, "C:\\fake")),
-            patch("jasna.main.check_nvidia_gpu", return_value=(True, "Fake GPU")),
-            patch("jasna.main.check_gpu_driver_version", return_value=(True, "590.18")),
+            patch("jasna.main.check_supported_gpu", return_value=(True, "Fake GPU")),
+            patch("jasna.main.check_gpu_driver_version", return_value=(True, "610.18")),
             patch("jasna.main.check_required_executables"),            patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
             patch("jasna.engine_compiler.ensure_engines_compiled", return_value=MagicMock(use_basicvsrpp_tensorrt=False)),
             patch("jasna.pipeline.Pipeline", side_effect=make_pipeline),
@@ -847,8 +1033,8 @@ class TestEngineCompilation:
 
         with (
             patch("jasna.main.check_ascii_install_path", return_value=(True, "C:\\fake")),
-            patch("jasna.main.check_nvidia_gpu", return_value=(True, "Fake GPU")),
-            patch("jasna.main.check_gpu_driver_version", return_value=(True, "590.18")),
+            patch("jasna.main.check_supported_gpu", return_value=(True, "Fake GPU")),
+            patch("jasna.main.check_gpu_driver_version", return_value=(True, "610.18")),
             patch("jasna.main.check_required_executables"),            patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
             patch("jasna.engine_compiler.ensure_engines_compiled", return_value=MagicMock(use_basicvsrpp_tensorrt=False)) as mock_compile,
             patch("jasna.pipeline.Pipeline", return_value=MagicMock()),
@@ -867,8 +1053,8 @@ class TestEngineCompilation:
 
         with (
             patch("jasna.main.check_ascii_install_path", return_value=(True, "C:\\fake")),
-            patch("jasna.main.check_nvidia_gpu", return_value=(True, "Fake GPU")),
-            patch("jasna.main.check_gpu_driver_version", return_value=(True, "590.18")),
+            patch("jasna.main.check_supported_gpu", return_value=(True, "Fake GPU")),
+            patch("jasna.main.check_gpu_driver_version", return_value=(True, "610.18")),
             patch("jasna.main.check_required_executables"),            patch("jasna.main.check_windows_nvidia_sysmem_fallback_policy", return_value=(True, "OK")),
             patch("jasna.engine_compiler.ensure_engines_compiled", return_value=MagicMock(use_basicvsrpp_tensorrt=False)) as mock_compile,
             patch("jasna.pipeline.Pipeline", return_value=MagicMock()),

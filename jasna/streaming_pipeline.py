@@ -15,7 +15,7 @@ from jasna.media import UnsupportedColorspaceError, get_video_meta_data
 from jasna.pipeline_items import FrameMeta, _SENTINEL
 from jasna.pipeline_threads import decode_detect_loop, primary_restore_loop, secondary_restore_loop, blend_encode_loop
 from jasna.streaming import HlsStreamingServer
-from jasna.streaming_encoder import StreamingEncoder
+from jasna.streaming_encoder import StreamingEncoder, StreamingEncodeError
 from jasna.vram_offloader import VramOffloader
 
 log = logging.getLogger(__name__)
@@ -40,10 +40,11 @@ class _StreamingFrameWriter:
     def set_cancel_event(self, cancel_event: threading.Event) -> None:
         self._cancel_event = cancel_event
 
-    def write(self, frame: torch.Tensor, pts: int) -> None:
+    def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None:
         self._encoder.write_frame(frame, pts)
 
     def after_write(self, frames_written: int) -> None:
+        self._encoder.raise_if_failed()
         if frames_written == 1:
             log.debug("[stream-blend-encode] first frame encoded: %.2fs", time.monotonic() - self._t0)
         elif frames_written % 100 == 0:
@@ -67,9 +68,15 @@ def run_streaming(
     from av.video.reformatter import Colorspace as AvColorspace
     device = pipeline.device
     metadata = get_video_meta_data(str(pipeline.input_video))
-    if metadata.color_space not in (AvColorspace.ITU709, AvColorspace.ITU601):
+    pipeline.configure_vr(metadata)
+    if metadata.color_space not in (
+        AvColorspace.ITU709,
+        AvColorspace.ITU601,
+        AvColorspace.BT2020,
+    ):
         raise UnsupportedColorspaceError(
-            f"Unsupported color space: {metadata.color_space!r} in {pipeline.input_video.name}. Only BT.709 and BT.601 are supported."
+            f"Unsupported color space: {metadata.color_space!r} in {pipeline.input_video.name}. "
+            "Only BT.709, BT.601, and BT.2020 non-constant-luminance are supported."
         )
 
     own_server = hls_server is None
@@ -121,6 +128,7 @@ def _streaming_loop(
     streaming_encoder: StreamingEncoder,
 ) -> None:
     start_segment = 0
+    first_pass = True
 
     while True:
         start_time = hls_server.segment_start_time(start_segment)
@@ -131,7 +139,11 @@ def _streaming_loop(
         hls_server.reset_demand(start_segment)
         if start_segment > 0:
             hls_server.notify_segment_requested(start_segment)
-        streaming_encoder.flush_and_restart(start_number=start_segment) if start_segment > 0 else streaming_encoder.start(start_number=0)
+        if first_pass:
+            streaming_encoder.start(start_number=start_segment)
+            first_pass = False
+        else:
+            streaming_encoder.flush_and_restart(start_number=start_segment)
 
         cancel_event = threading.Event()
         seek_result = _run_streaming_pass(
@@ -154,6 +166,7 @@ def _streaming_loop(
 
         if seek_result is None:
             streaming_encoder.stop()
+            streaming_encoder.raise_if_failed()
             hls_server.mark_finished()
             log.info("[stream] pass finished, all segments produced — waiting for seek requests")
             while True:
@@ -191,7 +204,7 @@ def _run_streaming_pass(
     metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=pipeline.max_clip_size * 5)
 
     error_holder: list[BaseException] = []
-    blend_buffer = BlendBuffer(device=device)
+    blend_buffer = BlendBuffer(device=device, vr_projector=pipeline._vr_projector)
     crop_buffers: dict[int, CropBuffer] = {}
     crop_lock = threading.Lock()
     primary_idle_event = threading.Event()
@@ -217,10 +230,13 @@ def _run_streaming_pass(
                 batch_size=pipeline.batch_size,
                 device=device,
                 metadata=metadata,
-                detection_model=pipeline.detection_model,
+                detection_model=pipeline._job_detection_model,
                 max_clip_size=pipeline.max_clip_size,
                 temporal_overlap=pipeline.temporal_overlap,
+                max_detection_gap=pipeline.max_detection_gap,
+                min_detection_duration=pipeline.min_detection_duration,
                 enable_crossfade=pipeline.enable_crossfade,
+                scene_detection=pipeline.scene_detection,
                 blend_buffer=blend_buffer,
                 crop_buffers=crop_buffers,
                 clip_queue=clip_queue,
@@ -229,6 +245,8 @@ def _run_streaming_pass(
                 frame_shape=frame_shape,
                 cancel_event=cancel_event,
                 seek_ts=seek_ts,
+                vr_mode=pipeline._vr_resolution.resolved,
+                vr_projector=pipeline._vr_projector,
             ),
             name="StreamDecodeDetect", daemon=True,
         ),
@@ -283,7 +301,13 @@ def _run_streaming_pass(
             log.info("[stream] video change detected, cancelling current pass")
             cancel_event.set()
             break
-        target = hls_server.consume_seek()
+        try:
+            streaming_encoder.raise_if_failed()
+        except StreamingEncodeError as exc:
+            error_holder.append(exc)
+            cancel_event.set()
+            break
+        target = hls_server.consume_seek_for_pass(start_segment)
         if target is not None:
             log.info("[stream] seek requested to segment %d, cancelling current pass", target)
             seek_target = target

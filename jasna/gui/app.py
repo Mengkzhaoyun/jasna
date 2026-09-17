@@ -2,16 +2,26 @@
 
 import customtkinter as ctk
 import logging
+import os
 from pathlib import Path
+import sys
 import threading
 import time
+import tkinter as tk
 
 from tkinterdnd2 import TkinterDnD, DND_FILES
 
 from jasna import __version__
 from jasna import startup_timing
+from jasna.gui.branding import (
+    HEADER_LOGO_SIZE,
+    create_header_logo,
+    install_window_icon,
+)
+from jasna.gui import scaling
 from jasna.gui.theme import Colors, Fonts, Sizing
 from jasna.gui.components import StatusPill, BuyMeCoffeeButton, UnifansButton, Toast, LicenseDialog
+from jasna.gui.icons import create_icon, create_native_icon_image
 from jasna.gui.queue_panel import QueuePanel
 from jasna.gui.settings_panel import SettingsPanel
 from jasna.engine_paths import UNET4X_ONNX_ENC_PATH
@@ -21,8 +31,19 @@ from jasna.gui.log_filter import runtime_log_level_for_filter
 from jasna.gui.processor import Processor, ProgressUpdate
 from jasna.gui.models import JobStatus, PresetManager
 from jasna.gui.locales import get_locale, t, LANGUAGE_NAMES
+from jasna.gui.font_backend import (
+    GuiFontBackendError,
+    font_backend_error,
+    font_backend_problem,
+    font_backend_status_json,
+    inspect_font_backend,
+)
+from jasna._frozen import is_frozen
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_WINDOW_SIZE = (1320, 960)
+_MIN_WINDOW_SIZE = (900, 580)
 
 
 def _warm_up_cuda() -> None:
@@ -39,6 +60,16 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
     
     def __init__(self, skip_wizard: bool = False):
         super().__init__()
+        font_status = inspect_font_backend(self)
+        font_problem = font_backend_problem(font_status)
+        if font_problem is not None:
+            from tkinter import messagebox
+
+            message = font_backend_error(font_status, frozen=is_frozen())
+            self.withdraw()
+            messagebox.showerror("Jasna GUI font error", message, parent=self)
+            self.destroy()
+            raise GuiFontBackendError(message)
         self._t_init_start = startup_timing.elapsed_ms()
         try:
             self.TkdndVersion = TkinterDnD._require(self)
@@ -48,19 +79,11 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self.TkdndVersion = None
         
         self.title("Jasna GUI")
+        self._window_icon = install_window_icon(self)
         self.configure(fg_color=Colors.BG_MAIN)
 
-        self.update_idletasks()
-        screen_w = self.winfo_screenwidth()
-        screen_h = self.winfo_screenheight()
+        self._size_and_center()
 
-        win_w = min(1200, screen_w - 40)
-        win_h = min(880, screen_h - 80)
-        x = (screen_w - win_w) // 2
-        y = max(0, (screen_h - win_h) // 2 - int(screen_h * 0.15 / 2))
-        self.geometry(f"{win_w}x{win_h}+{x}+{y}")
-        self.minsize(900, 580)
-        
         # Set appearance
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
@@ -69,6 +92,9 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         self._processor: Processor | None = None
         self._job_start_times: dict[int, float] = {}
         self._processing_start_time: float = 0.0
+        self._preview_gpu_busy = False
+        self._video_player_dialog = None
+        self._closing_after_player = False
         self._preset_manager = PresetManager()
 
         self._system_stats_stop = threading.Event()
@@ -88,10 +114,25 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             if self._preset_manager.get_system_check_passed_version() != __version__:
                 self.after(100, self._show_wizard)
             
+    def _size_and_center(self):
+        self.update_idletasks()
+        rect = scaling.screen_rect(self)
+        width, height = scaling.fit_size(
+            scaling.to_physical(self, *_DEFAULT_WINDOW_SIZE),
+            rect[2:],
+            scaling.to_physical(self, *scaling.SCREEN_MARGIN),
+        )
+        x = rect[0] + (rect[2] - width) // 2
+        y = rect[1] + max(0, (rect[3] - height) // 2 - int(rect[3] * 0.15 / 2))
+        scaling.apply_geometry(self, width, height, x, y)
+        scaling.apply_minsize(self, *_MIN_WINDOW_SIZE)
+
     def _build_ui(self):
+        # Footer before the body: the packer starves its last slaves when the window is
+        # shorter than the requested layout, and the control bar must never be the casualty.
         self._build_header()
-        self._build_main_body()
         self._build_footer()
+        self._build_main_body()
         
     def _build_header(self):
         header = ctk.CTkFrame(self, fg_color=Colors.BG_PANEL, height=Sizing.HEADER_HEIGHT, corner_radius=0)
@@ -102,15 +143,14 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         left = ctk.CTkFrame(header, fg_color="transparent")
         left.pack(side="left", padx=Sizing.PADDING_MEDIUM)
         
+        self._header_logo = create_header_logo()
         logo = ctk.CTkLabel(
             left,
-            text="J",
-            font=(Fonts.FAMILY, 18, "bold"),
-            text_color=Colors.PRIMARY,
-            fg_color=Colors.PRIMARY_DARK,
-            corner_radius=4,
-            width=28,
-            height=28,
+            text="",
+            image=self._header_logo,
+            fg_color="transparent",
+            width=HEADER_LOGO_SIZE[0],
+            height=HEADER_LOGO_SIZE[1],
         )
         logo.pack(side="left")
         
@@ -140,11 +180,20 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         right.pack(side="right", padx=Sizing.PADDING_MEDIUM)
         
         # Language selector
-        lang_label = ctk.CTkLabel(
+        self._language_icon = create_native_icon_image(
             right,
-            text="🌐",
-            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
-            text_color=Colors.TEXT_PRIMARY,
+            "globe",
+            16,
+            Colors.TEXT_PRIMARY,
+        )
+        lang_label = tk.Label(
+            right,
+            image=self._language_icon,
+            background=Colors.BG_PANEL,
+            width=scaling.raw_tk_size(right, 18),
+            height=scaling.raw_tk_size(right, 18),
+            borderwidth=0,
+            highlightthickness=0,
         )
         lang_label.pack(side="left", padx=(0, 4))
         
@@ -168,6 +217,27 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         )
         self._lang_dropdown.pack(side="left", padx=(0, 12))
         self._lang_dropdown.set(current_lang_name)
+
+        self._video_player_icon = create_icon("play", 16, Colors.PLAYER_TEXT)
+        self._video_player_btn = ctk.CTkButton(
+            right,
+            text=t("btn_video_player"),
+            image=self._video_player_icon,
+            compound="left",
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL, "bold"),
+            fg_color=Colors.PLAYER,
+            hover_color=Colors.PLAYER_HOVER,
+            border_color=Colors.PLAYER_BORDER,
+            border_width=1,
+            border_spacing=6,
+            text_color=Colors.PLAYER_TEXT,
+            text_color_disabled=Colors.STATUS_PENDING,
+            corner_radius=8,
+            width=145,
+            height=34,
+            command=self._open_video_player,
+        )
+        self._video_player_btn.pack(side="left", padx=(0, 12))
         
         # Support buttons — back the project on Buy Me a Coffee or Unifans
         self._bmc_btn = BuyMeCoffeeButton(right, compact=False)
@@ -194,7 +264,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             hover_color=Colors.BG_CARD,
             text_color=Colors.TEXT_PRIMARY,
             width=80,
-            command=self._show_wizard,
+            command=self._show_system_check,
         )
         self._system_check_btn.pack(side="left", padx=(0, 4))
         
@@ -225,26 +295,57 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _build_main_body(self):
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True)
-        
-        # Left: Queue panel
-        self._queue_panel = QueuePanel(body)
-        self._queue_panel.pack(side="left", fill="y")
+
+        # Not sashcursor: Tk applies it to the whole panedwindow window, and the
+        # cursorless panes inherit it, showing resize arrows everywhere. The
+        # widget cursor covers only the exposed sash strip, and the panes mask
+        # inheritance with an explicit "arrow".
+        self._workspace = tk.PanedWindow(
+            body,
+            orient=tk.HORIZONTAL,
+            background=Colors.BORDER,
+            borderwidth=0,
+            cursor="sb_h_double_arrow",
+            opaqueresize=True,
+            sashpad=0,
+            sashrelief=tk.FLAT,
+            sashwidth=scaling.raw_tk_size(body, 4),
+        )
+        self._workspace.pack(fill="both", expand=True)
+
+        self._queue_panel = QueuePanel(self._workspace)
+        self._queue_panel.configure(cursor="arrow")
         self._queue_panel.set_on_jobs_changed(self._on_jobs_changed)
-        
-        # Separator
-        sep = ctk.CTkFrame(body, fg_color=Colors.BORDER, width=1)
-        sep.pack(side="left", fill="y")
-        
-        # Right: Settings panel
-        self._settings_panel = SettingsPanel(body)
-        self._settings_panel.pack(side="right", fill="both", expand=True)
+
+        self._settings_panel = SettingsPanel(self._workspace)
+        self._settings_panel.configure(cursor="arrow")
         self._settings_panel.set_on_interactive_image_restore(self._open_interactive_image_restore)
+
+        self._workspace.add(
+            self._queue_panel,
+            minsize=scaling.raw_tk_size(self._workspace, Sizing.QUEUE_PANEL_MIN_WIDTH),
+            stretch="never",
+            width=scaling.raw_tk_size(self._workspace, Sizing.QUEUE_PANEL_WIDTH),
+        )
+        self._workspace.add(
+            self._settings_panel,
+            minsize=scaling.raw_tk_size(self._workspace, Sizing.SETTINGS_PANEL_MIN_WIDTH),
+            stretch="always",
+        )
         
+        self._queue_panel.set_segment_editor_context(
+            self._settings_panel.get_settings,
+            lambda: self._processor is not None and self._processor.is_running(),
+            self._set_preview_gpu_busy,
+        )
         self._queue_panel.set_initial_output(
             self._settings_panel.get_last_output_folder(),
             self._settings_panel.get_last_output_pattern(),
         )
         self._queue_panel.set_on_output_changed(self._on_output_changed)
+        self._queue_panel.set_on_play(
+            lambda path: JasnaApp._open_video_player(self, path)
+        )
         if self.TkdndVersion is not None:
             self._queue_panel.enable_file_drop()
         
@@ -304,6 +405,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 try:
                     self.after(0, lambda s=stats: self._control_bar.set_system_stats(s))
                 except Exception:
+                    logger.debug("System stats poller stopping (widget gone)", exc_info=True)
                     return
                 self._system_stats_stop.wait(1.5)
 
@@ -317,6 +419,10 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._system_stats_thread = None
 
     def _on_close(self):
+        if self._video_player_dialog is not None:
+            self._closing_after_player = True
+            self._video_player_dialog.request_close()
+            return
         try:
             if self._processor:
                 self._processor.stop()
@@ -340,10 +446,22 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         from jasna.gui.wizard import FirstRunWizard
         FirstRunWizard(self, on_complete=self._on_wizard_complete)
 
+    def _show_system_check(self):
+        from jasna.gui.wizard import FirstRunWizard
+        FirstRunWizard(self, on_complete=self._on_system_check_complete)
+
     def _on_wizard_complete(self, can_continue: bool, all_passed: bool = False):
         if not can_continue:
             self._log_panel.error(t("wizard_log_blocked"))
             self._on_close()
+            return
+        if all_passed:
+            self._preset_manager.set_system_check_passed_version(__version__)
+        self._log_panel.info(t("wizard_log_ready"))
+
+    def _on_system_check_complete(self, can_continue: bool, all_passed: bool = False):
+        """Dismissing a re-run system check only closes the dialog; it never quits the app."""
+        if not can_continue:
             return
         if all_passed:
             self._preset_manager.set_system_check_passed_version(__version__)
@@ -381,14 +499,63 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._queue_panel.get_output_pattern(),
             on_log=lambda level, message: self._log_panel.add_log(level, message),
         )
+
+    def _open_video_player(self, path: Path | None = None):
+        if self._preview_gpu_busy or (
+            self._processor is not None and self._processor.is_running()
+        ):
+            return
+        from jasna.gui.video_player import VideoPlayerDialog
+
+        self._set_preview_gpu_busy(True)
+        try:
+            self._video_player_dialog = VideoPlayerDialog(
+                self,
+                self._settings_panel.get_settings(),
+                initial_path=path,
+                on_closed=self._video_player_closed,
+            )
+        except Exception:
+            self._video_player_dialog = None
+            self._set_preview_gpu_busy(False)
+            raise
+
+    def _video_player_closed(self):
+        self._video_player_dialog = None
+        self._set_preview_gpu_busy(False)
+        if self._closing_after_player:
+            self._closing_after_player = False
+            self.after(0, self._on_close)
         
     def _update_start_button_state(self):
         jobs = self._queue_panel.get_jobs()
-        can_start = bool(jobs)
+        can_start = bool(jobs) and not self._preview_gpu_busy
         if can_start:
             self._control_bar.set_start_enabled(True)
+        elif self._preview_gpu_busy:
+            self._control_bar.set_start_enabled(False, t("segments_restore_restoring"))
         else:
             self._control_bar.set_start_enabled(False, t("toast_no_files"))
+        self._update_video_player_button_state()
+
+    def _update_video_player_button_state(self) -> None:
+        video_player_btn = self.__dict__.get("_video_player_btn")
+        if video_player_btn is None:
+            return
+        processing = self._processor is not None and self._processor.is_running()
+        disabled = self._preview_gpu_busy or processing
+        video_player_btn.configure(
+            state="disabled" if disabled else "normal",
+            fg_color=Colors.BG_CARD if disabled else Colors.PLAYER,
+            border_color=Colors.BORDER_LIGHT if disabled else Colors.PLAYER_BORDER,
+        )
+
+    def _set_preview_gpu_busy(self, busy: bool) -> None:
+        self._preview_gpu_busy = bool(busy)
+        try:
+            self.after(0, self._update_start_button_state)
+        except (tk.TclError, RuntimeError):
+            pass
         
     def _show_toast(self, message: str, type_: str = "info"):
         """Show a toast notification."""
@@ -396,6 +563,10 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         toast.place(relx=0.5, rely=0.9, anchor="center")
         
     def _on_start(self):
+        if self._preview_gpu_busy or (
+            self._processor is not None and self._processor.is_running()
+        ):
+            return
         jobs = self._queue_panel.get_jobs()
         if not jobs:
             self._log_panel.warning(t("toast_no_files"))
@@ -442,13 +613,17 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 self._log_panel.warning(msg)
         except Exception as e:
             self._log_panel.warning(f"Engine preflight warning failed: {e}")
+
+        self._queue_panel.reset_jobs_for_run()
         
         self._status_pill.set_status("PROCESSING", Colors.STATUS_PROCESSING)
         self._control_bar.set_running(True)
+        self._video_player_btn.configure(state="disabled")
         
         # Disable settings and output controls while running
         self._settings_panel.set_enabled(False)
         self._queue_panel.set_output_enabled(False)
+        self._queue_panel.set_running(True)
         
         self._log_panel.info("Processing started by user")
         self._log_panel.info(f"Output folder: {output_folder}")
@@ -465,6 +640,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             output_pattern,
             disable_basicvsrpp_tensorrt=disable_basicvsrpp_tensorrt,
         )
+        self._update_video_player_button_state()
                 
     def _on_stop(self):
         if self._processor:
@@ -473,8 +649,10 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             
         self._status_pill.set_status("IDLE", Colors.STATUS_PENDING)
         self._control_bar.reset()
-        self._update_start_button_state()
-        
+        # Start stays disabled until the worker thread has finished unwinding;
+        # _handle_complete re-enables it.
+        self._control_bar.set_start_enabled(False)
+
         # Re-enable settings and output controls
         self._settings_panel.set_enabled(True)
         self._queue_panel.set_output_enabled(True)
@@ -515,7 +693,9 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             try:
                 self._queue_panel.set_running(True, processing_job_id=job_id)
             except Exception:
-                pass
+                logger.warning("Failed to mark queue panel running", exc_info=True)
+        if update.status == JobStatus.PENDING:
+            self._job_start_times.pop(job_id, None)
         job_elapsed: float | None = None
         if update.status == JobStatus.COMPLETED:
             start = self._job_start_times.pop(job_id, None)
@@ -530,7 +710,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
                 elapsed_seconds=job_elapsed,
             )
         except Exception:
-            pass
+            logger.warning("Failed to update job status in queue panel", exc_info=True)
             
     def _on_processor_log(self, level: str, message: str):
         self.after(0, lambda: self._log_panel.add_log(level, message))
@@ -552,7 +732,7 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         try:
             self._queue_panel.set_running(False)
         except Exception:
-            pass
+            logger.warning("Failed to clear queue panel running state", exc_info=True)
         
     def _on_language_changed(self, lang_name: str):
         """Handle language selection change."""
@@ -575,6 +755,8 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         # Update header buttons
         self._help_btn.configure(text=t("btn_help"))
         self._about_btn.configure(text=t("btn_about"))
+        self._video_player_btn.configure(text=t("btn_video_player"))
+        self._status_pill.refresh_text()
         # Note: Other panels would need their own refresh methods
         # For a full implementation, each panel should listen to locale changes
         
@@ -585,19 +767,12 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _show_about(self):
         dialog = ctk.CTkToplevel(self)
         dialog.title(t("dialog_about_title"))
-        dialog.geometry("400x250")
         dialog.resizable(False, False)
         dialog.configure(fg_color=Colors.BG_MAIN)
         dialog.transient(self)
         dialog.wait_visibility()  # X11: window must be viewable before grab_set, else TclError
         dialog.grab_set()
-        
-        # Center on parent
-        dialog.update_idletasks()
-        x = self.winfo_x() + (self.winfo_width() - 400) // 2
-        y = self.winfo_y() + (self.winfo_height() - 250) // 2
-        dialog.geometry(f"+{x}+{y}")
-        
+
         ctk.CTkLabel(
             dialog,
             text="Jasna",
@@ -635,6 +810,17 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             command=dialog.destroy,
         ).pack(pady=30)
 
+        # Size to content so translated text never clips the close button
+        dialog.update_idletasks()
+        minimum_width, _ = scaling.to_physical(dialog, 400, 0)
+        scaling.place_centered_on_parent(
+            dialog,
+            self,
+            max(minimum_width, dialog.winfo_reqwidth()),
+            dialog.winfo_reqheight(),
+        )
+        return dialog
+
 
 class GUILogHandler(logging.Handler):
     """Custom logging handler that forwards logs to the GUI log panel."""
@@ -654,16 +840,33 @@ class GUILogHandler(logging.Handler):
 
 def run_gui():
     """Entry point to run the GUI application."""
+    from jasna._frozen import patch_frozen_torch
+    patch_frozen_torch()
+
     import logging
-    import os
     # Set up basic logging - will be connected to GUI after app creation
     logging.basicConfig(
         level=logging.INFO,
         format='%(message)s',
         handlers=[logging.StreamHandler()]  # Temporary console output
     )
-    
-    app = JasnaApp()
+
+    scaling.activate_static_dpi(_MIN_WINDOW_SIZE)
+
+    if os.environ.get("JASNA_GUI_FONT_PROBE") == "1":
+        root = ctk.CTk()
+        try:
+            status = inspect_font_backend(root)
+            print(font_backend_status_json(status), flush=True)
+            raise SystemExit(0 if font_backend_problem(status) is None else 1)
+        finally:
+            root.destroy()
+
+    try:
+        app = JasnaApp()
+    except GuiFontBackendError as error:
+        print(error, file=sys.stderr)
+        return
     
     # Replace console handler with GUI handler for all jasna loggers
     gui_handler = GUILogHandler(app._log_panel)

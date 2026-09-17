@@ -1,9 +1,13 @@
 from pathlib import Path
+from fractions import Fraction
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from jasna.pipeline import Pipeline
+from jasna.vr180 import SbsDetectionAdapter
+from jasna.vr_projection import FisheyeProjector, GnomonicProjector
 
 
 def _make_pipeline(**overrides):
@@ -20,6 +24,8 @@ def _make_pipeline(**overrides):
         device=torch.device("cpu"),
         max_clip_size=60,
         temporal_overlap=8,
+        max_detection_gap=0,
+        min_detection_duration=0,
         enable_crossfade=True,
         fp16=True,
     )
@@ -59,6 +65,8 @@ class TestPipelineInit:
                 device=torch.device("cpu"),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 fp16=True,
             )
             mock_rf.assert_called_once()
@@ -82,6 +90,8 @@ class TestPipelineInit:
                 device=torch.device("cpu"),
                 max_clip_size=60,
                 temporal_overlap=8,
+                max_detection_gap=0,
+                min_detection_duration=0,
                 fp16=True,
             )
             mock_yolo.assert_called_once()
@@ -91,13 +101,100 @@ class TestPipelineInit:
         p = _make_pipeline(enable_crossfade=False)
         assert p.enable_crossfade is False
 
-    def test_working_directory(self):
-        p = _make_pipeline(working_directory=Path("/tmp/work"))
-        assert p.working_directory == Path("/tmp/work")
+    def test_codec_forwarded_unchanged(self):
+        for codec in ("hevc", "h264", "av1"):
+            assert _make_pipeline(codec=codec).codec == codec
 
     def test_progress_callback(self):
         cb = MagicMock()
         p = _make_pipeline(progress_callback=cb)
         assert p.progress_callback is cb
 
+    def test_retarget_high_fps_defaults_off_and_can_be_enabled(self):
+        assert _make_pipeline().retarget_high_fps is False
+        assert _make_pipeline(retarget_high_fps=True).retarget_high_fps is True
 
+    def test_fmp4_defaults_off_and_can_be_enabled(self):
+        assert _make_pipeline().fmp4 is False
+        assert _make_pipeline(fmp4=True).fmp4 is True
+
+    def test_scene_detection_defaults_on_and_can_be_disabled(self):
+        assert _make_pipeline().scene_detection is True
+        assert _make_pipeline(scene_detection=False).scene_detection is False
+
+    def test_configure_vr_wraps_detector_for_direct_sbs(self):
+        pipeline = _make_pipeline(
+            input_video=Path("VRKM-0001.mp4"),
+            vr_mode="auto",
+        )
+        metadata = SimpleNamespace(
+            video_width=200,
+            video_height=100,
+            sample_aspect_ratio=Fraction(1, 1),
+            stereo_layout="",
+            spherical_projection="",
+        )
+
+        pipeline.configure_vr(metadata)
+
+        assert pipeline._vr_resolution.resolved == "sbs"
+        assert isinstance(pipeline._job_detection_model, SbsDetectionAdapter)
+        assert pipeline._vr_projector is None
+
+    def test_configure_vr_builds_fisheye_projector(self):
+        pipeline = _make_pipeline(
+            input_video=Path("FSVSS-0001.mp4"),
+            vr_mode="auto",
+        )
+        metadata = SimpleNamespace(
+            video_width=200,
+            video_height=100,
+            sample_aspect_ratio=Fraction(1, 1),
+            stereo_layout="",
+            spherical_projection="",
+        )
+
+        pipeline.configure_vr(metadata)
+
+        assert pipeline._vr_resolution.resolved == "sbs"
+        assert pipeline._vr_resolution.projection == "fisheye"
+        assert isinstance(pipeline._job_detection_model, SbsDetectionAdapter)
+        assert isinstance(pipeline._vr_projector, FisheyeProjector)
+        assert pipeline._vr_projector.eye_width == 100
+
+    def test_configure_vr_builds_gnomonic_projector_for_routed_studio(self):
+        pipeline = _make_pipeline(
+            input_video=Path("VRPRD-0108.mp4"),
+            vr_mode="auto",
+        )
+        metadata = SimpleNamespace(
+            video_width=200,
+            video_height=100,
+            sample_aspect_ratio=Fraction(1, 1),
+            stereo_layout="",
+            spherical_projection="",
+        )
+
+        pipeline.configure_vr(metadata)
+
+        assert pipeline._vr_resolution.projection == "gnomonic"
+        assert isinstance(pipeline._vr_projector, GnomonicProjector)
+
+    def test_configure_vr_honors_per_job_projection_override(self):
+        pipeline = _make_pipeline(
+            input_video=Path("VRKM-0001.mp4"),
+            vr_mode="auto",
+            vr_projection="fisheye",
+        )
+        metadata = SimpleNamespace(
+            video_width=200,
+            video_height=100,
+            sample_aspect_ratio=Fraction(1, 1),
+            stereo_layout="",
+            spherical_projection="",
+        )
+
+        pipeline.configure_vr(metadata)
+
+        assert pipeline._vr_resolution.projection == "fisheye"
+        assert isinstance(pipeline._vr_projector, FisheyeProjector)

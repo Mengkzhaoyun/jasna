@@ -7,13 +7,47 @@ from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvCol
 
 from jasna.media import (
     SUPPORTED_ENCODER_SETTINGS,
+    SUPPORTED_ENCODER_SETTINGS_BY_CODEC,
     _parse_encoder_setting_scalar,
     parse_encoder_settings,
     validate_encoder_settings,
     is_stream_10bit,
     get_video_meta_data,
+    parse_sample_aspect_ratio,
+    parse_video_bitrate,
+    resolve_video_start_pts,
     VideoMetadata,
 )
+
+
+@pytest.mark.parametrize(
+    ("stream_start", "metadata_start", "expected"),
+    [
+        (900, 300, 900),
+        (0, 300, 0),
+        (None, 300, 300),
+        (None, None, 0),
+    ],
+)
+def test_resolve_video_start_pts(stream_start, metadata_start, expected) -> None:
+    assert resolve_video_start_pts(stream_start, metadata_start) == expected
+
+
+@pytest.mark.parametrize(
+    ("stream", "fmt", "expected"),
+    [
+        ({"bit_rate": "18913000"}, {}, 18913000),
+        ({"bit_rate": "18913000"}, {"bit_rate": "19200000"}, 18913000),
+        ({"tags": {"BPS": "13567000"}}, {}, 13567000),
+        ({"tags": {"BPS-eng": "6505000"}}, {}, 6505000),
+        ({}, {"bit_rate": "25224000"}, 25224000),
+        ({"bit_rate": "N/A"}, {"bit_rate": "25224000"}, 25224000),
+        ({"bit_rate": "0"}, {}, 0),
+        ({}, {}, 0),
+    ],
+)
+def test_parse_video_bitrate(stream, fmt, expected) -> None:
+    assert parse_video_bitrate(stream, fmt) == expected
 
 
 class TestParseEncoderSettingScalar:
@@ -87,7 +121,7 @@ class TestParseEncoderSettings:
 
 class TestValidateEncoderSettings:
     def test_valid_settings(self):
-        settings = {"cq": 22, "lookahead": 32, "preset": "P5", "maxbitrate": 5_000_000}
+        settings = {"cq": 22, "rc-lookahead": 32, "lookahead": 32, "preset": "p5", "maxbitrate": 5_000_000}
         assert validate_encoder_settings(settings) == settings
 
     def test_empty_settings(self):
@@ -98,8 +132,65 @@ class TestValidateEncoderSettings:
             validate_encoder_settings({"cq": 22, "bad_key": 1})
 
     def test_all_supported_keys_accepted(self):
-        settings = {k: 0 for k in SUPPORTED_ENCODER_SETTINGS}
+        # spatial_aq/spatial-aq are aliases and may not be combined.
+        settings = {k: 0 for k in SUPPORTED_ENCODER_SETTINGS if k != "spatial-aq"}
         assert validate_encoder_settings(settings) == settings
+        settings = {k: 0 for k in SUPPORTED_ENCODER_SETTINGS if k != "spatial_aq"}
+        assert validate_encoder_settings(settings) == settings
+
+
+class TestValidateEncoderSettingsPerCodec:
+    def test_union_is_union_of_codec_sets(self):
+        union = frozenset().union(*SUPPORTED_ENCODER_SETTINGS_BY_CODEC.values())
+        assert union == SUPPORTED_ENCODER_SETTINGS
+
+    @pytest.mark.parametrize("codec", ["hevc", "h264", "av1"])
+    def test_common_settings_accepted_for_all_codecs(self, codec):
+        settings = {"preset": "p5", "cq": 25, "rc-lookahead": 32, "bf": 4, "maxrate": "10M"}
+        assert validate_encoder_settings(settings, codec=codec) == settings
+
+    @pytest.mark.parametrize("codec", ["hevc", "h264"])
+    def test_profile_accepted_for_hevc_and_h264(self, codec):
+        assert validate_encoder_settings({"profile": "x"}, codec=codec) == {"profile": "x"}
+
+    def test_profile_rejected_for_av1(self):
+        with pytest.raises(ValueError, match="for codec av1.*profile"):
+            validate_encoder_settings({"profile": "main"}, codec="av1")
+
+    @pytest.mark.parametrize("codec", ["hevc", "h264"])
+    def test_underscore_aq_alias_accepted_for_hevc_and_h264(self, codec):
+        assert validate_encoder_settings({"spatial_aq": 1}, codec=codec)
+        assert validate_encoder_settings({"spatial-aq": 1}, codec=codec)
+
+    def test_av1_requires_hyphen_aq_spelling(self):
+        assert validate_encoder_settings({"spatial-aq": 1}, codec="av1")
+        with pytest.raises(ValueError, match="for codec av1.*spatial_aq"):
+            validate_encoder_settings({"spatial_aq": 1}, codec="av1")
+
+    def test_av1_tile_options_accepted(self):
+        settings = {"tile-rows": 2, "tile-columns": 2}
+        assert validate_encoder_settings(settings, codec="av1") == settings
+        with pytest.raises(ValueError, match="for codec hevc"):
+            validate_encoder_settings(settings, codec="hevc")
+
+    def test_h264_coder_accepted_only_for_h264(self):
+        assert validate_encoder_settings({"coder": "cabac"}, codec="h264")
+        with pytest.raises(ValueError, match="for codec hevc"):
+            validate_encoder_settings({"coder": "cabac"}, codec="hevc")
+
+    def test_error_message_names_selected_codec(self):
+        with pytest.raises(ValueError, match=r"for codec h264.*tier.*Supported for h264"):
+            validate_encoder_settings({"tier": "high"}, codec="h264")
+
+    def test_conflicting_aq_aliases_rejected(self):
+        with pytest.raises(ValueError, match="Conflicting encoder settings.*spatial"):
+            validate_encoder_settings({"spatial_aq": 1, "spatial-aq": 1}, codec="hevc")
+        with pytest.raises(ValueError, match="Conflicting encoder settings.*spatial"):
+            validate_encoder_settings({"spatial_aq": 1, "spatial-aq": 1})
+
+    def test_unknown_codec_rejected(self):
+        with pytest.raises(ValueError, match="Unsupported codec: vp9"):
+            validate_encoder_settings({}, codec="vp9")
 
 
 class TestIsStream10bit:
@@ -138,6 +229,23 @@ class TestIsStream10bit:
 
     def test_bits_per_raw_sample_invalid_string(self):
         assert is_stream_10bit({"bits_per_raw_sample": "abc", "pix_fmt": "yuv420p"}) is False
+
+
+class TestParseSampleAspectRatio:
+    def test_anamorphic(self):
+        assert parse_sample_aspect_ratio({"sample_aspect_ratio": "8:9"}) == Fraction(8, 9)
+
+    def test_square(self):
+        assert parse_sample_aspect_ratio({"sample_aspect_ratio": "1:1"}) == Fraction(1, 1)
+
+    def test_missing_defaults_to_square(self):
+        assert parse_sample_aspect_ratio({}) == Fraction(1, 1)
+
+    def test_zero_defaults_to_square(self):
+        assert parse_sample_aspect_ratio({"sample_aspect_ratio": "0:1"}) == Fraction(1, 1)
+
+    def test_unparsable_defaults_to_square(self):
+        assert parse_sample_aspect_ratio({"sample_aspect_ratio": "N/A"}) == Fraction(1, 1)
 
 
 class TestGetVideoMetaData:
@@ -192,6 +300,25 @@ class TestGetVideoMetaData:
 
         meta = get_video_meta_data("test.mp4")
         assert meta.is_10bit is True
+
+    @patch("jasna.media.resolve_executable", return_value="ffprobe")
+    @patch("jasna.media.subprocess.Popen")
+    def test_preserves_color_primaries_and_transfer_names(self, mock_popen, mock_resolve):
+        proc = MagicMock()
+        proc.communicate.return_value = (
+            self._make_ffprobe_output(
+                color_primaries="bt2020",
+                color_transfer="smpte2084",
+            ),
+            b"",
+        )
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        meta = get_video_meta_data("test.mp4")
+
+        assert meta.color_primaries == "bt2020"
+        assert meta.color_transfer == "smpte2084"
 
     @patch("jasna.media.resolve_executable", return_value="ffprobe")
     @patch("jasna.media.subprocess.Popen")
@@ -306,3 +433,76 @@ class TestGetVideoMetaData:
         meta = get_video_meta_data("test.mp4")
         assert meta.color_range == AvColorRange.MPEG
         assert meta.color_space == AvColorspace.ITU709
+
+    @patch("jasna.media.resolve_executable", return_value="ffprobe")
+    @patch("jasna.media.subprocess.Popen")
+    def test_sample_aspect_ratio(self, mock_popen, mock_resolve):
+        proc = MagicMock()
+        proc.communicate.return_value = (
+            self._make_ffprobe_output(sample_aspect_ratio="8:9"),
+            b"",
+        )
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        meta = get_video_meta_data("test.mp4")
+        assert meta.sample_aspect_ratio == Fraction(8, 9)
+
+    @patch("jasna.media.resolve_executable", return_value="ffprobe")
+    @patch("jasna.media.subprocess.Popen")
+    def test_missing_sample_aspect_ratio_defaults_to_square(self, mock_popen, mock_resolve):
+        proc = MagicMock()
+        proc.communicate.return_value = (self._make_ffprobe_output(), b"")
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        meta = get_video_meta_data("test.mp4")
+        assert meta.sample_aspect_ratio == Fraction(1, 1)
+
+    @patch("jasna.media.resolve_executable", return_value="ffprobe")
+    @patch("jasna.media.subprocess.Popen")
+    def test_spatial_side_data(self, mock_popen, mock_resolve):
+        proc = MagicMock()
+        proc.communicate.return_value = (
+            self._make_ffprobe_output(
+                side_data_list=[
+                    {
+                        "side_data_type": "Stereo 3D",
+                        "type": "side by side",
+                    },
+                    {
+                        "side_data_type": "Spherical Mapping",
+                        "projection": "equirectangular",
+                    },
+                ],
+            ),
+            b"",
+        )
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        meta = get_video_meta_data("test.mp4")
+
+        assert meta.stereo_layout == "side by side"
+        assert meta.spherical_projection == "equirectangular"
+
+    @patch("jasna.media.resolve_executable", return_value="ffprobe")
+    @patch("jasna.media.subprocess.Popen")
+    def test_spatial_metadata_tag_fallback(self, mock_popen, mock_resolve):
+        proc = MagicMock()
+        proc.communicate.return_value = (
+            self._make_ffprobe_output(
+                tags={
+                    "stereo_mode": "left_right",
+                    "projection": "equirectangular",
+                },
+            ),
+            b"",
+        )
+        proc.returncode = 0
+        mock_popen.return_value = proc
+
+        meta = get_video_meta_data("test.mp4")
+
+        assert meta.stereo_layout == "left_right"
+        assert meta.spherical_projection == "equirectangular"

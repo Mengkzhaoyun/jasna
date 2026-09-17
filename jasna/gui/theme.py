@@ -1,5 +1,13 @@
 """Jasna GUI theme colors and styling constants."""
 
+import sys
+
+
+def _font_families_for_platform(platform: str) -> tuple[str, str]:
+    if platform.startswith("linux"):
+        return "sans-serif", "monospace"
+    return "Segoe UI", "Consolas"
+
 
 class Colors:
     # Backgrounds
@@ -15,6 +23,12 @@ class Colors:
     PRIMARY = "#4f46e5"      # Indigo-600
     PRIMARY_HOVER = "#4338ca"# Indigo-700
     PRIMARY_DARK = "#3730a3" # Indigo-800
+
+    # Video player call to action
+    PLAYER = "#0284c7"       # Sky-600
+    PLAYER_HOVER = "#0369a1" # Sky-700
+    PLAYER_BORDER = "#38bdf8"# Sky-400
+    PLAYER_TEXT = "#ffffff"
     
     # Text
     TEXT_PRIMARY = "#cbd5e1"   # Slate-300
@@ -44,11 +58,7 @@ class Colors:
 
 
 class Fonts:
-    # Primary: Segoe UI (Windows system font, no embedding needed for PyInstaller)
-    # Fallback chain handled by OS if unavailable
-    FAMILY = "Segoe UI"
-    # Monospace: Consolas (Windows system font)
-    FAMILY_MONO = "Consolas"
+    FAMILY, FAMILY_MONO = _font_families_for_platform(sys.platform)
     
     # Typography hierarchy per spec (+1px from original)
     SIZE_TITLE = 16      # App title "JASNA GUI" - bold
@@ -64,7 +74,9 @@ class Sizing:
     HEADER_HEIGHT = 48
     CONTROL_BAR_HEIGHT = 80
     LOG_PANEL_HEIGHT = 192
-    QUEUE_PANEL_WIDTH = 320
+    QUEUE_PANEL_WIDTH = 420
+    QUEUE_PANEL_MIN_WIDTH = 300
+    SETTINGS_PANEL_MIN_WIDTH = 520
     
     PADDING_LARGE = 16
     PADDING_MEDIUM = 12

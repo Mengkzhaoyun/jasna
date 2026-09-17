@@ -304,6 +304,7 @@ class _StreamRequestHandler(SimpleHTTPRequestHandler):
             root.destroy()
             return path if path else None
         except Exception:
+            log.warning("File open dialog failed", exc_info=True)
             return None
 
     def _serve_file(self, path: Path):
@@ -467,6 +468,16 @@ class HlsStreamingServer:
             target = self.seek_target_segment
             self.seek_requested.clear()
             return target
+
+    def consume_seek_for_pass(self, start_segment: int) -> int | None:
+        target = self.consume_seek()
+        if target == start_segment:
+            log.debug(
+                "[stream-server] ignoring seek to active segment %d",
+                start_segment,
+            )
+            return None
+        return target
 
     def notify_segment_requested(self, segment_index: int) -> None:
         with self._demand_lock:

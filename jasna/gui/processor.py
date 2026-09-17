@@ -1,15 +1,21 @@
 """Background processor for video processing jobs."""
 
+import logging
 import threading
 import traceback
 import queue
 import time
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from jasna.gui.models import JobItem, JobStatus, AppSettings
+from jasna.gui.video_session import build_video_session, release_session_memory, video_session_config
 from jasna.media import UnsupportedColorspaceError
+from jasna.session_config import SessionConfig
+from jasna.session_factory import RestorationSession, build_pipeline
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -22,6 +28,14 @@ class ProgressUpdate:
     frames_processed: int = 0
     total_frames: int = 0
     message: str = ""
+
+
+class ProcessingStopped(Exception):
+    """Raised inside a job when the user stopped processing."""
+
+
+def _pipeline_was_stopped(pipeline) -> bool:
+    return bool(pipeline.cancel_requested) and not bool(pipeline.completed)
 
 
 def _cleanup_torch(torch_mod) -> None:
@@ -62,7 +76,8 @@ class Processor:
         # Heavy models are loaded once and reused across consecutive jobs of the
         # same type; the other session is unloaded when the type switches.
         self._img_session: tuple | None = None      # (detector, restorer, device)
-        self._video_session: dict | None = None
+        self._video_session: RestorationSession | None = None
+        self._current_pipeline = None
         
     def start(
         self,
@@ -100,6 +115,9 @@ class Processor:
     def stop(self):
         self._stop_event.set()
         self._pause_event.set()  # Unpause to allow thread to exit
+        pipeline = self._current_pipeline
+        if pipeline is not None:
+            pipeline.cancel()
 
     def join(self, timeout: float = 5.0):
         if self._thread and self._thread.is_alive():
@@ -136,6 +154,8 @@ class Processor:
                     break
 
                 self._process_job(job)
+                if job.status is JobStatus.PENDING:
+                    break  # stopped mid-job; it stays queued for the next run
         finally:
             self._close_image_session()
             self._close_video_session()
@@ -163,7 +183,10 @@ class Processor:
         run_post_export_action_safely(action, command, lambda message: self._log("ERROR", message))
             
     def _process_job(self, job: JobItem):
-        job.status = JobStatus.PROCESSING
+        snapshot = job.begin_processing()
+        if snapshot is None:
+            return
+        segments = snapshot.segments
         self._log("INFO", f"Started processing {job.filename}")
         self._progress(ProgressUpdate(
             job_id=job.id,
@@ -174,6 +197,17 @@ class Processor:
         input_path = job.path
         from jasna.media.image_io import IMAGE_EXTENSIONS
         is_image = input_path.suffix.lower() in IMAGE_EXTENSIONS
+        job_settings = self._settings
+        if not is_image:
+            overrides = {}
+            if snapshot.detection_model is not None:
+                overrides["detection_model"] = snapshot.detection_model
+            if snapshot.detection_score_threshold is not None:
+                overrides["detection_score_threshold"] = snapshot.detection_score_threshold
+            if snapshot.vr_projection is not None:
+                overrides["vr_projection"] = snapshot.vr_projection
+            if overrides:
+                job_settings = replace(job_settings, **overrides)
 
         # Determine output path
         if self._output_folder:
@@ -212,8 +246,21 @@ class Processor:
                 self._close_video_session()
             else:
                 self._close_image_session()
-            self._run_pipeline(job.id, input_path, output_path)
+            pipeline_options = {}
+            if segments:
+                pipeline_options["segments"] = segments
+            if job_settings is not self._settings:
+                pipeline_options["settings"] = job_settings
+            self._run_pipeline(
+                job.id,
+                input_path,
+                output_path,
+                **pipeline_options,
+            )
+            if not is_image:
+                self._run_post_export_video_command(input_path, output_path)
 
+            job.output_path = output_path
             job.status = JobStatus.COMPLETED
             self._progress(ProgressUpdate(
                 job_id=job.id,
@@ -221,6 +268,9 @@ class Processor:
                 progress=100.0,
             ))
             self._log("INFO", f"Finished processing {job.filename}")
+
+        except ProcessingStopped:
+            self._mark_stopped(job)
 
         except UnsupportedColorspaceError as e:
             e.__traceback__ = None
@@ -247,119 +297,151 @@ class Processor:
             import torch
             _cleanup_torch(torch)
         except Exception:
-            pass
+            logger.warning("Torch cleanup failed after job", exc_info=True)
 
-    def _run_pipeline(self, job_id: int, input_path: Path, output_path: Path):
+    def _run_post_export_video_command(self, input_path: Path, output_path: Path) -> None:
+        settings = self._settings
+        if settings is None:
+            return
+        command = settings.post_export_video_command.strip()
+        if not command:
+            return
+        if self._stop_event.is_set():
+            raise ProcessingStopped("Processing stopped")
+        from jasna.post_export_action import (
+            PostExportVideoCommandCancelled,
+            run_post_export_video_command,
+        )
+
+        self._log("INFO", f"Running post-export command for {output_path.name}")
+        try:
+            run_post_export_video_command(
+                command,
+                input_path,
+                output_path,
+                self._stop_event.is_set,
+            )
+        except PostExportVideoCommandCancelled as exc:
+            raise ProcessingStopped("Processing stopped") from exc
+
+    def _mark_stopped(self, job: JobItem):
+        job.status = JobStatus.PENDING
+        self._progress(ProgressUpdate(
+            job_id=job.id,
+            status=JobStatus.PENDING,
+        ))
+        self._log("INFO", f"Stopped processing {job.filename}")
+
+    def _run_pipeline(
+        self,
+        job_id: int,
+        input_path: Path,
+        output_path: Path,
+        *,
+        segments=(),
+        settings: AppSettings | None = None,
+    ):
+        """Run one job; raises ProcessingStopped when the user stopped it."""
         from jasna.media.image_io import IMAGE_EXTENSIONS
 
         if input_path.suffix.lower() in IMAGE_EXTENSIONS:
             self._run_image_job(job_id, input_path, output_path)
-        else:
-            self._run_video_job(job_id, input_path, output_path)
-            
-    def _ensure_video_session(self):
+            return
+        self._run_video_job(
+            job_id,
+            input_path,
+            output_path,
+            segments=segments,
+            settings=settings or self._settings,
+        )
+
+
+    def _ensure_video_session(self, settings: AppSettings | None = None):
         """Compile engines + build the BasicVSR++ (and optional secondary) restorer
         once; reused across consecutive video jobs."""
         if self._video_session is not None:
             return
-        from jasna._suppress_noise import install as _install_noise_filters
-        _install_noise_filters()
-        import torch
-        from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
-        from jasna.engine_paths import model_weights_dir
-        from jasna.media import parse_encoder_settings, validate_encoder_settings
-        from jasna.mosaic.detection_registry import coerce_detection_model_name, detection_model_weights_path
-        from jasna.restorer.basicvsrpp_mosaic_restorer import BasicvsrppMosaicRestorer
-        from jasna.restorer.denoise import DenoiseStep, DenoiseStrength
-        from jasna.restorer.restoration_pipeline import RestorationPipeline
-
-        settings = self._settings
-        device = torch.device("cuda:0")
-        restoration_model_path = model_weights_dir() / "lada_mosaic_restoration_model_generic_v1.2.pth"
-        det_name = coerce_detection_model_name(str(settings.detection_model))
-        detection_model_path = detection_model_weights_path(det_name)
-
-        compile_basicvsrpp = bool(settings.compile_basicvsrpp) and (not self._disable_basicvsrpp_tensorrt_for_run)
-        compile_result = ensure_engines_compiled(
-            EngineCompilationRequest(
-                device=str(device),
-                fp16=settings.fp16_mode,
-                basicvsrpp=compile_basicvsrpp,
-                basicvsrpp_model_path=str(restoration_model_path),
-                basicvsrpp_max_clip_size=int(settings.max_clip_size),
-                detection=True,
-                detection_model_name=det_name,
-                detection_model_path=str(detection_model_path),
-                detection_batch_size=settings.batch_size,
-                unet4x=(settings.secondary_restoration == "unet-4x"),
-            ),
-            log_callback=lambda msg: self._log("INFO", msg),
+        self._video_session = build_video_session(
+            settings or self._settings,
+            disable_basicvsrpp_tensorrt=self._disable_basicvsrpp_tensorrt_for_run,
+            log=lambda msg: self._log("INFO", msg),
         )
-        use_tensorrt = compile_result.use_basicvsrpp_tensorrt
-
-        secondary_restorer = None
-        if settings.secondary_restoration == "tvai":
-            from jasna.restorer.tvai_secondary_restorer import TvaiSecondaryRestorer
-            tvai_args_str = f"model={settings.tvai_model}:scale={settings.tvai_scale}:{settings.tvai_args}"
-            secondary_restorer = TvaiSecondaryRestorer(
-                ffmpeg_path=settings.tvai_ffmpeg_path,
-                tvai_args=tvai_args_str,
-                scale=settings.tvai_scale,
-                num_workers=settings.tvai_workers,
-            )
-        elif settings.secondary_restoration == "unet-4x":
-            from jasna.restorer.unet4x_secondary_restorer import Unet4xSecondaryRestorer
-            secondary_restorer = Unet4xSecondaryRestorer(device=device, fp16=settings.fp16_mode)
-        elif settings.secondary_restoration == "rtx-super-res":
-            from jasna.restorer.rtx_superres_secondary_restorer import RtxSuperresSecondaryRestorer
-            rtx_denoise = settings.rtx_denoise.lower()
-            rtx_deblur = settings.rtx_deblur.lower()
-            secondary_restorer = RtxSuperresSecondaryRestorer(
-                device=device,
-                scale=settings.rtx_scale,
-                quality=settings.rtx_quality.lower(),
-                denoise=None if rtx_denoise == "none" else rtx_denoise,
-                deblur=None if rtx_deblur == "none" else rtx_deblur,
-            )
-
-        restoration_pipeline = RestorationPipeline(
-            restorer=BasicvsrppMosaicRestorer(
-                checkpoint_path=str(restoration_model_path),
-                device=device,
-                max_clip_size=settings.max_clip_size,
-                use_tensorrt=use_tensorrt,
-                fp16=settings.fp16_mode,
-            ),
-            secondary_restorer=secondary_restorer,
-            denoise_strength=DenoiseStrength(settings.denoise_strength),
-            denoise_step=DenoiseStep(settings.denoise_step),
-        )
-
-        encoder_settings = {}
-        if settings.encoder_cq:
-            encoder_settings["cq"] = settings.encoder_cq
-        if settings.encoder_custom_args:
-            encoder_settings.update(parse_encoder_settings(settings.encoder_custom_args))
-        encoder_settings = validate_encoder_settings(encoder_settings)
-
-        self._video_session = {
-            "device": device,
-            "det_name": det_name,
-            "detection_model_path": detection_model_path,
-            "restoration_pipeline": restoration_pipeline,
-            "secondary_restorer": secondary_restorer,
-            "encoder_settings": encoder_settings,
-            "working_directory": Path(settings.working_directory) if (settings.working_directory or "").strip() else None,
-            "lut_path": (settings.lut_path or "").strip() or None,
-        }
         self._log("INFO", "Restoration models loaded (reused across video jobs)")
 
-    def _run_video_job(self, job_id: int, input_path: Path, output_path: Path):
-        from jasna.pipeline import Pipeline
+    def _build_encoder_settings(self, codec: str) -> dict:
+        # Built per job (not cached in the video session) so a codec change
+        # between queued jobs is always validated against the selected codec.
+        from jasna.accelerator import AcceleratorVendor, vendor_for_device
+        from jasna.media import parse_encoder_settings, validate_encoder_settings
+        from jasna.media.encoder_quality import (
+            encoder_cq_spec,
+            validate_encoder_cq,
+        )
 
-        self._ensure_video_session()
-        s = self._video_session
         settings = self._settings
+        vendor = vendor_for_device()
+        cq = (
+            encoder_cq_spec(codec, vendor).default
+            if settings.encoder_cq is None
+            else settings.encoder_cq
+        )
+        validate_encoder_cq(cq, codec=codec, vendor=vendor)
+        encoder_settings = {"cq": cq}
+        if settings.encoder_custom_args:
+            custom_settings = parse_encoder_settings(settings.encoder_custom_args)
+            cq_aliases = {"cq"}
+            if vendor is AcceleratorVendor.AMD:
+                cq_aliases.add("qvbr_quality_level")
+            duplicates = sorted(cq_aliases & custom_settings.keys())
+            if duplicates:
+                raise ValueError(
+                    "CQ is controlled by the quality slider; remove "
+                    f"{', '.join(duplicates)} from custom encoder settings"
+                )
+            encoder_settings.update(custom_settings)
+        return validate_encoder_settings(encoder_settings, codec=codec, vendor=vendor)
+
+    def _run_video_job(
+        self,
+        job_id: int,
+        input_path: Path,
+        output_path: Path,
+        *,
+        segments=(),
+        settings: AppSettings | None = None,
+    ):
+        settings = settings or self._settings
+        if self._stop_event.is_set():
+            raise ProcessingStopped("Processing stopped")
+        codec = settings.codec
+        splice_plan = None
+        if segments:
+            from jasna.media import get_video_meta_data
+            from jasna.media.splice import build_splice_plan, probe_keyframes, validate_smart_render
+            metadata = get_video_meta_data(str(input_path))
+            codec = {
+                "avc": "h264",
+                "h265": "hevc",
+                "av01": "av1",
+            }.get(metadata.codec_name.lower(), metadata.codec_name.lower())
+            validate_smart_render(
+                metadata,
+                output_path=output_path,
+                codec=codec,
+                retarget_high_fps=settings.retarget_high_fps,
+            )
+            splice_plan = build_splice_plan(
+                tuple(segments),
+                probe_keyframes(input_path, metadata),
+                duration=metadata.duration,
+            )
+        encoder_settings = self._build_encoder_settings(codec)
+        config = video_session_config(settings, codec=codec, encoder_settings=encoder_settings)
+        self._ensure_video_session(settings)
+        s = self._video_session
+        self._prepare_job_detector(config, s)
+        if self._stop_event.is_set():
+            raise ProcessingStopped("Processing stopped")
         last_update_time = [0.0]
 
         def progress_callback(progress_pct: float, fps: float, eta_seconds: float, frames_done: int, total: int):
@@ -370,7 +452,7 @@ class Processor:
 
             self._pause_event.wait()
             if self._stop_event.is_set():
-                raise InterruptedError("Processing stopped")
+                raise ProcessingStopped("Processing stopped")
 
             self._progress(ProgressUpdate(
                 job_id=job_id,
@@ -384,49 +466,58 @@ class Processor:
 
         pipeline = None
         try:
-            pipeline = Pipeline(
-                input_video=input_path,
-                output_video=output_path,
-                detection_model_name=s["det_name"],
-                detection_model_path=s["detection_model_path"],
-                detection_score_threshold=settings.detection_score_threshold,
-                restoration_pipeline=s["restoration_pipeline"],
-                codec=settings.codec,
-                encoder_settings=s["encoder_settings"],
-                batch_size=settings.batch_size,
-                device=s["device"],
-                max_clip_size=settings.max_clip_size,
-                temporal_overlap=settings.temporal_overlap,
-                enable_crossfade=settings.enable_crossfade,
-                fp16=settings.fp16_mode,
-                disable_progress=True,
+            pipeline = build_pipeline(
+                config,
+                s,
+                input_path,
+                output_path,
                 progress_callback=progress_callback,
-                working_directory=s["working_directory"],
-                lut_path=s["lut_path"],
+                segments=tuple(segments) or None,
+                splice_plan=splice_plan,
             )
+            self._current_pipeline = pipeline
+            if self._stop_event.is_set():
+                pipeline.cancel()
             pipeline.run()
+            if _pipeline_was_stopped(pipeline):
+                raise ProcessingStopped("Processing stopped")
         finally:
+            self._current_pipeline = None
             if pipeline is not None:
                 pipeline.close()
-            from jasna.tracking.blending import _KERNEL_CACHE
-            _KERNEL_CACHE.clear()
-            from jasna.media.rgb_to_p010 import _cache as _p010_cache
-            _p010_cache.clear()
+
+    def _prepare_job_detector(
+        self,
+        config: SessionConfig,
+        session: RestorationSession,
+    ) -> None:
+        if (
+            config.detection_model_name == session.detection_model_name
+            and config.detection_model_path == session.detection_model_path
+        ):
+            return
+
+        from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
+
+        ensure_engines_compiled(
+            EngineCompilationRequest(
+                device=str(session.device),
+                fp16=config.fp16,
+                detection=True,
+                detection_model_name=config.detection_model_name,
+                detection_model_path=str(config.detection_model_path),
+                detection_batch_size=config.batch_size,
+            ),
+            log_callback=lambda msg: self._log("INFO", msg),
+        )
 
     def _close_video_session(self):
         if self._video_session is None:
             return
         s = self._video_session
         self._video_session = None
-        s["restoration_pipeline"].restorer.close()
-        secondary = s["secondary_restorer"]
-        if secondary is not None and hasattr(secondary, "close"):
-            secondary.close()
-        import gc
-        import torch
-        for _ in range(3):
-            gc.collect()
-        _cleanup_torch(torch)
+        s.close()
+        release_session_memory(s.device)
         self._log("INFO", "Restoration models unloaded")
 
     def _ensure_image_session(self):
@@ -438,7 +529,7 @@ class Processor:
         import torch
         from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
         from jasna.engine_paths import SD15_DIR
-        from jasna.mosaic.detection_registry import build_detection_model, coerce_detection_model_name, detection_model_weights_path
+        from jasna.mosaic.detection_registry import build_detection_model, coerce_detection_model_name, require_detection_model_weights
         from jasna.restorer.sd15_download import bundle_present
         from jasna.restorer.sd15_inpaint_restorer import Sd15InpaintRestorer
 
@@ -451,7 +542,7 @@ class Processor:
             )
 
         det_name = coerce_detection_model_name(str(settings.detection_model))
-        detection_model_path = detection_model_weights_path(det_name)
+        detection_model_path = require_detection_model_weights(det_name)
         ensure_engines_compiled(
             EngineCompilationRequest(
                 device=str(device),
@@ -487,7 +578,7 @@ class Processor:
 
         self._pause_event.wait()
         if self._stop_event.is_set():
-            raise InterruptedError("Processing stopped")
+            raise ProcessingStopped("Processing stopped")
         self._progress(ProgressUpdate(job_id=job_id, status=JobStatus.PROCESSING, progress=20.0, message="Detecting mosaics"))
 
         num_variants = max(1, int(settings.image_restore_variants))

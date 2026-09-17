@@ -149,13 +149,16 @@ def _build_rfdetr_model():
     engine_path.exists.return_value = True
 
     with (
+        patch("jasna.mosaic.rfdetr.is_nvidia_device", return_value=True),
         patch("jasna.mosaic.rfdetr.get_onnx_tensorrt_engine_path", return_value=engine_path),
         patch("jasna.mosaic.rfdetr.TrtRunner", return_value=mock_runner),
     ):
         model = RfDetrMosaicDetectionModel(
-            onnx_path=Path("model.onnx"),
+            weights_path=Path("model.onnx"),
             batch_size=2,
             device=torch.device("cpu"),
+            resolution=768,
+            dynamic_batch=True,
             fp16=False,
         )
     return model, mock_runner
@@ -169,6 +172,52 @@ class TestRfDetrInit:
         assert model.boxes_out == "pred_boxes"
         assert model.logits_out == "pred_logits"
         assert model.masks_out == "pred_masks"
+
+    def test_amd_init_uses_torch_runner(self, monkeypatch, tmp_path):
+        import jasna.mosaic.rfdetr as module
+        import jasna.mosaic.rfdetr_torch_runner as torch_runner_module
+
+        weights_path = tmp_path / "rfdetr-v6.pt"
+        runner = MagicMock()
+        runner.input_names = ["input"]
+        runner.input_dtypes = {"input": torch.float32}
+        runner.output_names = ["dets", "labels", "masks"]
+        runner.outputs = {
+            "dets": MagicMock(ndim=3, shape=(1, 100, 4)),
+            "labels": MagicMock(ndim=3, shape=(1, 100, 3)),
+            "masks": MagicMock(ndim=4, shape=(1, 100, 8, 8)),
+        }
+        constructed = MagicMock(return_value=runner)
+        monkeypatch.setattr(module, "is_amd_device", lambda _device: True)
+        monkeypatch.setattr(module, "is_nvidia_device", lambda _device: False)
+        monkeypatch.setattr(torch_runner_module, "RfDetrTorchRunner", constructed)
+
+        model = RfDetrMosaicDetectionModel(
+            weights_path=weights_path,
+            batch_size=1,
+            device=torch.device("cpu"),
+            resolution=576,
+            dynamic_batch=True,
+            torch_variant="medium",
+            fp16=True,
+        )
+
+        assert model.engine_path == weights_path
+        assert constructed.call_args.kwargs["variant"] == "medium"
+
+    def test_amd_init_requires_torch_variant(self, monkeypatch, tmp_path):
+        import jasna.mosaic.rfdetr as module
+
+        monkeypatch.setattr(module, "is_amd_device", lambda _device: True)
+        with pytest.raises(RuntimeError, match="torch variant"):
+            RfDetrMosaicDetectionModel(
+                weights_path=tmp_path / "rfdetr-v6.pt",
+                batch_size=1,
+                device=torch.device("cpu"),
+                resolution=576,
+                dynamic_batch=True,
+                fp16=True,
+            )
 
 
 class TestRfDetrPreprocess:
@@ -204,10 +253,81 @@ class TestRfDetrCall:
         assert det.boxes_xyxy[0].shape[0] == 1
         mock_runner.infer.assert_called_once()
 
+    def test_fixed_batch_model_pads_and_chunks(self):
+        model, mock_runner = _build_rfdetr_model()
+        model.dynamic_batch = False
+        model.input_dtype = torch.float32
+        shared_outputs = {
+            "pred_boxes": torch.zeros(2, 1, 4),
+            "pred_logits": torch.zeros(2, 1, 1),
+            "pred_masks": torch.zeros(2, 1, 8, 8),
+        }
+        call_count = 0
+
+        def infer(inputs):
+            nonlocal call_count
+            call_count += 1
+            batch = next(iter(inputs.values()))
+            assert batch.shape[0] == 2
+            for output in shared_outputs.values():
+                output.fill_(call_count)
+            return shared_outputs
+
+        mock_runner.infer.side_effect = infer
+        frames = torch.randint(0, 256, (5, 3, 32, 32), dtype=torch.uint8)
+
+        outputs = model._infer(model._preprocess(frames))
+
+        assert outputs["pred_boxes"][:, 0, 0].tolist() == [1, 1, 2, 2, 3]
+        assert mock_runner.infer.call_count == 3
+
+    def test_dynamic_batch_model_does_not_pad(self):
+        model, mock_runner = _build_rfdetr_model()
+        model.input_dtype = torch.float32
+        mock_runner.infer.return_value = {
+            "pred_boxes": torch.zeros(1, 1, 4),
+            "pred_logits": torch.full((1, 1, 1), -10.0),
+            "pred_masks": torch.zeros(1, 1, 8, 8),
+        }
+        frames = torch.randint(0, 256, (1, 3, 32, 32), dtype=torch.uint8)
+
+        model(frames, target_hw=(32, 32))
+
+        fed = next(iter(mock_runner.infer.call_args.args[0].values()))
+        assert fed.shape[0] == 1
+
 
 class TestCompileRfdetrEngine:
     def test_delegates_to_compile_onnx(self):
         with patch("jasna.trt.compile_onnx_to_tensorrt_engine", return_value=Path("out.engine")) as mock_compile:
-            result = compile_rfdetr_engine(Path("model.onnx"), torch.device("cuda:0"), batch_size=4, fp16=True)
-            mock_compile.assert_called_once_with(Path("model.onnx"), torch.device("cuda:0"), batch_size=4, fp16=True, workspace_gb=20)
+            result = compile_rfdetr_engine(
+                Path("model.onnx"),
+                torch.device("cuda:0"),
+                batch_size=4,
+                resolution=576,
+                dynamic_batch=True,
+                fp16=True,
+            )
+            mock_compile.assert_called_once_with(
+                Path("model.onnx"), torch.device("cuda:0"),
+                batch_size=4, fp16=True, workspace_gb=20, dynamic_batch=True,
+            )
             assert result == Path("out.engine")
+
+    def test_amd_is_a_noop_returning_the_weights_path(self, monkeypatch, tmp_path):
+        import jasna.mosaic.rfdetr as module
+
+        weights = tmp_path / "rfdetr-v6.pt"
+        monkeypatch.setattr(module, "is_amd_device", lambda _device: True)
+
+        result = compile_rfdetr_engine(
+            weights,
+            torch.device("cpu"),
+            batch_size=4,
+            resolution=576,
+            dynamic_batch=True,
+            fp16=True,
+        )
+
+        # AMD runs the checkpoint through the rfdetr torch model; nothing to build.
+        assert result == weights

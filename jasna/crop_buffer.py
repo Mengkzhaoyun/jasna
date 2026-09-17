@@ -105,22 +105,49 @@ class RawCrop:
     crop_shape: tuple[int, int]  # (crop_h, crop_w)
 
 
+def compute_enlarged_bbox(
+    bbox: np.ndarray,
+    frame_h: int,
+    frame_w: int,
+    x_bounds: tuple[int, int] | None = None,
+) -> tuple[int, int, int, int]:
+    """Clamp ``bbox`` to ``x_bounds`` (an SBS eye seam) and grow it toward the
+    256 restoration aspect via ``expand_bbox``. Shared by the axis-aligned 2D
+    crop and the VR per-region projection so both produce the same paste box."""
+    x_min, x_max = x_bounds if x_bounds is not None else (0, frame_w)
+    if not (0 <= x_min < x_max <= frame_w):
+        raise ValueError(f"Invalid crop x bounds {(x_min, x_max)} for width {frame_w}")
+    x1 = int(np.floor(bbox[0]))
+    y1 = int(np.floor(bbox[1]))
+    x2 = int(np.ceil(bbox[2]))
+    y2 = int(np.ceil(bbox[3]))
+    x1 = max(x_min, min(x1, x_max))
+    y1 = max(0, min(y1, frame_h))
+    x2 = max(x_min, min(x2, x_max))
+    y2 = max(0, min(y2, frame_h))
+
+    x1_exp, y1_exp, x2_exp, y2_exp = expand_bbox(
+        x1 - x_min,
+        y1,
+        x2 - x_min,
+        y2,
+        frame_h,
+        x_max - x_min,
+    )
+    return x1_exp + x_min, y1_exp, x2_exp + x_min, y2_exp
+
+
 def extract_crop(
     frame: torch.Tensor,
     bbox: np.ndarray,
     frame_h: int,
     frame_w: int,
+    *,
+    x_bounds: tuple[int, int] | None = None,
 ) -> RawCrop:
-    x1 = int(np.floor(bbox[0]))
-    y1 = int(np.floor(bbox[1]))
-    x2 = int(np.ceil(bbox[2]))
-    y2 = int(np.ceil(bbox[3]))
-    x1 = max(0, min(x1, frame_w))
-    y1 = max(0, min(y1, frame_h))
-    x2 = max(0, min(x2, frame_w))
-    y2 = max(0, min(y2, frame_h))
-
-    x1_exp, y1_exp, x2_exp, y2_exp = expand_bbox(x1, y1, x2, y2, frame_h, frame_w)
+    x1_exp, y1_exp, x2_exp, y2_exp = compute_enlarged_bbox(
+        bbox, frame_h, frame_w, x_bounds
+    )
     if frame.device.type == "cpu":
         crop = torch.from_numpy(np.array(frame.numpy()[:, y1_exp:y2_exp, x1_exp:x2_exp]))
     else:

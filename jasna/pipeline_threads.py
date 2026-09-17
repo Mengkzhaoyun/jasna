@@ -19,12 +19,13 @@ from jasna.pipeline_timing import LoopTimer
 from jasna.progressbar import Progressbar
 from jasna.restorer import RestorationPipeline
 from jasna.tracking import ClipTracker
+from jasna.tracking.scene_detector import SceneCutDetector
 
 log = logging.getLogger(__name__)
 
 
 class FrameWriter(Protocol):
-    def write(self, frame: torch.Tensor, pts: int) -> None: ...
+    def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None: ...
     def after_write(self, frames_written: int) -> None: ...
 
 
@@ -37,7 +38,10 @@ def decode_detect_loop(
     detection_model,
     max_clip_size: int,
     temporal_overlap: int,
+    max_detection_gap: int,
+    min_detection_duration: int,
     enable_crossfade: bool,
+    scene_detection: bool,
     blend_buffer: BlendBuffer,
     crop_buffers: dict[int, CropBuffer],
     clip_queue: FrameQueue,
@@ -46,38 +50,98 @@ def decode_detect_loop(
     frame_shape: list[tuple[int, int]],
     cancel_event: threading.Event | None = None,
     seek_ts: float | None = None,
+    end_pts: int | None = None,
+    effect_ranges: tuple[tuple[int, int], ...] | None = None,
+    frame_stride: int = 1,
+    output_frame_count: int | None = None,
+    output_fps: float | None = None,
     progress: Progressbar | None = None,
+    close_progress: bool = True,
     debug_memory: PipelineDebugMemoryLogger | None = None,
+    vr_mode: str = "off",
+    vr_projector=None,
 ) -> None:
     timer = LoopTimer("decode-detect")
     try:
         torch.cuda.set_device(device)
-        tracker = ClipTracker(max_clip_size=max_clip_size, temporal_overlap=temporal_overlap)
+        tracker = ClipTracker(
+            max_clip_size=max_clip_size,
+            temporal_overlap=temporal_overlap,
+            max_detection_gap=max_detection_gap,
+        )
+        scene_detector = SceneCutDetector() if scene_detection else None
         discard_margin = temporal_overlap
         blend_frames = (temporal_overlap // 3) if enable_crossfade else 0
 
         with (
-            NvidiaVideoReader(input_video, batch_size=batch_size, device=device, metadata=metadata) as reader,
+            NvidiaVideoReader(
+                input_video,
+                batch_size=batch_size,
+                device=device,
+                metadata=metadata,
+                frame_stride=frame_stride,
+            ) as reader,
             torch.inference_mode(),
         ):
             if progress is not None:
                 progress.init()
             target_hw = (int(metadata.video_height), int(metadata.video_width))
+            crop_eye_width = (
+                int(metadata.video_width) // 2 if vr_mode == "sbs" else None
+            )
             frame_idx = 0 if seek_ts is None else _estimate_start_frame(metadata, seek_ts)
-            first_batch = seek_ts is not None
+            effect_active = effect_ranges is None
+            stop_after_batch = False
+
+            def _selected(pts: int) -> bool:
+                if effect_ranges is None:
+                    return True
+                return any(start <= pts < end for start, end in effect_ranges)
+
+            def _finalize_tracker() -> None:
+                nonlocal effect_active
+                if not effect_active:
+                    return
+                fs = frame_shape[0] if frame_shape else target_hw
+                finalize_processing(
+                    tracker=tracker,
+                    blend_buffer=blend_buffer,
+                    crop_buffers=crop_buffers,
+                    clip_queue=clip_queue,
+                    frame_shape=fs,
+                    discard_margin=discard_margin,
+                    blend_frames=blend_frames,
+                    min_detection_duration=min_detection_duration,
+                )
+                if scene_detector is not None:
+                    scene_detector.reset()
+                effect_active = False
             log.info(
                 "Processing %s: %d frames @ %s fps, %dx%d",
-                input_video, metadata.num_frames, metadata.video_fps, metadata.video_width, metadata.video_height,
+                input_video,
+                metadata.num_frames if output_frame_count is None else output_frame_count,
+                metadata.video_fps if output_fps is None else output_fps,
+                metadata.video_width,
+                metadata.video_height,
             )
 
             try:
                 for frames, pts_list in timer.timed_iter(reader.frames(seek_ts=seek_ts), "decode"):
-                    if first_batch:
-                        first_batch = False
                     if cancel_event is not None and cancel_event.is_set():
                         break
+                    if end_pts is not None:
+                        keep_count = next(
+                            (i for i, pts in enumerate(pts_list) if int(pts) >= end_pts),
+                            len(pts_list),
+                        )
+                        if keep_count < len(pts_list):
+                            stop_after_batch = True
+                            frames = frames[:keep_count]
+                            pts_list = pts_list[:keep_count]
                     effective_bs = len(pts_list)
                     if effective_bs == 0:
+                        if stop_after_batch:
+                            break
                         continue
 
                     if not frame_shape:
@@ -90,39 +154,59 @@ def decode_detect_loop(
                     batch_start = frame_idx
 
                     with timer.measure("detect-track"):
-                        res = process_frame_batch(
-                            frames=frames,
-                            pts_list=[int(p) for p in pts_list],
-                            start_frame_idx=frame_idx,
-                            batch_size=batch_size,
-                            target_hw=target_hw,
-                            detections_fn=detection_model,
-                            tracker=tracker,
-                            blend_buffer=blend_buffer,
-                            crop_buffers=crop_buffers,
-                            clip_queue=clip_queue,
-                            metadata_queue=metadata_queue,
-                            discard_margin=discard_margin,
-                            blend_frames=blend_frames,
-                        )
+                        offset = 0
+                        while offset < effective_bs:
+                            selected = _selected(int(pts_list[offset]))
+                            group_end = offset + 1
+                            while (
+                                group_end < effective_bs
+                                and _selected(int(pts_list[group_end])) == selected
+                            ):
+                                group_end += 1
 
-                    frame_idx = res.next_frame_idx
+                            if selected:
+                                effect_active = True
+                                selected_frames = frames[offset:group_end]
+                                res = process_frame_batch(
+                                    frames=selected_frames,
+                                    pts_list=[int(p) for p in pts_list[offset:group_end]],
+                                    start_frame_idx=frame_idx,
+                                    target_hw=target_hw,
+                                    detections_fn=detection_model,
+                                    tracker=tracker,
+                                    blend_buffer=blend_buffer,
+                                    crop_buffers=crop_buffers,
+                                    clip_queue=clip_queue,
+                                    metadata_queue=metadata_queue,
+                                    discard_margin=discard_margin,
+                                    blend_frames=blend_frames,
+                                    crop_eye_width=crop_eye_width,
+                                    min_detection_duration=min_detection_duration,
+                                    scene_detector=scene_detector,
+                                    vr_projector=vr_projector,
+                                )
+                                frame_idx = res.next_frame_idx
+                            else:
+                                _finalize_tracker()
+                                for pts in pts_list[offset:group_end]:
+                                    metadata_queue.put(
+                                        FrameMeta(
+                                            frame_idx=frame_idx,
+                                            pts=int(pts),
+                                            apply_effect=False,
+                                        )
+                                    )
+                                    frame_idx += 1
+                            offset = group_end
                     if debug_memory is not None:
                         debug_memory.snapshot("decode", f"frame_start={batch_start} batch={effective_bs}")
                     if progress is not None:
                         progress.update(effective_bs)
+                    if stop_after_batch:
+                        break
 
                 if cancel_event is None or not cancel_event.is_set():
-                    fs = frame_shape[0] if frame_shape else (int(metadata.video_height), int(metadata.video_width))
-                    finalize_processing(
-                        tracker=tracker,
-                        blend_buffer=blend_buffer,
-                        crop_buffers=crop_buffers,
-                        clip_queue=clip_queue,
-                        frame_shape=fs,
-                        discard_margin=discard_margin,
-                        blend_frames=blend_frames,
-                    )
+                    _finalize_tracker()
                     if debug_memory is not None:
                         debug_memory.snapshot("decode", "finalized")
             except Exception:
@@ -130,7 +214,7 @@ def decode_detect_loop(
                     progress.error = True
                 raise
             finally:
-                if progress is not None:
+                if progress is not None and close_progress:
                     progress.close(ensure_completed_bar=True)
     except BaseException as e:
         if cancel_event is None or not cancel_event.is_set():
@@ -270,6 +354,7 @@ def blend_encode_loop(
     frame_writer: FrameWriter,
     cancel_event: threading.Event | None = None,
     seek_ts: float | None = None,
+    frame_stride: int = 1,
     vram_offloader=None,
 ) -> None:
     timer = LoopTimer("blend-encode")
@@ -281,7 +366,13 @@ def blend_encode_loop(
                 for i in range(len(pts)):
                     yield batch[i]
 
-        with NvidiaVideoReader(input_video, batch_size=batch_size, device=device, metadata=metadata) as reader2:
+        with NvidiaVideoReader(
+            input_video,
+            batch_size=batch_size,
+            device=device,
+            metadata=metadata,
+            frame_stride=frame_stride,
+        ) as reader2:
             frame_gen = _flat_frames(reader2)
             secondary_done = False
             frames_encoded = 0
@@ -314,7 +405,7 @@ def blend_encode_loop(
                     original_frame = next(frame_gen)
 
                 with timer.measure("result-wait"):
-                    while not blend_buffer.is_frame_ready(meta.frame_idx):
+                    while meta.apply_effect and not blend_buffer.is_frame_ready(meta.frame_idx):
                         if cancel_event is not None and cancel_event.is_set():
                             break
                         if error_holder:
@@ -332,9 +423,18 @@ def blend_encode_loop(
                             pass
 
                 with timer.measure("blend"):
-                    blended = blend_buffer.blend_frame(meta.frame_idx, original_frame)
+                    if not meta.apply_effect:
+                        blended = original_frame
+                    else:
+                        blended = blend_buffer.blend_frame(
+                            meta.frame_idx,
+                            original_frame,
+                        )
                 with timer.measure("write"):
-                    frame_writer.write(blended, meta.pts)
+                    if meta.apply_effect:
+                        frame_writer.write(blended, meta.pts)
+                    else:
+                        frame_writer.write(blended, meta.pts, apply_lut=False)
                     frames_encoded += 1
                     frame_writer.after_write(frames_encoded)
 
