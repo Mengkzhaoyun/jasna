@@ -7,7 +7,7 @@ on:
 
 env:
   BUILD_VERSION: "13.0.3"
-  JASNA_VERSION: "v0.7.2"
+  JASNA_VERSION: "v0.10.0"
   IMAGE_NAME: ghcr.io/mengkzhaoyun/jasna
 
 jobs:
