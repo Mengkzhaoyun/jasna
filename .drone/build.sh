@@ -105,7 +105,7 @@ pip install --cache-dir "$SRC_DIR/.pip_cache" --no-build-isolation \
     ".[dev]"
 
 echo ">>> 4. 生成 Nuitka standalone 二进制..."
-NCCL_LIB=$(find /usr/lib /usr/local/lib/python3.13/site-packages/nvidia/nccl/lib -name "libnccl.so.2" 2>/dev/null | head -1 || true)
+NCCL_LIB=$(find /usr/local/lib/python3.13/site-packages/nvidia/nccl/lib /usr/lib -name "libnccl.so.2" 2>/dev/null | head -1 || true)
 [ -n "$NCCL_LIB" ] && export LD_PRELOAD="$NCCL_LIB"
 export CUDA_VISIBLE_DEVICES=""
 
@@ -136,7 +136,7 @@ python3.13 -m nuitka \
     --include-distribution-metadata=tensorrt \
     --include-distribution-metadata=torch_tensorrt \
     --include-distribution-metadata=diffusers \
-    --include-distribution-metadata=huggingface-hub \
+    --include-distribution-metadata=huggingface_hub \
     --nofollow-import-to=pytest \
     --nofollow-import-to=tests \
     jasna
