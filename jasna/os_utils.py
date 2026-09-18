@@ -188,8 +188,15 @@ FFMPEG_DOWNLOAD_LINKS = (
 )
 
 
-def check_required_executables() -> None:
+def check_required_executables(*, disable_ffmpeg_check: bool = False) -> None:
     """Check that required external tools are available in PATH and callable."""
+    if (
+        disable_ffmpeg_check
+        or os.environ.get("JASNA_DISABLE_FFMPEG_CHECK") == "1"
+        or os.environ.get("DISABLE_FFMPEG_CHECK") == "1"
+    ):
+        return
+
     missing: list[str] = []
     wrong_version: list[str] = []
     checks = {

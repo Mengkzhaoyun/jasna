@@ -186,6 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable the progress bar.",
     )
+    parser.add_argument(
+        "--disable-ffmpeg-check",
+        action="store_true",
+        help="Skip checking for ffmpeg/ffprobe in PATH and their version.",
+    )
 
     restoration = parser.add_argument_group("Restoration")
     restoration.add_argument(
@@ -592,7 +597,7 @@ def main() -> None:
         print(f"Current path: {path_info}")
         sys.exit(1)
 
-    check_required_executables()
+    check_required_executables(disable_ffmpeg_check=bool(args.disable_ffmpeg_check))
 
     gpu_ok, gpu_result = check_supported_gpu(str(args.device))
     if not gpu_ok:

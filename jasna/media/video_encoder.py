@@ -307,6 +307,17 @@ def _option_value(value: object) -> str:
     return str(value)
 
 
+_LEGACY_NVENC_OPTION_RENAMES = {
+    "gop": "g",
+    "maxbitrate": "maxrate",
+    "vbvbufsize": "bufsize",
+    "lookahead": "rc-lookahead",
+    "temporalaq": "temporal-aq",
+    "nonrefp": "nonref_p",
+    "tflevel": "tf_level",
+}
+
+
 def _drop_unsupported_nvenc_overrides(
     codec: str, overrides: dict[str, str], defaults: Mapping[str, str]
 ) -> None:
@@ -491,7 +502,15 @@ class NvidiaVideoEncoder:
         self.encoder_options = dict(spec.default_options)
         overrides: dict[str, str] = {}
         if encoder_settings:
-            overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
+            raw_overrides = {k: _option_value(v) for k, v in encoder_settings.items()}
+            overrides = {}
+            for k, v in raw_overrides.items():
+                target_k = _LEGACY_NVENC_OPTION_RENAMES.get(k, k)
+                val_str = v
+                if target_k in {"maxrate", "bufsize"} and val_str.isdigit() and 0 < int(val_str) < 100000:
+                    val_str = f"{val_str}k"
+                overrides[target_k] = val_str
+
             # FFmpeg accepts both spellings for HEVC/H.264, but their defaults
             # use the underscore key. Normalize the alias so a user override
             # replaces that default instead of passing two conflicting options.

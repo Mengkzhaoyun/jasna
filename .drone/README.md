@@ -8,7 +8,7 @@
 git remote add upstream git@github.com:Kruk2/jasna.git
 git fetch upstream
 git switch dev
-git merge v0.7.2
+git merge v0.10.0
 ```
 
 ## CI/CD

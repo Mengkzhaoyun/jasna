@@ -32,6 +32,9 @@ set -e
 # 支持的视频扩展名
 VIDEO_EXTS="mp4 mkv avi mov wmv flv webm ts"
 
+export JASNA_DISABLE_FFMPEG_CHECK=1
+export DISABLE_FFMPEG_CHECK=1
+
 if [ -d "/app/sglang" ]; then
 	cd /app/sglang
 fi
@@ -64,7 +67,7 @@ build_encoder_settings() {
 	if [ -n "${ENCODER_SETTINGS:-}" ]; then
 		echo "$ENCODER_SETTINGS"
 	elif [ -n "$target_kbps" ]; then
-		echo "rc=vbr,maxbitrate=${target_kbps},vbvbufsize=${target_kbps},cq=${ENCODER_CQ:-20},gop=${ENCODER_GOP:-60}"
+		echo "rc=vbr,maxrate=${target_kbps}k,bufsize=${target_kbps}k,cq=${ENCODER_CQ:-20},g=${ENCODER_GOP:-60}"
 	else
 		echo "cq=${ENCODER_CQ:-20}"
 	fi
@@ -74,7 +77,7 @@ build_low_bitrate_encoder_settings() {
 	if [ -n "${LOW_BITRATE_ENCODER_SETTINGS:-}" ]; then
 		echo "$LOW_BITRATE_ENCODER_SETTINGS"
 	else
-		echo "rc=vbr,maxbitrate=0,vbvbufsize=0,cq=${ENCODER_CQ:-20},gop=${ENCODER_GOP:-60}"
+		echo "rc=vbr,maxrate=0,bufsize=0,cq=${ENCODER_CQ:-20},g=${ENCODER_GOP:-60}"
 	fi
 }
 

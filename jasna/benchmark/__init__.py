@@ -97,7 +97,7 @@ def _print_results_table(
 
 
 def run_benchmark_cli(args: Namespace) -> None:
-    check_required_executables()
+    check_required_executables(disable_ffmpeg_check=bool(getattr(args, "disable_ffmpeg_check", False)))
     gpu_ok, gpu_result = check_supported_gpu(str(args.device))
     if not gpu_ok:
         if gpu_result == "no_cuda":
