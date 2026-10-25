@@ -230,7 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     restoration.add_argument(
         "--restoration-model-name",
         type=str,
-        default="basicvsrpp",
+        default="ltx",
         choices=list(CLI_RESTORATION_MODELS),
         help=CLI_HELP["restoration_model_name"],
     )

@@ -67,6 +67,7 @@ docker run --name sglang \
 ```
 
 > **提示**：
+>
 > - 若首次在新机器上激活，只需额外传入 `-e JASNA_LICENSE="JL1-..."`，`entrypoint.sh` 会自动完成激活并将离线凭证写入 `/root/.config/jasna/license.json`。
 > - 在 **RTX 5090 (Blackwell SM 12.0)** 上，可额外传入 `-e LTX_FAST=true` 启用硬件原生 **NVFP4** 权重与算子（提速约 1.4x，显存占用减半）。
 > - 如需切换回传统极速模式（BasicVSR++），传入 `-e RESTORATION_MODEL_NAME=basicvsrpp` 即可。
