@@ -8,7 +8,7 @@
 git remote add upstream git@github.com:Kruk2/jasna.git
 git fetch upstream
 git switch dev
-git merge v0.10.0
+git merge v0.11.3
 ```
 
 ## CI/CD
@@ -31,71 +31,81 @@ git checkout build ;`
 
 ```powershell
 # 1. 本地测试构建 builder 环境镜像
-docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.10.0-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
+docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.11.3-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
 
-# 2. 本地测试 Nuitka 编译流程 (挂载当前代码并执行 build.sh)
-docker pull ghcr.io/mengkzhaoyun/jasna:v0.10.0-build ; `
-docker run --rm -it `
-  -v "${PWD}:/app/jasna" `
-  -w /app/jasna `
-  ghcr.io/mengkzhaoyun/jasna:v0.10.0-build `
-  bash .drone/build.sh
+# 2. 本地测试运行镜像构建 (内置预编译 LTX C++/CUDA 算子与 Triton AOT 内核)
+docker build -f .drone/dockerfile -t registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3 .
 ```
 
 ## Hot Update
 
 ```powershell
 # 快速热更新源码和 entrypoint:
-#   本地 jasna/              -> /data/jasna/src/jasna              -> 容器 /app/sglang/jasna
+#   本地 jasna/              -> /data/jasna/src/jasna              -> 容器 /app/jasna/jasna & site-packages/jasna
 #   本地 .drone/entrypoint.sh -> /data/jasna/src/entrypoint.sh      -> 容器 /usr/local/bin/entrypoint.sh
 .\.tmp\hot-update.ps1
-
-# 如果改了 Python 代码，先本地编译 (产物在 dist_linux/jasna/)
-docker pull ghcr.io/mengkzhaoyun/jasna:v0.10.0-build ; `
-docker run --rm -it `
-  -v "${PWD}:/app/jasna" `
-  -w /app/jasna `
-  ghcr.io/mengkzhaoyun/jasna:v0.10.0-build `
-  bash .drone/build.sh
-
-# 编译产物热替换进运行中的 jasna 容器
-.\.tmp\hot-update.ps1 -Dist
 ```
 
-## Production Deployment (RTX 4090 Recommended)
+## Production Deployment (RTX 4090 / RTX 5090 Recommended)
 
-对于配备 RTX 4090 (24GB VRAM) 的生产环境，建议使用以下启动命令以充分榨干算力并实现极限画质：
+自 `v0.11.3` 起，容器已默认内置 `RESTORATION_MODEL_NAME=ltx`（LTX-2.5 22B 2-step 视频去马赛克修复）并自动探测 `RESTORATION_MODEL_PATH`，无需额外传递模型环境变量即可直接启动：
+
+### 1. LTX 模式生产部署（默认推荐，画质与细节最佳）
 
 ```bash
 docker rm -f sglang || true && \
-docker pull registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.10.0 && \
 docker run --name sglang \
   -it --rm \
+  --gpus '"device=0"' \
+  -e TARGET_BITRATE=5M \
+  -v /etc/machine-id:/etc/machine-id:ro \
+  -v /root/.config/jasna:/root/.config/jasna \
+  -v /data/jasna/model_weights:/app/sglang/model_weights \
+  -v /data/jasna/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3:/app/jasna-release \
+  -v /nas/sglang/ai:/data \
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3
+```
+
+> **提示**：
+> - 若首次在新机器上激活，只需额外传入 `-e JASNA_LICENSE="JL1-..."`，`entrypoint.sh` 会自动完成激活并将离线凭证写入 `/root/.config/jasna/license.json`。
+> - 在 **RTX 5090 (Blackwell SM 12.0)** 上，可额外传入 `-e LTX_FAST=true` 启用硬件原生 **NVFP4** 权重与算子（提速约 1.4x，显存占用减半）。
+> - 如需切换回传统极速模式（BasicVSR++），传入 `-e RESTORATION_MODEL_NAME=basicvsrpp` 即可。
+
+### 2. BasicVSR++ 极速模式部署（无需官方 release 挂载与授权）
+
+```bash
+docker rm -f sglang || true && \
+docker run --name sglang \
+  -it --rm \
+  --gpus all \
   -e NVIDIA_DRIVER_CAPABILITIES=all \
   -e CUDA_VISIBLE_DEVICES=0 \
+  -e RESTORATION_MODEL_NAME=basicvsrpp \
   -e TARGET_BITRATE=5M \
-  --gpus all \
   -v /nas/sglang/model_weights:/app/sglang/model_weights \
-  -v /nas/sglang/sglang:/app/sglang/sglang \
   -v /nas/sglang/ai:/data \
-  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-sglang-v0.10.0
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3
 ```
 
 ### 核心参数优化说明
 
-- `--max-clip-size 150`: 大幅增加 BasicVSR++ 的时序上下文窗口（默认90），让模型能参考更多连续帧，极大提升视频一致性和极限画质。4090 的 24GB 显存完美吃下此参数。
-- `--temporal-overlap 16`: 配合更长的 clip 增加重叠区，配合 crossfade 实现完美丝滑的拼接过渡。
-- `--denoise low`: 开启轻度空间降噪，抹除模型生成的极其细微的杂色噪点，且不损失 4090 跑出的高清纹理细节。
-- `TARGET_BITRATE=5M`: 直接把 5M 目标码率传给 Jasna 内部 PyNvVideoCodec/NVENC，避免先输出高码率文件再用 FFmpeg 二次转码。
-- `PRESERVE_LOW_BITRATE=true`: 批量扫描时先读取输入视频码率，若输入视频码率已经小于等于 `TARGET_BITRATE`，仍正常处理视频，但改用不限码率上限的 NVENC 设置，避免重编码把小文件压到 5M。旧的 `SKIP_LOW_BITRATE` 变量仍兼容，但语义已变为低码率不压缩。
-- `LOW_BITRATE_ENCODER_SETTINGS=...`: 可覆盖低码率输入使用的 NVENC 设置；默认是 `rc=vbr,maxbitrate=0,vbvbufsize=0,cq=20,gop=60`。
+- `RESTORATION_MODEL_NAME=ltx`（内置默认）：支持 `ltx`（默认 2-step）、`ltx-4step`（4-step）、`ltx-8step`（8-step）、`ltx-undistilled` 及 `basicvsrpp`。
+- `RESTORATION_MODEL_PATH`（内置自动探测）：容器启动时自动桥接 `/app/sglang/model_weights` 与 `/data/jasna/model_weights` 并定位 `vae.safetensors(.enc)` 所在目录。
+- `LTX_FAST=false`：设为 `true` 时启用 RTX 50 系（Blackwell）专属 NVFP4 模型。
+- `LTX_LARGE_CANVAS=false`：设为 `true` 时以 768px 画布（默认 512px）修复大面积马赛克。
+- `--max-clip-size 150`（仅 `basicvsrpp`）：大幅增加 BasicVSR++ 的时序上下文窗口（默认90），让模型能参考更多连续帧，极大提升视频一致性和极限画质。4090 的 24GB 显存完美吃下此参数。
+- `--temporal-overlap 16`：配合更长的 clip 增加重叠区，配合 crossfade 实现完美丝滑的拼接过渡。
+- `--denoise low`：开启轻度空间降噪，抹除模型生成的极其细微的杂色噪点，且不损失 4090 跑出的高清纹理细节。
+- `TARGET_BITRATE=5M`：直接把 5M 目标码率传给 Jasna 内部 VALI/NVENC，避免先输出高码率文件再用 FFmpeg 二次转码。
+- `PRESERVE_LOW_BITRATE=true`：批量扫描时先读取输入视频码率，若输入视频码率已经小于等于 `TARGET_BITRATE`，仍正常处理视频，但改用不限码率上限的 NVENC 设置，避免重编码把小文件压到 5M。旧的 `SKIP_LOW_BITRATE` 变量仍兼容，但语义已变为低码率不压缩。
+- `LOW_BITRATE_ENCODER_SETTINGS=...`：可覆盖低码率输入使用的 NVENC 设置；默认是 `rc=vbr,maxrate=0,bufsize=0,cq=20,g=60`。
 
 ### 编码流水线说明
 
-当前镜像默认采用单阶段处理：
+当前镜像默认采用全硬件单阶段处理（已集成 `python_vali==4.8.8` 容错分支，支持 `DecodeSingleSurfaceAsyncDetailed`）：
 
 ```text
-PyAV 解码(PTS 稳定) -> Jasna CUDA/BasicVSR++ 去马赛克 -> PyNvVideoCodec/NVENC 5M 输出 -> 音频/元数据 remux
+VALI/NVDEC 硬件解码 (PyAV 自动兜底) -> RF-DETR v6 检测 -> LTX 22B (INT8/NVFP4) 或 BasicVSR++ 修复 -> VALI/NVENC 5M 硬件编码 -> 音频/元数据 remux
 ```
 
 之前的 `POST_COMPRESS_BITRATE=5M` 是二阶段方案：
@@ -115,18 +125,29 @@ Jasna 容器运行依赖挂载目录（如 `/nas/sglang/model_weights`）中的�
 mkdir -p /nas/sglang/model_weights
 cd /nas/sglang/model_weights
 
-# 1. 核心去马赛克修复模型 (必须)
-# (如直连 HuggingFace 失败可直接使用国内镜像加速源)
+# 1. LTX-2.5 22B 去马赛克修复模型套件 (默认推荐，支持国内 hf-mirror 高速直连)
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae.safetensors.enc.manifest.json
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae-decoder.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae-decoder.safetensors.enc.manifest.json
+# RTX 4090 / SM 8.9 推荐 INT8 2-step 蒸馏权重 (13.3 GB):
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-int8.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-int8.safetensors.enc.manifest.json
+# RTX 5090 / SM 12.0 专属 NVFP4 2-step 蒸馏权重 (7.7 GB，配合 LTX_FAST=true):
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-nvfp4.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-nvfp4.safetensors.enc.manifest.json
+
+# 2. BasicVSR++ 传统去马赛克修复模型
 curl -L -O https://hf-mirror.com/ladaapp/lada/resolve/main/lada_mosaic_restoration_model_generic_v1.2.pth
 
-# 2. 最新 RF-DETR v6 高清/4K 检测模型 (推荐，检出率更优)
+# 3. 最新 RF-DETR v6 高清/4K 检测模型 (推荐，检出率更优)
 # (如遇直连 GitHub 较慢，可在链接前添加 ghproxy 代理，例如: https://ghproxy.net/https://github.com/...)
 curl -L -O https://ghproxy.net/https://github.com/Kruk2/jasna/releases/download/0.1/rfdetr-v6-large.onnx
 
-# 3. 稳定版 RF-DETR v5 检测模型 (通用兼容，可选)
+# 4. 稳定版 RF-DETR v5 检测模型 (通用兼容，可选)
 curl -L -O https://ghproxy.net/https://github.com/Kruk2/jasna/releases/download/v0.7.1/rfdetr-v5.onnx
 
-# 4. YOLO v4 极速轻量检测模型 (二次元/低显存可选)
+# 5. YOLO v4 极速轻量检测模型 (二次元/低显存可选)
 curl -L -O https://hf-mirror.com/ladaapp/lada/resolve/main/lada_mosaic_detection_model_v4_fast.pt
 ```
 
