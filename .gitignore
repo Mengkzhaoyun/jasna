@@ -84,5 +84,6 @@ jasna/ltx/native/prebuilt/
 
 /.tmp
 /.pip_cache
+.kiro/
 *.orig
 *.rej
