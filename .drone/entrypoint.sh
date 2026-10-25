@@ -178,6 +178,17 @@ if [ -z "${RESTORATION_MODEL_PATH:-}" ] && [[ "${RESTORATION_MODEL_NAME}" == ltx
 	done
 fi
 
+# 自动识别 GPU 架构 (RTX 5090 Blackwell SM 12.0+ 且存在 nvfp4 权重时自动开启 LTX_FAST=true，4090 自动使用 INT8)
+if [ -z "${LTX_FAST:-}" ] && [[ "${RESTORATION_MODEL_NAME}" == ltx* ]]; then
+	GPU_CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -n 1 | tr -d ' ' || true)"
+	if [[ "${GPU_CC}" == 12.* ]] && [ -n "${RESTORATION_MODEL_PATH:-}" ]; then
+		if ls "${RESTORATION_MODEL_PATH}"/*nvfp4*.safetensors* >/dev/null 2>&1; then
+			LTX_FAST="true"
+		fi
+	fi
+fi
+LTX_FAST="${LTX_FAST:-false}"
+
 # ---- 带参数时直接透传给 sglang ----
 JASNA_BIN="/app/sglang/sglang"
 FFMPEG_CHECK_ARG="--disable-ffmpeg-check"
@@ -203,6 +214,9 @@ if [ $# -gt 0 ]; then
 	fi
 	if [[ " $* " != *"--restoration-model-path"* ]] && [ -n "${RESTORATION_MODEL_PATH:-}" ]; then
 		PASSTHROUGH_MODEL_ARGS+=(--restoration-model-path "${RESTORATION_MODEL_PATH}")
+	fi
+	if [[ " $* " != *"--ltx-fast"* ]] && [[ " $* " != *"--no-ltx-fast"* ]] && [ "${LTX_FAST}" = "true" ]; then
+		PASSTHROUGH_MODEL_ARGS+=(--ltx-fast)
 	fi
 	exec $JASNA_BIN $FFMPEG_CHECK_ARG --detection-model "${DETECTION_MODEL:-rfdetr-v6-large}" "${PASSTHROUGH_MODEL_ARGS[@]}" --encoder-settings "$(build_encoder_settings)" "$@"
 fi
@@ -256,7 +270,7 @@ echo "============================================"
 echo " sglang 批量处理模式"
 echo "============================================"
 echo " 扫描目录: ${SCAN_DIR}"
-echo " 修复模型: ${RESTORATION_MODEL_NAME}${RESTORATION_MODEL_PATH:+ (${RESTORATION_MODEL_PATH})}"
+echo " 修复模型: ${RESTORATION_MODEL_NAME}$([ "$LTX_FAST" = "true" ] && echo " [NVFP4 Fast]" || true)${RESTORATION_MODEL_PATH:+ (${RESTORATION_MODEL_PATH})}"
 echo " 检测模型: ${DETECTION_MODEL}"
 echo " 编码器:   ${CODEC}"
 echo " NVENC:    ${ENCODER_SETTINGS}"
