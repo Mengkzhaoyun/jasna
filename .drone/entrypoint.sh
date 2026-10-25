@@ -19,6 +19,11 @@ set -e
 #   DETECTION_SCORE_THRESHOLD  (默认: 0.25)
 #   FP16                       (默认: true)
 #   COMPILE_BASICVSRPP         (默认: true)
+#   RESTORATION_MODEL_NAME     (默认: 空, 即 basicvsrpp; 可选: ltx, ltx-4step, ltx-8step, ltx-undistilled)
+#   RESTORATION_MODEL_PATH     (默认: 空, 自动按模型类型解析路径)
+#   LTX_LARGE_CANVAS           (默认: false)
+#   LTX_FAST                   (默认: false, 仅 RTX 50 系支持 NVFP4)
+#   LTX_TRIAL                  (默认: false, LTX 免费测速/算子验证模式)
 #   LOG_LEVEL                  (默认: info)
 #   TARGET_BITRATE             (默认: 5M) 直接传给 Jasna NVENC，一阶段输出目标码率
 #   PRESERVE_LOW_BITRATE       (默认: true) 输入视频码率 <= TARGET_BITRATE 时仍处理，但不压缩
@@ -171,6 +176,11 @@ DENOISE="${DENOISE:-low}"
 DETECTION_SCORE_THRESHOLD="${DETECTION_SCORE_THRESHOLD:-}"
 FP16="${FP16:-true}"
 COMPILE_BASICVSRPP="${COMPILE_BASICVSRPP:-true}"
+RESTORATION_MODEL_NAME="${RESTORATION_MODEL_NAME:-}"
+RESTORATION_MODEL_PATH="${RESTORATION_MODEL_PATH:-}"
+LTX_LARGE_CANVAS="${LTX_LARGE_CANVAS:-false}"
+LTX_FAST="${LTX_FAST:-false}"
+LTX_TRIAL="${LTX_TRIAL:-false}"
 LOG_LEVEL="${LOG_LEVEL:-info}"
 TARGET_BITRATE="${TARGET_BITRATE:-5M}"
 TARGET_BITRATE_KBPS="$(bitrate_to_kbps "$TARGET_BITRATE")"
@@ -182,6 +192,11 @@ POST_COMPRESS_BITRATE="${POST_COMPRESS_BITRATE:-}"
 JASNA_OPTS=""
 [ -n "$BATCH_SIZE" ] && JASNA_OPTS="$JASNA_OPTS --batch-size $BATCH_SIZE"
 [ -n "$DETECTION_MODEL" ] && JASNA_OPTS="$JASNA_OPTS --detection-model $DETECTION_MODEL"
+[ -n "$RESTORATION_MODEL_NAME" ] && JASNA_OPTS="$JASNA_OPTS --restoration-model-name $RESTORATION_MODEL_NAME"
+[ -n "$RESTORATION_MODEL_PATH" ] && JASNA_OPTS="$JASNA_OPTS --restoration-model-path $RESTORATION_MODEL_PATH"
+[ "$LTX_LARGE_CANVAS" = "true" ] && JASNA_OPTS="$JASNA_OPTS --ltx-large-canvas"
+[ "$LTX_FAST" = "true" ] && JASNA_OPTS="$JASNA_OPTS --ltx-fast"
+[ "$LTX_TRIAL" = "true" ] && JASNA_OPTS="$JASNA_OPTS --ltx-trial"
 [ -n "$MAX_CLIP_SIZE" ] && JASNA_OPTS="$JASNA_OPTS --max-clip-size $MAX_CLIP_SIZE"
 [ -n "$TEMPORAL_OVERLAP" ] && JASNA_OPTS="$JASNA_OPTS --temporal-overlap $TEMPORAL_OVERLAP"
 [ "$ENABLE_CROSSFADE" = "true" ] && JASNA_OPTS="$JASNA_OPTS --enable-crossfade"

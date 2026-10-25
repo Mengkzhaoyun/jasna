@@ -33,8 +33,10 @@ ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
 WORKDIR /app/jasna
 COPY . /app/jasna
 
-# 极速安装当前版本 jasna（无依赖重复下载）并创建 sglang 兼容入口
-RUN pip install --no-cache-dir --no-deps . && \
+# 预编译 LTX 原生 C++/CUDA 算子扩展 (SageAttention INT8 + Triton AOT 内核, 覆盖 SM 8.0/8.6/8.9/12.0)
+# 并极速安装当前版本 jasna（无依赖重复下载）与创建 sglang 兼容入口
+RUN python3.13 -c "from jasna.ltx.native import PREBUILT, prebuild; prebuild(PREBUILT)" && \
+    pip install --no-cache-dir --no-deps . && \
     mkdir -p /app/sglang/model_weights && \
     printf '#!/bin/bash\nexec python3.13 -m jasna "$@"\n' > /app/sglang/sglang && \
     chmod +x /app/sglang/sglang && \

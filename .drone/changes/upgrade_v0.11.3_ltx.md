@@ -82,11 +82,39 @@
 | `vae.safetensors`                               |  1,472,223_815 | `b9252d5a...08f5e25` | 共享视频 VAE（基于 Lightricks `ltx-2.5-video-vae-bf16.safetensors`）        |
 | `vae-decoder.safetensors`                       |     38,718,609 | `c60c3572...caeea2d` | 共享微调 VAE Decoder                                                        |
 
-### 3. RTX 4090 vs RTX 5090 算子与显存行为对比
+### 3. 上游 `jasna.protection` 与 `.safetensors.enc` 加密架构解析
+
+通过对上游 `v0.11.3` 官方 Linux 发行版二进制常量区与 `protection/_core.so` 的完整分析，其保护层由 18 个子模块构成，核心数据流如下：
+
+1. **文件格式与清单校验（`jasna/protection/model_manifest.py` & `_pins.py`）**：
+   - `.safetensors.enc` 文件头部为 29 字节 `JASNAENC1` + `>8sQI`（8 字节 base nonce、8 字节明文总长度、4 字节分块数 `total_chunks`），随后每个分块以 4 字节块长度开头，后接密文与 16 字节 AES-GCM 认证标签。
+   - `.manifest.json`（及 `_pins.py` 内置固定清单）记录分块 SHA-256 哈希列表并使用发布者 Ed25519 私钥签名。
+2. **密钥信封机制（`jasna/protection/envelope.py` & `license_store.py` & `activation.py`）**：
+   - 模型的真实 AES-GCM 内容密钥（`content_key`）**并不存储在客户端代码或 `.enc` 文件中**。
+   - 当用户通过 `License code`（`JL1-...`）向激活服务（`https://jasna-activation.kruk2.workers.dev/v1/activate` 或 `https://47.238.135.110/v1/activate`）请求激活时，服务端校验机器标识（Linux 为 `JM1-<sha256>`，基于 `/etc/machine-id`）并返回 `Activation key`（保存在 `license.json`）。
+   - `Activation key` 中包含 `wraps["ltx-2.5-v2"]`，即用构建主密钥（`master_key`）通过 HKDF-SHA256 + AES-GCM 封装后的模型 `content_key`，由 `protection/_core.so` 在原生层解封并解密分块。
+3. **自建容器与源码环境落地路径**：
+   - **路径 A（明文 `.safetensors` 直跑，无需任何 `jasna.protection` 组件）**：只要将解密后或自训练的明文 `.safetensors` 放入 `model_weights/`（或指定 `--restoration-model-path`），`jasna/ltx/model_files.py` 会自动走 `_PlaintextHandle` 原生加载，并通过开源 `BlockStore` + `jasna_ltx_native` 全速运行。
+   - **路径 B（官方发行版组件 + 授权激活）**：已将官方 `v0.11.3` 的 `jasna` 主程序、`comfy_kitchen` 及 `protection/`（`_core.so`、`_opaque_ltx.so` 等）提取缓存在 4090 服务器 `/data/jasna/.release-cache/v0.11.3/`。
+
+### 4. RTX 4090 真机热更新与算子实测结果（`36.170.21.98:36226`）
+
+已在 8× RTX 4090 服务器（Driver `595.84`，CUDA `13.2`）完成热更新与算子预编译验证：
+
+- **热更新镜像**：`registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3`（位于 `/data/jasna/src`）。
+- **预编译算子缓存（`jasna/ltx/native/prebuilt/`）**：
+  - `jasna_ltx_native.so`（3.42 MB，含 C++/CUDA `block.cpp`、`glue.cu` 及 SageAttention INT8 内核）。
+  - `kernels/`：已完成全架构 Triton AOT 内核预编译，涵盖 `sm75-int8`、`sm86-int8`、`sm89-int8`（RTX 4090）、`sm120-int8`、`sm120-nvfp4`（RTX 5090）、`sm121-int8`、`sm121-nvfp4`。
+- **RTX 4090 (GPU 3, 24GB VRAM) 实测指标**：
+  - `T.require_kernels(cuda:0)`：**通过**（`triton` + `comfy_kitchen` INT8 Attention 就绪）。
+  - `LtxTransformer`（`distilled2` INT8，48 层 Transformer Blocks）加载耗时：**4.22 秒**（预编译后免 JIT 编译）。
+  - 后端与显存驻留：`backend = native`，**`resident blocks = 48 / 48`（100% 显存常驻，0 PCIe 流式回退）**。
+
+### 5. RTX 4090 vs RTX 5090 算子与显存行为对比
 
 - **RTX 4090 (24GB VRAM, Ada Lovelace SM 8.9)**：
-  - 使用 **INT8** 权重（约 13.3 GB），自动启用 `cuBLAS INT8 MM` + `SageAttention INT8` + `Triton Epilogue` 原生算子。
-  - 24GB 显存可常驻大部分 Transformer Blocks，剩余少量 Block 通过 Pinned Host Memory 双缓冲异步流式传输。
+  - 使用 **INT8** 权重（约 13.3 GB），自动启用 `cuBLAS INT8 MM` + `SageAttention INT8` + `Triton Epilogue` 原生算子（`sm89-int8`）。
+  - 空载 24GB 显存下可将全部 **48 / 48** 个 Transformer Blocks 100% 常驻显存。
 - **RTX 5090 (32GB VRAM, Blackwell SM 12.0)**：
-  - 支持 `--ltx-fast` 启用硬件原生 **NVFP4** 权重（仅 7.7 GB，体积减半）与 `cuBLAS BlockWise1x16 NVFP4 GEMM` + `Triton FP4 Quantize` 算子。
-  - 32GB 显存可将全部 28 个 Transformer Blocks **100% 驻留 GPU 显存**（`resident = 28, streamed = 0`），彻底消除 PCIe 流式拷贝开销，同时支持更大的窗口并发组（`group_size`）与 `--ltx-large-canvas`。
+  - 支持 `--ltx-fast` 启用硬件原生 **NVFP4** 权重（仅 7.7 GB，体积减半）与 `cuBLAS BlockWise1x16 NVFP4 GEMM` + `Triton FP4 Quantize` 算子（`sm120-nvfp4`，已在 `prebuilt/kernels/` 中预编译就绪）。
+  - 32GB 显存不仅可 100% 常驻全部 Blocks，还支持更大的窗口并发组（`group_size`）与 `--ltx-large-canvas`。
