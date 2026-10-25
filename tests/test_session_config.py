@@ -4,9 +4,12 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from jasna.gui.models import AppSettings
-from jasna.gui.video_session import video_session_config
+from jasna.gui.video_session import build_image_session, video_session_config
 from jasna.main import _session_config_from_args, build_parser
+from jasna.mosaic.detection_registry import recommended_score_threshold
 
 _DETECTION_PATH = Path("mw") / "rfdetr-v6.onnx"
 _RESTORATION_PATH = Path("mw") / "lada_mosaic_restoration_model_generic_v1.2.pth"
@@ -16,12 +19,14 @@ def _cli_config(extra_args: list[str] | None = None):
     args = build_parser().parse_args(
         ["--input", "a.mp4", "--output", "b.mp4", *(extra_args or [])]
     )
+    threshold = args.detection_score_threshold
     return _session_config_from_args(
         args,
         codec="hevc",
         encoder_settings={},
         detection_model_name="rfdetr-v6",
         detection_model_path=_DETECTION_PATH,
+        detection_score_threshold=recommended_score_threshold("rfdetr-v6") if threshold is None else threshold,
         restoration_model_path=_RESTORATION_PATH,
         lut_path=None,
     )
@@ -115,6 +120,38 @@ def test_cli_non_default_args_are_mapped() -> None:
     assert config.scene_detection is False
 
 
+def test_cli_ltx_args_are_mapped() -> None:
+    defaults = _cli_config()
+    assert defaults.restoration_model_name == "basicvsrpp"
+    assert defaults.ltx_large_canvas is False
+    assert defaults.ltx_seed == 20260923
+    assert defaults.ltx_model == "distilled2"
+
+    assert _cli_config(["--restoration-model-name", "ltx"]).ltx_model == "distilled2"
+    assert _cli_config(["--restoration-model-name", "ltx-4step"]).ltx_model == "distilled4"
+    assert _cli_config(["--restoration-model-name", "ltx-8step"]).ltx_model == "distilled"
+    teacher = _cli_config(["--restoration-model-name", "ltx-undistilled"])
+    assert (teacher.restoration_model_name, teacher.ltx_model) == ("ltx", "undistilled")
+
+    config = _cli_config(["--restoration-model-name", "ltx", "--ltx-large-canvas", "--ltx-seed", "7"])
+    assert config.restoration_model_name == "ltx"
+    assert config.ltx_large_canvas is True
+    assert config.ltx_seed == 7
+
+
+def test_cli_less_overlap_is_on_by_default_and_steps_ltx_windows_by_104_frames() -> None:
+    assert _cli_config(["--restoration-model-name", "ltx"]).ltx_window_hop == 104
+    more = _cli_config(["--restoration-model-name", "ltx", "--no-experimental-ltx-less-overlap"])
+    assert more.ltx_window_hop == 88
+
+
+def test_restoration_model_path_defaults_per_model() -> None:
+    from jasna.engine_paths import default_restoration_model_path
+
+    assert default_restoration_model_path("basicvsrpp").name == "lada_mosaic_restoration_model_generic_v1.2.pth"
+    assert default_restoration_model_path("ltx").name == "ltx-restore"
+
+
 def test_gui_defaults_match_cli_defaults() -> None:
     cli = _cli_config()
     gui = _gui_config(AppSettings())
@@ -144,3 +181,13 @@ def test_gui_config_maps_settings_fields() -> None:
     assert config.denoise_strength == "low"
     assert config.scene_detection is False
     assert config.disable_progress is True
+
+
+def test_gui_image_session_requires_installed_sd15_bundle(monkeypatch) -> None:
+    from jasna.gui.locales import t
+    from jasna.restorer import sd15_download
+
+    monkeypatch.setattr(sd15_download, "bundle_present", lambda _path: False)
+
+    with pytest.raises(FileNotFoundError, match=t("interactive_model_missing")):
+        build_image_session(AppSettings(), log=None)

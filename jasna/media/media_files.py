@@ -2,12 +2,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from jasna.media.image_io import IMAGE_EXTENSIONS
-
+IMAGE_EXTENSIONS: frozenset[str] = frozenset(
+    {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+)
 VIDEO_EXTENSIONS: frozenset[str] = frozenset(
     {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm"}
 )
 MEDIA_EXTENSIONS: frozenset[str] = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+
+
+def file_dialog_patterns(extensions: frozenset[str]) -> str:
+    return " ".join(f"*{extension}" for extension in sorted(extensions))
 
 
 def is_image(path: str | Path) -> bool:
@@ -61,3 +66,14 @@ def folder_output_path(output_dir: str | Path, input_path: str | Path, output_pa
     if is_image(input_path) or not output_path.suffix:
         output_path = output_path.with_suffix(input_path.suffix)
     return output_path
+
+
+def unique_path(path: Path) -> Path:
+    """Return ``path``, or ``<stem> (N)<suffix>`` for the first N that does not exist."""
+    if not path.exists():
+        return path
+    for counter in range(1, 10000):
+        candidate = path.with_name(f"{path.stem} ({counter}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Could not find unique filename after 9999 attempts: {path}")

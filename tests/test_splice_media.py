@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 from jasna.accelerator import AcceleratorVendor
-from jasna.media import get_video_meta_data
+from jasna.media.audio_utils import source_audio_codec
+from jasna.media.probe import get_video_meta_data
 from jasna.media.splice import (
     SpliceSpan,
     concatenate_fragments,
@@ -19,6 +20,8 @@ from jasna.media.splice import (
     resolve_smart_encoder_settings,
 )
 from jasna.os_utils import resolve_executable, subprocess_no_window_kwargs
+
+from factories import write_double_adts_aac_source, write_non_utf8_metadata_source
 
 
 def _ffmpeg(*args: str) -> None:
@@ -74,7 +77,7 @@ def test_h264_probe_resolves_source_compatible_smart_settings(tmp_path: Path) ->
     ("codec", "encoder", "source_options", "render_options"),
     [
         ("h264", "libx264", ["-g", "12", "-keyint_min", "12", "-sc_threshold", "0"], ["-g", "12", "-bf", "3", "-flags", "+cgop"]),
-        ("hevc", "libx265", ["-x265-params", "keyint=12:min-keyint=12:scenecut=0:open-gop=0"], ["-x265-params", "keyint=12:bframes=4:open-gop=0"]),
+        ("hevc", "libx265", ["-x265-params", "keyint=12:min-keyint=12:scenecut=0:open-gop=0"], ["-x265-params", "keyint=12:bframes=4:open-gop=0:ref=5"]),
         ("av1", "libsvtav1", ["-preset", "10", "-g", "12", "-svtav1-params", "scd=0"], ["-preset", "10", "-g", "12"]),
     ],
 )
@@ -100,8 +103,12 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
     assert len(index.pts) >= 3
 
     raw_parts = [tmp_path / f"raw-{i}.nut" for i in range(3)]
-    create_copy_fragment(source, SpliceSpan("copy", index.start_pts, index.pts[1]), index, raw_parts[0])
-    create_copy_fragment(source, SpliceSpan("copy", index.pts[2], index.end_pts), index, raw_parts[2])
+    create_copy_fragment(
+        source, SpliceSpan("copy", index.start_pts, index.pts[1]), index, raw_parts[0], codec=metadata.codec_name
+    )
+    create_copy_fragment(
+        source, SpliceSpan("copy", index.pts[2], index.end_pts), index, raw_parts[2], codec=metadata.codec_name
+    )
     _ffmpeg(
         "-ss", "1",
         "-i", str(source),
@@ -135,6 +142,8 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
         assert len(container.streams.video) == 1
         assert len(container.streams.audio) == 1
         assert container.streams.video[0].codec_context.name in {codec, "libdav1d"}
+        if codec == "hevc":
+            assert container.streams.video[0].codec_tag == "hev1"
         output_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
         assert len(output_frames) == 36
         assert float(container.duration / av.time_base) == pytest.approx(3.0, abs=0.01)
@@ -142,6 +151,10 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
         source_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
     for frame_index in [*range(12), *range(24, 36)]:
         assert np.array_equal(output_frames[frame_index], source_frames[frame_index])
+    with av.open(str(raw_parts[1])) as container:
+        render_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    for frame_index in range(12):
+        assert np.array_equal(output_frames[12 + frame_index], render_frames[frame_index])
 
 
 @pytest.mark.parametrize(
@@ -198,6 +211,7 @@ def test_final_mux_preserves_compatible_source_structure(
         "-c:s", "srt",
         "-attach", str(attachment),
         "-metadata:s:t:0", "mimetype=text/plain",
+        "-metadata:s:t:0", f"filename={attachment.name}",
         str(source),
     )
     assembled = tmp_path / "assembled.mkv"
@@ -288,3 +302,58 @@ def test_final_mux_rebuilds_mp4_chapter_carrier_only_once(tmp_path: Path) -> Non
             "Main",
         ]
         assert len(container.streams.data) == 1
+
+
+def test_final_mux_skips_mp4_timecode_stream_without_codec(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=12:duration=1",
+        "-f", "lavfi", "-i", "sine=frequency=1000:duration=1",
+        "-c:v", "libx264",
+        "-c:a", "aac",
+        "-timecode", "00:00:00:00",
+        str(source),
+    )
+    with av.open(str(source)) as container:
+        assert container.streams.data[0].codec_context is None
+
+    assembled = tmp_path / "assembled.mp4"
+    _ffmpeg("-i", str(source), "-map", "0:v:0", "-c:v", "copy", str(assembled))
+    output = tmp_path / "output.mp4"
+
+    mux_final_output(assembled, source, output, codec="h264")
+
+    with av.open(str(output)) as container:
+        assert len(container.streams.video) == 1
+        assert len(container.streams.audio) == 1
+        assert container.streams.video[0].metadata["timecode"] == "00:00:00:00"
+
+
+def test_final_mux_copies_double_adts_aac_into_mp4(tmp_path: Path) -> None:
+    source = write_double_adts_aac_source(tmp_path)
+    assembled = tmp_path / "assembled.mp4"
+    _ffmpeg("-i", str(source), "-map", "0:v:0", "-c:v", "copy", str(assembled))
+    output = tmp_path / "output.mp4"
+
+    mux_final_output(assembled, source, output, codec="h264")
+
+    with av.open(str(output)) as container:
+        assert sum(1 for _ in container.decode(audio=0)) > 1
+
+
+def test_source_with_non_utf8_tags_probes_and_splices(tmp_path: Path) -> None:
+    source = write_non_utf8_metadata_source(tmp_path / "bad-tags.mp4")
+
+    metadata = get_video_meta_data(str(source))
+    assert source_audio_codec(str(source)) == "aac"
+    index = probe_keyframes(source, metadata)
+    copied = tmp_path / "copy.nut"
+    create_copy_fragment(source, SpliceSpan("copy", index.start_pts, index.pts[1]), index, copied, codec="h264")
+    normalized = tmp_path / "copy.ts"
+    normalize_fragment(copied, normalized, codec="h264")
+    output = tmp_path / "output.mp4"
+    mux_final_output(normalized, source, output, codec="h264")
+
+    with av.open(str(output), metadata_errors="replace") as container:
+        assert container.metadata["title"] == "JASNA\ufffdTAG"
+        assert container.streams.audio

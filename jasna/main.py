@@ -1,12 +1,14 @@
 import argparse
 import logging
 import sys
+from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 from jasna import __version__
 from jasna.cli_help import CLI_HELP
-from jasna.engine_paths import model_weights_dir
-from jasna.media import UnsupportedColorspaceError
+from jasna.engine_paths import default_restoration_model_path
+from jasna.media.probe import UnsupportedVideoError
 from jasna.os_utils import (
     MIN_DRIVER_VERSION,
     check_ascii_install_path,
@@ -14,8 +16,20 @@ from jasna.os_utils import (
     check_required_executables,
     check_supported_gpu,
     check_windows_nvidia_sysmem_fallback_policy,
+    gpu_check_error,
+    install_on_hard_disk,
 )
-from jasna.session_config import SessionConfig
+from jasna.session_config import LTX_DEFAULT_MODEL, LTX_DEFAULT_SEED, LtxModelName, RestorationModelName, SessionConfig
+
+# CLI restoration model name -> (restoration backend, LTX model variant).
+CLI_RESTORATION_MODELS: dict[str, tuple[RestorationModelName, LtxModelName]] = {
+    "basicvsrpp": ("basicvsrpp", LTX_DEFAULT_MODEL),
+    "ltx": ("ltx", "distilled2"),
+    "ltx-4step": ("ltx", "distilled4"),
+    "ltx-8step": ("ltx", "distilled"),
+    "ltx-undistilled": ("ltx", "undistilled"),
+}
+
 
 
 def _session_config_from_args(
@@ -25,25 +39,31 @@ def _session_config_from_args(
     encoder_settings: dict[str, object],
     detection_model_name: str,
     detection_model_path: Path,
+    detection_score_threshold: float,
     restoration_model_path: Path,
     lut_path: str | None,
 ) -> SessionConfig:
-    from jasna.mosaic.detection_registry import recommended_score_threshold
+    from jasna.ltx.plan import window_hop
 
-    threshold = args.detection_score_threshold
-    if threshold is None:
-        threshold = recommended_score_threshold(detection_model_name)
     return SessionConfig(
         device=str(args.device),
         fp16=bool(args.fp16),
         batch_size=int(args.batch_size),
         detection_model_name=detection_model_name,
         detection_model_path=detection_model_path,
-        detection_score_threshold=float(threshold),
+        detection_score_threshold=detection_score_threshold,
         max_detection_gap=int(args.max_detection_gap),
         min_detection_duration=int(args.min_detection_duration),
         scene_detection=bool(args.scene_detection),
+        restoration_model_name=CLI_RESTORATION_MODELS[args.restoration_model_name][0],
         restoration_model_path=restoration_model_path,
+        ltx_large_canvas=bool(args.ltx_large_canvas),
+        ltx_window_hop=window_hop(bool(args.experimental_ltx_less_overlap)),
+        ltx_seed=int(args.ltx_seed),
+        ltx_fast=bool(args.ltx_fast),
+        ltx_model=CLI_RESTORATION_MODELS[args.restoration_model_name][1],
+        ltx_trial=bool(args.ltx_trial),
+        ltx_auto_split_percent=args.ltx_auto_split,
         compile_basicvsrpp=bool(args.compile_basicvsrpp),
         max_clip_size=int(args.max_clip_size),
         temporal_overlap=int(args.temporal_overlap),
@@ -62,6 +82,7 @@ def _session_config_from_args(
         rtx_denoise=str(args.rtx_denoise).lower(),
         rtx_deblur=str(args.rtx_deblur).lower(),
         vr_mode=str(args.vr_mode),
+        vr_projection="auto",
         codec=codec,
         encoder_settings=encoder_settings,
         lut_path=lut_path,
@@ -87,8 +108,8 @@ def _resolve_cli_encoder_settings(
     vendor,
 ) -> dict[str, object]:
     from jasna.accelerator import AcceleratorVendor
-    from jasna.media import parse_encoder_settings, validate_encoder_settings
-    from jasna.media.encoder_quality import encoder_cq_spec, validate_encoder_cq
+    from jasna.media.encoder_settings import parse_encoder_settings, validate_encoder_settings
+    from jasna.media.encoder_settings import encoder_cq_spec, validate_encoder_cq
 
     resolved_vendor = AcceleratorVendor(str(vendor))
     settings = parse_encoder_settings(raw_settings)
@@ -138,8 +159,21 @@ def _resolve_cli_encoder_settings(
     )
 
 
+class _ShortErrorParser(argparse.ArgumentParser):
+    def error(self, message: str):
+        self.exit(2, f"{self.prog}: error: {message}\nRun '{self.prog} --help' to see all options.\n")
+
+
+@contextmanager
+def _usage_errors(parser: argparse.ArgumentParser):
+    try:
+        yield
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="jasna")
+    parser = _ShortErrorParser(prog="jasna")
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--benchmark", action="store_true", help="Run benchmarks instead of processing video")
     parser.add_argument("--input", required=False, type=str, default=None, help="Path to input video, image, or folder")
@@ -197,14 +231,51 @@ def build_parser() -> argparse.ArgumentParser:
         "--restoration-model-name",
         type=str,
         default="basicvsrpp",
-        choices=["basicvsrpp"],
-        help='Restoration model for video input (only "basicvsrpp" supported for now).',
+        choices=list(CLI_RESTORATION_MODELS),
+        help=CLI_HELP["restoration_model_name"],
     )
     restoration.add_argument(
         "--restoration-model-path",
         type=str,
-        default=str(model_weights_dir() / "lada_mosaic_restoration_model_generic_v1.2.pth"),
-        help="Path to restoration model (default: %(default)s)",
+        default=None,
+        help=CLI_HELP["restoration_model_path"],
+    )
+    restoration.add_argument(
+        "--ltx-large-canvas",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=CLI_HELP["ltx_large_canvas"],
+    )
+    restoration.add_argument(
+        "--experimental-ltx-less-overlap",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help=CLI_HELP["experimental_ltx_less_overlap"],
+    )
+    restoration.add_argument(
+        "--ltx-seed",
+        type=int,
+        default=LTX_DEFAULT_SEED,
+        help=CLI_HELP["ltx_seed"],
+    )
+    restoration.add_argument(
+        "--ltx-fast",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=CLI_HELP["ltx_fast"],
+    )
+    restoration.add_argument(
+        "--ltx-trial",
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help=CLI_HELP["ltx_trial"],
+    )
+    restoration.add_argument(
+        "--ltx-auto-split",
+        type=float,
+        default=None,
+        metavar="PERCENT",
+        help=CLI_HELP["ltx_auto_split"],
     )
     restoration.add_argument(
         "--compile-basicvsrpp",
@@ -266,45 +337,55 @@ def build_parser() -> argparse.ArgumentParser:
         "--sd15-steps",
         type=int,
         default=25,
-        help="SD15 inpaint diffusion steps (default: %(default)s)",
+        help="More steps = more detail, but slower (default: %(default)s)",
     )
     sd15.add_argument(
         "--sd15-strength",
         type=float,
         default=0.6,
-        help="SDEdit denoise strength, clamped to <= 0.7 (default: %(default)s)",
+        help="How much of the image is redrawn, up to 0.7. Higher = bigger changes (default: %(default)s)",
     )
     sd15.add_argument(
         "--sd15-freeu",
         default=True,
         action=argparse.BooleanOptionalAction,
-        help="Apply FreeU (s1=0.9, s2=0.2, b1=1.2, b2=1.4) to the SD15 UNet (default: %(default)s)",
+        help="Small extra detail boost; turn off if results look over-sharpened (default: %(default)s)",
     )
     sd15.add_argument(
         "--sd15-seed",
         type=int,
         default=0,
-        help="Base seed for SD15 inpaint (default: %(default)s)",
+        help="Starting number for the random result. Same seed = same result (default: %(default)s)",
     )
     sd15.add_argument(
         "--sd15-variants",
         type=int,
         default=1,
-        help="Generate N stochastic variants with seeds seed..seed+N-1 (default: %(default)s)",
+        help="Save N versions (name_v1 … name_vN), each with the next seed, so you can pick the best (default: %(default)s)",
     )
 
-    license_group = parser.add_argument_group("License")
+    license_group = parser.add_argument_group("Activation")
     license_group.add_argument(
-        "--license-email",
-        type=str,
-        default="",
-        help="Supporter email tied to your license key (enables unet-4x).",
+        "--machine-key",
+        action="store_true",
+        help=CLI_HELP["machine_key"],
     )
     license_group.add_argument(
-        "--license-key",
+        "--cloud-workspace",
+        action="store_true",
+        help=CLI_HELP["cloud_workspace"],
+    )
+    activation_input = license_group.add_mutually_exclusive_group()
+    activation_input.add_argument(
+        "--license-code",
         type=str,
-        default="",
-        help="License key issued for your supporter email.",
+        help=CLI_HELP["license_code"],
+    )
+    activation_input.add_argument(
+        "--activation-key",
+        type=str,
+        default=None,
+        help=CLI_HELP["activation_key"],
     )
 
     rtx = parser.add_argument_group("RTX Super Res")
@@ -361,7 +442,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--tvai-args",
         type=str,
         default="preblur=0:noise=0:details=0:halo=0:blur=0:compression=0:estimate=8:blend=0.2:device=-2:vram=1:instances=1",
-        help='Extra params for tvai_up. (default: %(default)s)',
+        help='Extra options for the Topaz model, for advanced users (default: %(default)s)',
     )
     tvai.add_argument(
         "--tvai-workers",
@@ -552,60 +633,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    parser = build_parser()
-    args = parser.parse_args()
-    codec_was_explicit = any(
-        value == "--codec" or value.startswith("--codec=")
-        for value in sys.argv[1:]
-    )
-
-    if args.benchmark:
-        from jasna.benchmark import run_benchmark_cli
-        run_benchmark_cli(args)
-        return
-
-    is_streaming = bool(args.stream)
-    if is_streaming and args.retarget_high_fps:
-        parser.error("--retarget-high-fps is only supported for offline exports")
-    if is_streaming and args.fmp4:
-        parser.error("--fmp4 is only supported for offline exports")
-    from jasna.post_export_action import (
-        PostExportVideoCommandError,
-        run_post_export_action_safely,
-        run_post_export_video_command,
-        validate_post_export_action,
-    )
-    validate_post_export_action(str(args.post_export_action), str(args.post_export_command))
-    post_export_video_command = str(args.post_export_video_command).strip()
-
-    def _run_post_export_action() -> None:
-        run_post_export_action_safely(
-            str(args.post_export_action),
-            str(args.post_export_command),
-            lambda message: print(f"Warning: {message}"),
-        )
-
-    if args.input is None and not is_streaming:
-        parser.error("--input is required when not using --benchmark or --stream")
-    if args.output is None and not is_streaming:
-        parser.error("--output is required when not using --benchmark or --stream")
-
+def _check_system(args: argparse.Namespace) -> None:
     path_ok, path_info = check_ascii_install_path()
     if not path_ok:
-        print(f"Error: Jasna must be installed in a path with ASCII characters only.")
+        print("Error: Jasna must be installed in a path with ASCII characters only.")
         print(f"Current path: {path_info}")
         sys.exit(1)
 
-    check_required_executables(disable_ffmpeg_check=bool(args.disable_ffmpeg_check))
+    check_required_executables(disable_ffmpeg_check=bool(getattr(args, "disable_ffmpeg_check", False)))
 
     gpu_ok, gpu_result = check_supported_gpu(str(args.device))
     if not gpu_ok:
-        if gpu_result == "no_cuda":
-            print("Error: No compatible GPU was found for this Jasna build.")
-        else:
-            _, major, minor = gpu_result
-            print(f"Error: Compute capability 7.5+ required (GPU: {major}.{minor}).")
+        print(f"Error: {gpu_check_error(gpu_result)}")
         sys.exit(1)
 
     driver_ok, driver_info = check_gpu_driver_version()
@@ -622,6 +661,12 @@ def main() -> None:
         if not sysmem_ok:
             print(f"Warning: CUDA Sysmem Fallback Policy: {sysmem_info}")
 
+    if install_on_hard_disk():
+        print("Warning: Jasna is installed on a hard disk drive (HDD), so it starts and loads models slowly. "
+              "Move the Jasna folder to an SSD.")
+
+
+def _configure_runtime(args: argparse.Namespace) -> None:
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
@@ -633,20 +678,305 @@ def main() -> None:
 
     from jasna._frozen import patch_frozen_torch
     patch_frozen_torch()
-    import torch
+    from jasna.engine_paths import configure_torch_compile_cache
+    configure_torch_compile_cache()
+    from jasna.accelerator import configure_rocm_process_env
+    configure_rocm_process_env()
 
-    from jasna.pipeline import Pipeline
+
+def _plan_folder(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    input_dir: Path,
+    output_dir: Path | None,
+) -> tuple[list[Path], list[Path], Path]:
+    """Validate a folder batch and return its images, videos and output folder."""
+    from jasna.media.media_files import classify_folder, folder_output_path, is_media
+
+    images, videos = classify_folder(input_dir)
+    if not images and not videos:
+        parser.error(f"No image or video files found in folder: {input_dir}")
+    if output_dir is None:
+        parser.error("--output (a folder) is required when --input is a folder")
+    if output_dir.exists() and not output_dir.is_dir():
+        parser.error(f"--output must be a folder when --input is a folder (got existing file: {output_dir})")
+    if not output_dir.exists() and is_media(output_dir):
+        parser.error(f"--output must be a folder when --input is a folder; got a media filename: {output_dir}")
+    inputs = [*images, *videos]
+    planned_outputs: dict[str, tuple[Path, Path]] = {}
+    input_keys = {_path_collision_key(path) for path in inputs}
+    for path in inputs:
+        out_path = folder_output_path(output_dir, path, args.output_pattern)
+        out_key = _path_collision_key(out_path)
+        if out_key in planned_outputs:
+            other_input, other_output = planned_outputs[out_key]
+            parser.error(
+                "--output-pattern maps multiple inputs to the same output: "
+                f"{other_input.name} and {path.name} -> {other_output}"
+            )
+        if out_key in input_keys:
+            parser.error(f"--output-pattern would overwrite an input file: {out_path}")
+        planned_outputs[out_key] = (path, out_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return images, videos, output_dir
+
+
+def _resolve_segments(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+    input_video: Path,
+    output_video: Path,
+    *,
+    codec_was_explicit: bool,
+):
+    """Parse --segments and return (codec, segments, splice_plan); smart rendering keeps the input codec."""
+    from jasna.media.probe import get_video_meta_data
+    from jasna.media.splice import (
+        SmartRenderCompatibilityError,
+        build_splice_plan,
+        canonical_codec,
+        probe_keyframes,
+        validate_smart_render,
+    )
+    from jasna.segments import parse_segments
+
+    metadata = get_video_meta_data(str(input_video))
+    try:
+        segments = parse_segments(str(args.segments).strip(), duration=metadata.duration)
+    except ValueError as exc:
+        parser.error(f"invalid --segments: {exc}")
+    input_codec = canonical_codec(metadata.codec_name)
+    if codec_was_explicit and str(args.codec).lower() != input_codec:
+        parser.error(f"with --segments output codec must match input; pass --codec {input_codec}")
+    try:
+        validate_smart_render(
+            metadata,
+            output_path=output_video,
+            codec=input_codec,
+            retarget_high_fps=bool(args.retarget_high_fps),
+        )
+        splice_plan = build_splice_plan(
+            segments,
+            probe_keyframes(input_video, metadata),
+            duration=metadata.duration,
+        )
+    except SmartRenderCompatibilityError as exc:
+        parser.error(str(exc))
+    return input_codec, segments, splice_plan
+
+
+def _run_streaming(args: argparse.Namespace, make_pipeline, input_video: Path | None) -> None:
+    from jasna.streaming import HlsStreamingServer
+    from jasna.streaming_pipeline import run_streaming
+
+    hls_server = HlsStreamingServer(
+        segment_duration=float(args.stream_segment_duration),
+        port=int(args.stream_port),
+    )
+    print(f"HLS stream: {hls_server.start()}")
+    print(f"Browser:    http://localhost:{args.stream_port}/")
+    if not args.no_browser:
+        import webbrowser
+        webbrowser.open(f"http://localhost:{args.stream_port}/")
+    try:
+        if input_video is not None:
+            run_streaming(make_pipeline(input_video, input_video), hls_server)
+            return
+        while True:
+            video_path = hls_server.wait_for_video()
+            try:
+                run_streaming(make_pipeline(video_path, video_path), hls_server)
+            except UnsupportedVideoError as e:
+                print(f"Error: {e}")
+            hls_server.unload_video()
+    except KeyboardInterrupt:
+        print("Streaming stopped")
+    finally:
+        hls_server.stop()
+
+
+def _run_videos(
+    args: argparse.Namespace,
+    make_pipeline,
+    videos: list[Path],
+    output_path_for,
+    *,
+    in_folder: bool,
+    first_index: int,
+    total: int,
+) -> bool:
+    """Process videos one by one; returns False when a per-video command failed in a folder batch."""
+    from jasna.post_export_action import PostExportVideoCommandError, run_post_export_video_command
+
+    post_export_video_command = str(args.post_export_video_command).strip()
+    all_commands_ok = True
+    for i, vid in enumerate(videos, start=first_index):
+        out_path = output_path_for(vid)
+        if in_folder:
+            print(f"[{i}/{total}] Processing {vid.name} -> {out_path.name}")
+        try:
+            make_pipeline(vid, out_path).run()
+        except UnsupportedVideoError as e:
+            print(f"Error processing {vid.name}: {e}")
+            if not in_folder:
+                sys.exit(1)
+            continue
+        if not post_export_video_command:
+            continue
+        print(f"Running post-export command for {out_path.name}")
+        try:
+            run_post_export_video_command(post_export_video_command, vid, out_path, lambda: False)
+        except PostExportVideoCommandError as e:
+            print(f"Error post-processing {vid.name}: {e}")
+            if not in_folder:
+                sys.exit(1)
+            all_commands_ok = False
+    return all_commands_ok
+
+
+def _ensure_ltx_model(config: SessionConfig, segments) -> None:
+    """Offer to download the selected LTX model when the job needs it and it is missing.
+    Without a terminal to ask in, fail with what to download instead of waiting."""
+    from jasna.ltx.model_files import LTX_TRIAL_NOTICE, download_files, download_size_text, missing_downloads
+
+    uses_ltx = config.restoration_model_name == "ltx" or any(
+        segment.restoration is not None and segment.restoration.model == "ltx" for segment in segments or ()
+    )
+    if not uses_ltx:
+        return
+    if config.ltx_trial:
+        print(LTX_TRIAL_NOTICE)
+        return
+    directory = config.restoration_model_path if config.restoration_model_name == "ltx" else default_restoration_model_path("ltx")
+    missing = missing_downloads(directory, config.ltx_model, fast=config.ltx_fast)
+    if not missing:
+        return
+    from jasna.license_api import require_protection
+
+    require_protection()
+    names = ", ".join(file.name for file in missing)
+    size = download_size_text(missing)
+    if not sys.stdin.isatty():
+        raise FileNotFoundError(f"LTX model files missing in {directory}: {names}. Run jasna in a terminal to download them ({size}).")
+    answer = input(f"LTX {config.ltx_model} model not found in {directory}:\n  {names}\nDownload it ({size})? [y/N]: ")
+    if answer.strip().lower() not in ("y", "yes"):
+        raise FileNotFoundError(f"LTX model files missing in {directory}: {names}")
+    from tqdm import tqdm
+
+    from jasna.gui.locales import get_locale
+
+    with tqdm(total=sum(file.size_bytes for file in missing), unit="B", unit_scale=True, desc="LTX download") as bar:
+        download_files(directory, missing, lambda done, total: bar.update(done - bar.n), mirror_first=get_locale().current_language == "zh")
+
+
+LTX_ONLY_ARG_DESTS = (
+    "ltx_fast", "ltx_large_canvas", "experimental_ltx_less_overlap", "ltx_seed", "ltx_trial", "ltx_auto_split"
+)
+BASICVSRPP_ONLY_ARG_DESTS = ("compile_basicvsrpp",)
+
+
+def _reject_options_of_other_restoration_backend(
+    parser: argparse.ArgumentParser, args: argparse.Namespace, restoration_backend: str
+) -> None:
+    if restoration_backend == "ltx":
+        foreign_dests, needed_models = BASICVSRPP_ONLY_ARG_DESTS, "basicvsrpp"
+    else:
+        foreign_dests, needed_models = LTX_ONLY_ARG_DESTS, "ltx, ltx-4step, ltx-8step or ltx-undistilled"
+    for dest in foreign_dests:
+        if getattr(args, dest) != parser.get_default(dest):
+            option = "--" + dest.replace("_", "-")
+            parser.error(f"{option} needs --restoration-model-name {needed_models}")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.cloud_workspace and not args.machine_key and args.license_code is None:
+        parser.error("--cloud-workspace needs --machine-key or --license-code")
+    if args.machine_key and (args.activation_key is not None or args.license_code is not None):
+        parser.error("--machine-key cannot be combined with --activation-key or --license-code")
+    if args.machine_key or args.activation_key is not None or args.license_code is not None:
+        from jasna.license_api import ProtectionUnavailableError, require_protection
+
+        try:
+            require_protection()
+        except ProtectionUnavailableError as exc:
+            parser.exit(1, f"Activation error: {exc}\n")
+    if args.machine_key:
+        from jasna.protection import ProtectionError, machine
+        try:
+            print(machine.machine_key(cloud_workspace=args.cloud_workspace))
+        except (ProtectionError, OSError) as exc:
+            parser.exit(1, f"Activation error: {exc}\n")
+        return
+    if args.activation_key is not None or args.license_code is not None:
+        from jasna.protection import ProtectionError, activation, license_store, machine
+        try:
+            if args.license_code is not None:
+                from jasna.gui.locales import get_locale
+
+                activation.activate_license_code(
+                    args.license_code, machine.machine_key(cloud_workspace=args.cloud_workspace),
+                    prefer_hong_kong=get_locale().current_language == "zh",
+                )
+            else:
+                license_store.set_license(args.activation_key.strip())
+        except (ProtectionError, OSError) as exc:
+            parser.exit(1, f"Activation error: {exc}\n")
+        print("Jasna activated. The Activation key is saved on this machine.")
+        if args.input is None and not args.stream and not args.benchmark:
+            return
+    codec_was_explicit = any(
+        value == "--codec" or value.startswith("--codec=")
+        for value in sys.argv[1:]
+    )
+
+    if args.benchmark:
+        from jasna.benchmark import run_benchmark_cli
+        run_benchmark_cli(args)
+        return
+
+    is_streaming = bool(args.stream)
+    if is_streaming and args.retarget_high_fps:
+        parser.error("--retarget-high-fps is only supported for offline exports")
+    if is_streaming and args.fmp4:
+        parser.error("--fmp4 is only supported for offline exports")
+    from jasna.post_export_action import run_post_export_action_safely, validate_post_export_action
+    with _usage_errors(parser):
+        validate_post_export_action(str(args.post_export_action), str(args.post_export_command))
+
+    def _run_post_export_action() -> None:
+        run_post_export_action_safely(
+            str(args.post_export_action),
+            str(args.post_export_command),
+            lambda message: print(f"Warning: {message}"),
+        )
+
+    if args.input is None and not is_streaming:
+        parser.error("--input is required when not using --benchmark or --stream")
+    if args.output is None and not is_streaming:
+        parser.error("--output is required when not using --benchmark or --stream")
 
     input_video = Path(args.input) if args.input else None
     if input_video is not None and not input_video.exists():
-        raise FileNotFoundError(str(input_video))
-
+        parser.error(f"input not found: {input_video}")
     output_video = Path(args.output) if args.output else (input_video.with_name(input_video.stem + "_out.mp4") if input_video else None)
+    lut_arg = str(args.lut).strip()
+    if lut_arg and not Path(lut_arg).exists():
+        parser.error(f"--lut file not found: {lut_arg}")
 
-    from jasna.media.image_io import is_image_path
-    input_is_image = input_video is not None and is_image_path(input_video)
+    from jasna.media.media_files import folder_output_path, is_image
+    input_is_image = input_video is not None and is_image(input_video)
     input_is_dir = input_video is not None and input_video.is_dir()
     segments_spec = str(args.segments).strip()
+    auto_split = args.ltx_auto_split is not None
+    if auto_split:
+        if segments_spec:
+            parser.error("--segments cannot be combined with --ltx-auto-split")
+        if not 0 < args.ltx_auto_split <= 100:
+            parser.error("--ltx-auto-split must be a percentage above 0 and at most 100")
+        if args.fmp4:
+            parser.error("--fmp4 cannot be combined with --ltx-auto-split")
     if segments_spec:
         if is_streaming:
             parser.error("--segments cannot be combined with --stream")
@@ -656,43 +986,31 @@ def main() -> None:
             parser.error("--segments requires a single video input, not a folder")
         if args.fmp4:
             parser.error("--fmp4 cannot be combined with --segments")
+    if is_streaming and input_is_dir:
+        parser.error("--stream does not support folder input")
+    if is_streaming and input_is_image:
+        parser.error("Image input does not support --stream")
 
+    restoration_backend = CLI_RESTORATION_MODELS[args.restoration_model_name][0]
+    if not input_is_image:
+        if restoration_backend == "ltx":
+            model_option = f"--restoration-model-name {args.restoration_model_name}"
+            if is_streaming:
+                parser.error(f"{model_option} does not support --stream")
+            if args.secondary_restoration != "none":
+                parser.error(f"{model_option} does not support --secondary-restoration")
+            if args.denoise != "none":
+                parser.error(f"{model_option} does not support --denoise")
+        _reject_options_of_other_restoration_backend(parser, args, restoration_backend)
+
+    _check_system(args)
+    _configure_runtime(args)
+
+    folder_images: list[Path] = []
     folder_videos: list[Path] = []
     folder_output_dir: Path | None = None
     if input_is_dir:
-        if is_streaming:
-            parser.error("--stream does not support folder input")
-        from jasna.media.media_files import classify_folder, folder_output_path, is_media
-        folder_images, folder_videos = classify_folder(input_video)
-        folder_total = len(folder_images) + len(folder_videos)
-        if not folder_images and not folder_videos:
-            parser.error(f"No image or video files found in folder: {input_video}")
-        if output_video is None:
-            parser.error("--output (a folder) is required when --input is a folder")
-        folder_output_dir = output_video
-        if folder_output_dir.exists() and not folder_output_dir.is_dir():
-            parser.error(f"--output must be a folder when --input is a folder (got existing file: {folder_output_dir})")
-        if not folder_output_dir.exists() and is_media(folder_output_dir):
-            parser.error(
-                f"--output must be a folder when --input is a folder; got a media filename: {folder_output_dir}"
-            )
-        folder_inputs = [*folder_images, *folder_videos]
-        planned_outputs: dict[str, tuple[Path, Path]] = {}
-        input_keys = {_path_collision_key(path) for path in folder_inputs}
-        for path in folder_inputs:
-            out_path = folder_output_path(folder_output_dir, path, args.output_pattern)
-            out_key = _path_collision_key(out_path)
-            if out_key in planned_outputs:
-                other_input, other_output = planned_outputs[out_key]
-                parser.error(
-                    "--output-pattern maps multiple inputs to the same output: "
-                    f"{other_input.name} and {path.name} -> {other_output}"
-                )
-            if out_key in input_keys:
-                parser.error(f"--output-pattern would overwrite an input file: {out_path}")
-            planned_outputs[out_key] = (path, out_path)
-        folder_output_dir.mkdir(parents=True, exist_ok=True)
-        # Images first, then videos.
+        folder_images, folder_videos, folder_output_dir = _plan_folder(parser, args, input_video, output_video)
         if folder_images:
             from jasna.image_restore import run_image_restoration_folder
             run_image_restoration_folder(
@@ -700,15 +1018,13 @@ def main() -> None:
                 folder_images,
                 folder_output_dir,
                 output_pattern=args.output_pattern,
-                progress_total=folder_total,
+                progress_total=len(folder_images) + len(folder_videos),
             )
         if not folder_videos:
             _run_post_export_action()
             return
 
     if input_is_image:
-        if is_streaming:
-            parser.error("Image input does not support --stream")
         from jasna.image_restore import run_image_restoration
         run_image_restoration(args)
         _run_post_export_action()
@@ -717,251 +1033,100 @@ def main() -> None:
     from jasna.mosaic.detection_registry import (
         coerce_detection_model_name,
         discover_available_detection_models,
-        recommended_score_threshold,
-        require_detection_model_weights,
+        resolve_detection_model,
     )
 
-    detection_model_name = coerce_detection_model_name(str(args.detection_model))
-    has_explicit_path = bool(str(args.detection_model_path).strip())
-    if not has_explicit_path:
-        available = discover_available_detection_models()
-        if available and detection_model_name not in available:
-            print(f"Warning: detection model '{detection_model_name}' not found in model_weights/. Available: {', '.join(available)}")
-    detection_model_path = (
-        Path(str(args.detection_model_path))
-        if has_explicit_path
-        else require_detection_model_weights(detection_model_name)
-    )
-    if not detection_model_path.exists():
-        raise FileNotFoundError(str(detection_model_path))
+    with _usage_errors(parser):
+        if not str(args.detection_model_path).strip():
+            available = discover_available_detection_models()
+            requested = coerce_detection_model_name(str(args.detection_model))
+            if available and requested not in available:
+                print(f"Warning: detection model '{requested}' not found in model_weights/. Available: {', '.join(available)}")
+        detection_model_name, detection_model_path, detection_score_threshold = resolve_detection_model(
+            str(args.detection_model), str(args.detection_model_path), args.detection_score_threshold
+        )
 
-    restoration_model_name = str(args.restoration_model_name)
-    restoration_model_path = Path(args.restoration_model_path)
-    if not restoration_model_path.exists():
-        raise FileNotFoundError(str(restoration_model_path))
+    restoration_model_path = Path(
+        args.restoration_model_path or default_restoration_model_path(restoration_backend)
+    )
+    if restoration_backend != "ltx" and not restoration_model_path.exists():
+        parser.error(f"restoration model not found: {restoration_model_path}")
 
     segments = None
     splice_plan = None
     codec = str(args.codec).lower()
     if segments_spec:
-        from jasna.media import get_video_meta_data
-        from jasna.media.splice import (
-            SmartRenderCompatibilityError,
-            build_splice_plan,
-            probe_keyframes,
-            validate_smart_render,
-        )
-        from jasna.segments import parse_segments
-
-        metadata = get_video_meta_data(str(input_video))
-        try:
-            segments = parse_segments(segments_spec, duration=metadata.duration)
-        except ValueError as exc:
-            parser.error(f"invalid --segments: {exc}")
-        input_codec = {
-            "avc": "h264",
-            "h265": "hevc",
-            "av01": "av1",
-        }.get(metadata.codec_name.lower(), metadata.codec_name.lower())
-        if codec_was_explicit and codec != input_codec:
-            parser.error(
-                f"with --segments output codec must match input; pass --codec {input_codec}"
-            )
-        codec = input_codec
-        try:
-            validate_smart_render(
-                metadata,
-                output_path=output_video,
-                codec=codec,
-                retarget_high_fps=bool(args.retarget_high_fps),
-            )
-            splice_plan = build_splice_plan(
-                segments,
-                probe_keyframes(input_video, metadata),
-                duration=metadata.duration,
-            )
-        except SmartRenderCompatibilityError as exc:
-            parser.error(str(exc))
-    if codec not in {"hevc", "h264", "av1"}:
-        raise ValueError(f"Unsupported codec: {codec} (supported: hevc, h264, av1)")
-
-    from jasna.accelerator import vendor_for_device
-
-    encoder_settings = _resolve_cli_encoder_settings(
-        str(args.encoder_settings),
-        cq=args.cq,
-        codec=codec,
-        vendor=vendor_for_device(str(args.device)),
-    )
-
-    batch_size = int(args.batch_size)
-    if batch_size <= 0:
-        raise ValueError("--batch-size must be > 0")
-
-    max_clip_size = int(args.max_clip_size)
-    if max_clip_size <= 0:
-        raise ValueError("--max-clip-size must be > 0")
-
-    temporal_overlap = int(args.temporal_overlap)
-    if temporal_overlap < 0:
-        raise ValueError("--temporal-overlap must be >= 0")
-    if temporal_overlap >= max_clip_size:
-        raise ValueError("--temporal-overlap must be < --max-clip-size")
-    if temporal_overlap > 0 and (2 * temporal_overlap) >= max_clip_size:
-        raise ValueError("--temporal-overlap must satisfy 2*--temporal-overlap < --max-clip-size")
-
-    max_detection_gap = int(args.max_detection_gap)
-    if max_detection_gap < 0:
-        raise ValueError("--max-detection-gap must be >= 0")
-    if max_detection_gap >= max_clip_size:
-        raise ValueError("--max-detection-gap must be < --max-clip-size")
-
-    min_detection_duration = int(args.min_detection_duration)
-    if min_detection_duration < 0:
-        raise ValueError("--min-detection-duration must be >= 0")
-    if min_detection_duration >= max_clip_size:
-        raise ValueError("--min-detection-duration must be < --max-clip-size")
-    if not (0.0 <= float(args.sharpen) <= 1.0):
-        raise ValueError("--sharpen must be in [0, 1]")
-
-    device = torch.device(str(args.device))
-    from jasna.accelerator import device_context
-
-    if args.detection_score_threshold is None:
-        args.detection_score_threshold = recommended_score_threshold(detection_model_name)
-    detection_score_threshold = float(args.detection_score_threshold)
-    if not (0.0 <= detection_score_threshold <= 1.0):
-        raise ValueError("--detection-score-threshold must be in [0, 1]")
-
-    if restoration_model_name != "basicvsrpp":
-        raise ValueError(f"Unsupported restoration model: {restoration_model_name}")
-
-    if args.license_email and args.license_key:
-        from jasna.protection import license_store
-        license_store.set_license(args.license_email, args.license_key)
-
-    lut_arg = str(args.lut).strip()
-    if lut_arg and not Path(lut_arg).exists():
-        raise FileNotFoundError(lut_arg)
-
-    config = _session_config_from_args(
-        args,
-        codec=codec,
-        encoder_settings=encoder_settings,
-        detection_model_name=detection_model_name,
-        detection_model_path=detection_model_path,
-        restoration_model_path=restoration_model_path,
-        lut_path=lut_arg or None,
-    )
-
-    from jasna.session_factory import build_pipeline, build_restoration_session
-
-    with device_context(device):
-        session = build_restoration_session(
-            config,
-            disable_basicvsrpp_tensorrt=False,
-            log_callback=None,
+        codec, segments, splice_plan = _resolve_segments(
+            parser, args, input_video, output_video, codec_was_explicit=codec_was_explicit
         )
 
-        def _make_pipeline(vid_input: Path, out_path: Path) -> Pipeline:
-            return build_pipeline(
+    from jasna.accelerator import device_context, vendor_for_device
+
+    with _usage_errors(parser):
+        encoder_settings = _resolve_cli_encoder_settings(
+            str(args.encoder_settings),
+            cq=args.cq,
+            codec=codec,
+            vendor=vendor_for_device(str(args.device)),
+        )
+        config = _session_config_from_args(
+            args,
+            codec=codec,
+            encoder_settings=encoder_settings,
+            detection_model_name=detection_model_name,
+            detection_model_path=detection_model_path,
+            detection_score_threshold=detection_score_threshold,
+            restoration_model_path=restoration_model_path,
+            lut_path=lut_arg or None,
+        )
+
+    _ensure_ltx_model(config, segments)
+
+    from jasna.session_factory import build_pipeline, build_restoration_session, ltx_auto_split
+
+    with device_context(config.device):
+        session = build_restoration_session(config, log_callback=None)
+
+        def make_pipeline(vid_input: Path, out_path: Path):
+            split = None if segments else ltx_auto_split(config, session, vid_input, out_path, progress_callback=None)
+            if split is None:
+                return build_pipeline(config, session, vid_input, out_path, segments=segments, splice_plan=splice_plan)
+            split_config = replace(
                 config,
-                session,
-                vid_input,
-                out_path,
-                segments=segments,
-                splice_plan=splice_plan,
+                codec=split.codec,
+                encoder_settings=_resolve_cli_encoder_settings(
+                    str(args.encoder_settings), cq=args.cq, codec=split.codec, vendor=vendor_for_device(str(args.device))
+                ),
+            )
+            return build_pipeline(
+                split_config, session, vid_input, out_path, segments=split.segments, splice_plan=split.splice_plan
             )
 
-        video_inputs = folder_videos if input_is_dir else ([input_video] if input_video is not None else [])
-
-        def _video_output_path(vid: Path) -> Path:
+        def output_path_for(vid: Path) -> Path:
             if input_is_dir:
                 return folder_output_path(folder_output_dir, vid, args.output_pattern)
             return output_video or vid.with_name(vid.stem + "_out.mp4")
 
-        pipeline: Pipeline | None = None
-        post_export_video_failed = False
         try:
-            if is_streaming and input_video is None:
-                from jasna.streaming import HlsStreamingServer
-                pipeline = _make_pipeline(Path("__streaming__"), Path("__streaming___out__"))
-                hls_server = HlsStreamingServer(
-                    segment_duration=float(args.stream_segment_duration),
-                    port=int(args.stream_port),
-                )
-                hls_server.start()
-                if not args.no_browser:
-                    import webbrowser
-                    webbrowser.open(f"http://localhost:{args.stream_port}/")
-                try:
-                    while True:
-                        video_path = hls_server.wait_for_video()
-                        pipeline.input_video = video_path
-                        try:
-                            pipeline.run_streaming(
-                                hls_server=hls_server,
-                                segment_duration=float(args.stream_segment_duration),
-                            )
-                        except UnsupportedColorspaceError as e:
-                            print(f"Error: {e}")
-                        hls_server.unload_video()
-                except KeyboardInterrupt:
-                    pass
-                finally:
-                    hls_server.stop()
-            elif is_streaming:
-                pipeline = _make_pipeline(input_video, _video_output_path(input_video))
-                if not args.no_browser:
-                    import webbrowser
-                    webbrowser.open(f"http://localhost:{args.stream_port}/")
-                pipeline.run_streaming(
-                    port=int(args.stream_port),
-                    segment_duration=float(args.stream_segment_duration),
-                )
-            else:
-                video_start = len(folder_images) + 1 if input_is_dir else 1
-                video_total = len(folder_images) + len(video_inputs) if input_is_dir else len(video_inputs)
-                for i, vid in enumerate(video_inputs, start=video_start):
-                    out_path = _video_output_path(vid)
-                    if input_is_dir:
-                        print(f"[{i}/{video_total}] Processing {vid.name} -> {out_path.name}")
-                    pipeline = _make_pipeline(vid, out_path)
-                    export_succeeded = False
-                    try:
-                        pipeline.run()
-                        export_succeeded = True
-                    except UnsupportedColorspaceError as e:
-                        # In a folder batch, skip the bad file and keep going.
-                        print(f"Error processing {vid.name}: {e}")
-                        if not input_is_dir:
-                            sys.exit(1)
-                    finally:
-                        pipeline.close()
-                        pipeline = None
-                    if export_succeeded and post_export_video_command:
-                        print(f"Running post-export command for {out_path.name}")
-                        try:
-                            run_post_export_video_command(
-                                post_export_video_command,
-                                vid,
-                                out_path,
-                                lambda: False,
-                            )
-                        except PostExportVideoCommandError as e:
-                            print(f"Error post-processing {vid.name}: {e}")
-                            if not input_is_dir:
-                                sys.exit(1)
-                            post_export_video_failed = True
-                _run_post_export_action()
-                if post_export_video_failed:
-                    sys.exit(1)
-        except UnsupportedColorspaceError as e:
+            if is_streaming:
+                _run_streaming(args, make_pipeline, input_video)
+                return
+            all_commands_ok = _run_videos(
+                args,
+                make_pipeline,
+                folder_videos if input_is_dir else [input_video],
+                output_path_for,
+                in_folder=input_is_dir,
+                first_index=len(folder_images) + 1,
+                total=len(folder_images) + len(folder_videos) if input_is_dir else 1,
+            )
+            _run_post_export_action()
+            if not all_commands_ok:
+                sys.exit(1)
+        except UnsupportedVideoError as e:
             print(f"Error: {e}")
             sys.exit(1)
         finally:
-            if pipeline is not None:
-                pipeline.close()
             session.close()
 
 

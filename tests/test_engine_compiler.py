@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 import subprocess
+import sys
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -42,7 +45,7 @@ def test_request_defaults() -> None:
 
 
 def test_ensure_no_subprocess_when_basicvsrpp_exists(monkeypatch) -> None:
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: True)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", lambda *_a, **_kw: True)
     req = EngineCompilationRequest(device="cuda:0", fp16=True, basicvsrpp=True, basicvsrpp_model_path="x")
     assert ensure_engines_compiled(req).use_basicvsrpp_tensorrt is True
 
@@ -54,7 +57,7 @@ def test_ensure_no_subprocess_when_not_requested() -> None:
 
 
 def test_ensure_all_exist_no_subprocess(monkeypatch) -> None:
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: True)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", lambda *_a, **_kw: True)
     monkeypatch.setattr("jasna.engine_compiler._detection_engine_exists", lambda *_a, **_kw: True)
     monkeypatch.setattr("jasna.engine_compiler._unet4x_engine_exists", lambda *_a, **_kw: True)
     req = EngineCompilationRequest(
@@ -78,7 +81,7 @@ def test_ensure_spawns_subprocess_on_missing(monkeypatch) -> None:
     def engines_exist_after_compile(*_a, **_kw):
         call_count[0] += 1
         return call_count[0] > 1
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", engines_exist_after_compile)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", engines_exist_after_compile)
 
     log_messages = []
     req = EngineCompilationRequest(device="cuda:0", fp16=True, basicvsrpp=True, basicvsrpp_model_path="model.pth")
@@ -92,7 +95,7 @@ def test_ensure_spawns_subprocess_on_missing(monkeypatch) -> None:
 
 
 def test_ensure_subprocess_failure_raises(monkeypatch) -> None:
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", lambda *_a, **_kw: False)
     monkeypatch.setattr("jasna.engine_compiler.subprocess.Popen", lambda *a, **kw: _mock_proc(["error\n"], returncode=1))
 
     req = EngineCompilationRequest(device="cuda:0", fp16=True, basicvsrpp=True, basicvsrpp_model_path="x")
@@ -101,10 +104,9 @@ def test_ensure_subprocess_failure_raises(monkeypatch) -> None:
 
 
 def test_ensure_frozen_exe_uses_compile_engines_flag(monkeypatch) -> None:
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", lambda *_a, **_kw: False)
     monkeypatch.setattr("jasna.engine_compiler.is_frozen", lambda: True)
-    fake_sys = type("FakeSys", (), {"executable": "C:/app/jasna.exe"})()
-    monkeypatch.setattr("jasna.engine_compiler.sys", fake_sys)
+    monkeypatch.setattr("jasna.engine_compiler.get_application_executable", lambda: "C:/app/jasna.exe")
 
     popen_calls = []
     proc = _mock_proc([])
@@ -119,12 +121,74 @@ def test_ensure_frozen_exe_uses_compile_engines_flag(monkeypatch) -> None:
     assert "-m" not in popen_calls[0]
 
 
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_frozen_engine_compiler_removes_parent_tcl_paths_before_native_startup(monkeypatch, platform) -> None:
+    import torch
+    import jasna.engine_compiler as compiler
+
+    pytest.importorskip("jasna.protection.runtime")
+    monkeypatch.setattr(compiler, "is_frozen", lambda: True)
+    monkeypatch.setattr(compiler.sys, "platform", platform)
+    monkeypatch.setattr(compiler, "get_application_executable", lambda: "/app/jasna.bin")
+    monkeypatch.setattr(compiler, "subprocess_no_window_kwargs", lambda: {})
+    monkeypatch.setattr(compiler, "_missing_engines", lambda *_args, **_kwargs: compiler._MissingEngines(False, True, False))
+    for name in ("TCL_LIBRARY", "TK_LIBRARY", "TCLLIBPATH"):
+        monkeypatch.setenv(name, "/parent/runtime/tcl")
+    monkeypatch.setenv("JASNA_ENGINE_ENV_SENTINEL", "preserved")
+    calls = []
+    monkeypatch.setattr(compiler.subprocess, "Popen", lambda command, **kwargs: (calls.append(kwargs), _mock_proc([]))[1])
+
+    ensure_engines_compiled(EngineCompilationRequest(device="cpu", fp16=False, detection=True))
+
+    environment = calls[0]["env"]
+    assert all(name not in environment for name in ("TCL_LIBRARY", "TK_LIBRARY", "TCLLIBPATH"))
+    assert environment["JASNA_ENGINE_ENV_SENTINEL"] == "preserved"
+
+
+def test_frozen_linux_engine_compiler_uses_the_running_binary(monkeypatch) -> None:
+    import torch  # noqa: F401  Initialize before mocking subprocess.
+    import jasna.engine_compiler as compiler
+    from jasna import os_utils
+
+    monkeypatch.setattr(compiler, "is_frozen", lambda: True)
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: True)
+    monkeypatch.setattr(os_utils.sys, "platform", "linux")
+    monkeypatch.setattr(compiler.sys, "executable", "/relocated/app/python")
+    monkeypatch.setattr(os_utils.os, "readlink", lambda path: "/relocated/app/jasna.bin")
+    monkeypatch.setattr(compiler, "_missing_engines", lambda *_args, **_kwargs: compiler._MissingEngines(False, True, False))
+    commands = []
+    monkeypatch.setattr(compiler.subprocess, "Popen", lambda command, **kwargs: (commands.append(command), _mock_proc([]))[1])
+
+    ensure_engines_compiled(EngineCompilationRequest(device="cpu", fp16=False, detection=True))
+
+    assert commands[0][:2] == ["/relocated/app/jasna.bin", "--compile-engines"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows native module path API")
+def test_frozen_windows_engine_compiler_uses_running_binary_when_python_placeholder_is_missing(monkeypatch) -> None:
+    import torch  # noqa: F401  Initialize before mocking subprocess.
+    import jasna.engine_compiler as compiler
+    from jasna import os_utils
+
+    expected = sys.executable
+    monkeypatch.setattr(compiler, "is_frozen", lambda: True)
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: True)
+    monkeypatch.setattr(compiler.sys, "executable", "C:/relocated/app/python.exe")
+    monkeypatch.setattr(compiler, "_missing_engines", lambda *_args, **_kwargs: compiler._MissingEngines(False, True, False))
+    commands = []
+    monkeypatch.setattr(compiler.subprocess, "Popen", lambda command, **kwargs: (commands.append(command), _mock_proc([]))[1])
+
+    ensure_engines_compiled(EngineCompilationRequest(device="cpu", fp16=False, detection=True))
+
+    assert commands[0][0].casefold() == expected.casefold()
+    assert commands[0][1] == "--compile-engines"
+
+
 def test_ensure_create_no_window_on_windows(monkeypatch) -> None:
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
-    monkeypatch.setattr("jasna.engine_compiler.os.name", "nt")
-    # CREATE_NO_WINDOW is a Windows-only subprocess attribute; inject it so the nt branch
-    # is exercisable on a Linux test host.
-    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", lambda *_a, **_kw: False)
+    monkeypatch.setattr(
+        "jasna.engine_compiler.subprocess_no_window_kwargs", lambda: {"creationflags": 0x08000000}
+    )
 
     popen_kwargs = {}
     monkeypatch.setattr(
@@ -134,14 +198,14 @@ def test_ensure_create_no_window_on_windows(monkeypatch) -> None:
 
     req = EngineCompilationRequest(device="cuda:0", fp16=True, basicvsrpp=True, basicvsrpp_model_path="x")
     ensure_engines_compiled(req)
-    assert popen_kwargs.get("creationflags") == subprocess.CREATE_NO_WINDOW
+    assert popen_kwargs.get("creationflags") == 0x08000000
 
 
 def test_ensure_does_not_print_when_log_callback_given(monkeypatch) -> None:
     # The frozen GUI drops its console (FreeConsole), so stdout is invalid — an
     # unconditional print() would raise WinError 6. With a log_callback (GUI path), the
     # progress message must go to the callback and never to print().
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", lambda *_a, **_kw: False)
     monkeypatch.setattr("jasna.engine_compiler.subprocess.Popen", lambda *a, **kw: _mock_proc(["Done.\n"]))
     printed: list = []
     monkeypatch.setattr("jasna.engine_compiler.print", lambda *a, **kw: printed.append(a), raising=False)
@@ -156,7 +220,7 @@ def test_ensure_does_not_print_when_log_callback_given(monkeypatch) -> None:
 
 def test_ensure_popen_stdin_is_devnull(monkeypatch) -> None:
     # The detached GUI's stdin handle is invalid; the child must not inherit it.
-    monkeypatch.setattr("jasna.engine_compiler._basicvsrpp_engines_exist", lambda *_a, **_kw: False)
+    monkeypatch.setattr("jasna.engine_compiler.all_basicvsrpp_sub_engines_exist", lambda *_a, **_kw: False)
     popen_kwargs: dict = {}
     monkeypatch.setattr(
         "jasna.engine_compiler.subprocess.Popen",
@@ -174,7 +238,11 @@ def test_subprocess_compile_patches_frozen_torch(monkeypatch) -> None:
     # compiles nothing, so this only exercises the early import-torch + patch path.
     called = []
     monkeypatch.setattr("jasna._frozen.patch_frozen_torch", lambda: called.append(True))
-    _subprocess_compile(EngineCompilationRequest(device="cpu", fp16=False))
+    try:
+        with warnings.catch_warnings():
+            _subprocess_compile(EngineCompilationRequest(device="cpu", fp16=False))
+    finally:
+        logging.disable(logging.NOTSET)
     assert called, "patch_frozen_torch must run before any torch_tensorrt/_inductor import"
 
 

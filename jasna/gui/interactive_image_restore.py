@@ -9,9 +9,12 @@ from pathlib import Path
 import customtkinter as ctk
 from PIL import Image
 
+from jasna.gui.components import grab_modal
 from jasna.gui import scaling
 from jasna.gui.locales import t
-from jasna.gui.models import AppSettings
+from jasna.gui.models import DEFAULT_OUTPUT_PATTERN, AppSettings
+from jasna.gui.queues import MainThreadCalls
+from jasna.media.media_files import folder_output_path, unique_path
 from jasna.gui.theme import Colors, Fonts, Sizing
 
 logger = logging.getLogger(__name__)
@@ -19,22 +22,7 @@ logger = logging.getLogger(__name__)
 
 def interactive_output_path(input_path: Path, output_folder: str, output_pattern: str) -> Path:
     input_path = Path(input_path)
-    output_dir = Path(output_folder) if output_folder else input_path.parent
-    pattern = output_pattern or "{original}_restored.mp4"
-    output_name = pattern.replace("{original}", input_path.stem)
-    candidate = (output_dir / output_name).with_suffix(input_path.suffix)
-    return _unique_path(candidate)
-
-
-def _unique_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-
-    for counter in range(1, 10000):
-        candidate = path.with_name(f"{path.stem} ({counter}){path.suffix}")
-        if not candidate.exists():
-            return candidate
-    raise RuntimeError(f"Could not find unique filename after 9999 attempts: {path}")
+    return unique_path(folder_output_path(output_folder or input_path.parent, input_path, output_pattern or DEFAULT_OUTPUT_PATTERN))
 
 
 def _dialog_geometry_for_image(image_size: tuple[int, int], screen_size: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -66,6 +54,7 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         on_log: callable | None = None,
     ):
         super().__init__(master)
+        self._main_thread = MainThreadCalls(self, 50)
         self._paths = [Path(p) for p in image_paths]
         self._settings = settings
         self._output_folder = output_folder
@@ -74,7 +63,12 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
 
         self._index = 0
         self._seed = int(settings.image_restore_seed)
-        self._view = t("interactive_view_restored")
+        self._view = "restored"
+        self._view_by_label = {
+            t("interactive_view_restored"): "restored",
+            t("interactive_view_mask"): "mask",
+            t("interactive_view_raw"): "raw",
+        }
         self._token = 0
         self._closed = False
         self._current_result = None
@@ -98,10 +92,7 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
 
         self._build_ui()
         self._center(master)
-        self.wait_visibility()
-        self.grab_set()
-        self.lift()
-        self.focus_force()
+        grab_modal(self)
 
         self._worker.start()
         self._request_render()
@@ -208,8 +199,8 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
 
         self._view_selector = ctk.CTkSegmentedButton(
             controls,
-            values=[t("interactive_view_restored"), t("interactive_view_mask"), t("interactive_view_raw")],
-            command=self._set_view,
+            values=list(self._view_by_label),
+            command=lambda label: self._set_view(self._view_by_label[label]),
             selected_color=Colors.PRIMARY,
             selected_hover_color=Colors.PRIMARY_HOVER,
             unselected_color=Colors.BG_CARD,
@@ -217,7 +208,7 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
             text_color=Colors.TEXT_PRIMARY,
         )
         self._view_selector.pack(side="left")
-        self._view_selector.set(self._view)
+        self._view_selector.set(t("interactive_view_restored"))
 
         self._save = ctk.CTkButton(
             controls,
@@ -315,9 +306,9 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
                         prepared_by_path[path] = prepared
                     result = self._render(prepared, restorer, seed)
                     mask = self._mask(prepared)
-                    self._after(lambda: self._finish_render(token, index, seed, prepared.img_chw_u8, mask, result))
+                    self._main_thread.post(lambda: self._finish_render(token, index, seed, prepared.img_chw_u8, mask, result))
                 except Exception as exc:
-                    self._after(lambda e=exc, tk=token: self._fail_render(tk, e))
+                    self._main_thread.post(lambda e=exc, tk=token: self._fail_render(tk, e))
         finally:
             if detector is not None:
                 detector.close()
@@ -334,42 +325,9 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         if detector is not None and restorer is not None:
             return detector, restorer, self._device
 
-        import torch
+        from jasna.gui.video_session import build_image_session
 
-        from jasna._suppress_noise import install as _install_noise_filters
-        from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
-        from jasna.engine_paths import SD15_DIR
-        from jasna.mosaic.detection_registry import build_detection_model, coerce_detection_model_name, require_detection_model_weights
-        from jasna.restorer.sd15_download import bundle_present
-        from jasna.restorer.sd15_inpaint_restorer import Sd15InpaintRestorer
-
-        _install_noise_filters()
-        if not bundle_present(SD15_DIR):
-            raise FileNotFoundError(t("interactive_model_missing"))
-
-        settings = self._settings
-        self._device = torch.device("cuda:0")
-        det_name = coerce_detection_model_name(str(settings.detection_model))
-        detection_model_path = require_detection_model_weights(det_name)
-        ensure_engines_compiled(
-            EngineCompilationRequest(
-                device=str(self._device),
-                fp16=settings.fp16_mode,
-                detection=True,
-                detection_model_name=det_name,
-                detection_model_path=str(detection_model_path),
-                detection_batch_size=settings.batch_size,
-            ),
-        )
-        detector = build_detection_model(
-            det_name,
-            detection_model_path,
-            batch_size=settings.batch_size,
-            device=self._device,
-            score_threshold=settings.detection_score_threshold,
-            fp16=settings.fp16_mode,
-        )
-        restorer = Sd15InpaintRestorer(SD15_DIR, self._device, settings.fp16_mode)
+        detector, restorer, self._device = build_image_session(self._settings, log=None)
         return detector, restorer, self._device
 
     def _prepare(self, path: Path, detector, device):
@@ -424,9 +382,9 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
 
     def _show_current_view(self) -> None:
         image = self._current_result
-        if self._view == t("interactive_view_mask"):
+        if self._view == "mask":
             image = self._current_mask
-        elif self._view == t("interactive_view_raw"):
+        elif self._view == "raw":
             image = self._current_raw
 
         if image is None:
@@ -449,17 +407,10 @@ class InteractiveImageRestoreDialog(ctk.CTkToplevel):
         if self._on_log:
             self._on_log("INFO", f"Wrote {path}")
 
-    def _after(self, callback: callable) -> None:
-        if self._closed:
-            return
-        try:
-            self.after(0, callback)
-        except Exception:
-            logger.debug("Failed to schedule callback (widget gone)", exc_info=True)
-
     def _close(self) -> None:
         self._closed = True
         self._requests.put(None)
+        self._main_thread.close()
         self.destroy()
 
 

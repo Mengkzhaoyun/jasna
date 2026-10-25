@@ -3,7 +3,7 @@
 Maps ``AppSettings`` to the core ``SessionConfig`` (the only place a
 GUI-settings-to-internal-value mapping may live) and builds the heavy video
 restoration session for both the background job Processor and the
-segment-editor restoration preview.
+segment-editor restoration preview, plus the still-image session.
 """
 
 from pathlib import Path
@@ -28,6 +28,10 @@ def video_session_key(settings: AppSettings) -> tuple:
         settings.denoise_strength,
         settings.denoise_step,
         settings.secondary_restoration,
+        settings.restoration_model,
+        settings.ltx_model,
+        settings.ltx_fast,
+        settings.ltx_trial,
     )
     if settings.secondary_restoration == "tvai":
         key += (
@@ -54,10 +58,13 @@ def video_session_config(
     codec: str,
     encoder_settings: Mapping[str, object],
 ) -> SessionConfig:
-    from jasna.engine_paths import model_weights_dir
+    from jasna.engine_paths import default_restoration_model_path
+    from jasna.ltx.plan import window_hop
     from jasna.mosaic.detection_registry import coerce_detection_model_name, require_detection_model_weights
 
     det_name = coerce_detection_model_name(str(settings.detection_model))
+    standard_model = settings.restoration_model == "basicvsrpp"
+    secondary_restoration = settings.secondary_restoration if standard_model else "none"
     return SessionConfig(
         device="cuda:0",
         fp16=bool(settings.fp16_mode),
@@ -68,22 +75,28 @@ def video_session_config(
         max_detection_gap=int(settings.max_detection_gap),
         min_detection_duration=int(settings.min_detection_duration),
         scene_detection=bool(settings.scene_detection),
-        restoration_model_path=model_weights_dir() / "lada_mosaic_restoration_model_generic_v1.2.pth",
+        restoration_model_name=settings.restoration_model,
+        restoration_model_path=default_restoration_model_path(settings.restoration_model),
+        ltx_large_canvas=bool(settings.ltx_large_canvas),
+        ltx_window_hop=window_hop(bool(settings.ltx_less_overlap)),
+        ltx_seed=int(settings.ltx_seed),
+        ltx_fast=bool(settings.ltx_fast),
+        ltx_model=settings.ltx_model,
+        ltx_trial=bool(settings.ltx_trial),
+        ltx_auto_split_percent=float(settings.ltx_auto_split_percent) if settings.ltx_auto_split else None,
         compile_basicvsrpp=bool(settings.compile_basicvsrpp),
         max_clip_size=int(settings.max_clip_size),
         temporal_overlap=int(settings.temporal_overlap),
         enable_crossfade=bool(settings.enable_crossfade),
-        denoise_strength=settings.denoise_strength,
+        denoise_strength=settings.denoise_strength if standard_model else "none",
         denoise_step=settings.denoise_step,
-        secondary_restoration=settings.secondary_restoration,
+        secondary_restoration=secondary_restoration,
         tvai_ffmpeg_path=settings.tvai_ffmpeg_path,
         tvai_model=settings.tvai_model,
         tvai_scale=int(settings.tvai_scale),
         tvai_args=settings.tvai_args,
         tvai_workers=int(settings.tvai_workers),
-        tvai_denoise=bool(
-            settings.tvai_denoise and settings.secondary_restoration == "tvai"
-        ),
+        tvai_denoise=bool(settings.tvai_denoise and secondary_restoration == "tvai"),
         rtx_scale=int(settings.rtx_scale),
         rtx_quality=settings.rtx_quality.lower(),
         rtx_denoise=settings.rtx_denoise.lower(),
@@ -104,19 +117,67 @@ def video_session_config(
 def build_video_session(
     settings: AppSettings,
     *,
-    disable_basicvsrpp_tensorrt: bool,
     log: Callable[[str], None],
 ) -> RestorationSession:
     from jasna._suppress_noise import install as _install_noise_filters
     _install_noise_filters()
     from jasna.session_factory import build_restoration_session
+    from jasna.engine_paths import unet4x_plaintext_available
+    from jasna.gui.activation_worker import read_license_info
+    from jasna.gui.locales import t
 
     config = video_session_config(settings, codec=settings.codec, encoder_settings={})
-    return build_restoration_session(
-        config,
-        disable_basicvsrpp_tensorrt=disable_basicvsrpp_tensorrt,
+    encrypted = config.secondary_restoration == "unet-4x" and not unet4x_plaintext_available()
+    if config.restoration_model_name == "ltx" and not config.ltx_trial:
+        from jasna.ltx import model_files
+
+        encrypted = any(path.suffix == ".enc" for path in model_files._bundle_paths(
+            config.restoration_model_path, config.ltx_model, fast=config.ltx_fast))
+    if encrypted:
+        _, _, identity = read_license_info()
+        if identity is not None and identity.startswith("JW1-"):
+            raise ValueError(t("license_cloud_cli_only"))
+    return build_restoration_session(config, log_callback=log)
+
+
+def build_image_session(
+    settings: AppSettings,
+    *,
+    log: Callable[[str], None] | None,
+) -> tuple:
+    """Load the mosaic detector and SD 1.5 inpaint restorer used for still images."""
+    import torch
+
+    from jasna._suppress_noise import install as _install_noise_filters
+    from jasna.engine_paths import SD15_DIR
+    from jasna.gui.locales import t
+    from jasna.mosaic.detection_registry import resolve_detection_model
+    from jasna.restorer.sd15_download import bundle_present
+    from jasna.restorer.sd15_inpaint_restorer import Sd15InpaintRestorer, use_plaintext_sd15
+    from jasna.session_factory import build_compiled_detection_model
+    from jasna.gui.activation_worker import read_license_info
+
+    _install_noise_filters()
+    if not use_plaintext_sd15(SD15_DIR):
+        _, _, identity = read_license_info()
+        if identity is not None and identity.startswith("JW1-"):
+            raise ValueError(t("license_cloud_cli_only"))
+    if not bundle_present(SD15_DIR):
+        raise FileNotFoundError(t("interactive_model_missing"))
+    device = torch.device("cuda:0")
+    detection_model_name, detection_model_path, _ = resolve_detection_model(
+        str(settings.detection_model), "", None
+    )
+    detector = build_compiled_detection_model(
+        detection_model_name,
+        detection_model_path,
+        device=device,
+        batch_size=settings.batch_size,
+        fp16=settings.fp16_mode,
+        score_threshold=settings.detection_score_threshold,
         log_callback=log,
     )
+    return detector, Sd15InpaintRestorer(SD15_DIR, device, settings.fp16_mode), device
 
 
 def release_session_memory(device: "torch.device") -> None:

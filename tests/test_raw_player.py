@@ -22,7 +22,7 @@ from jasna.gui.raw_player import (
     run_raw_restoration_pass,
 )
 from jasna.gui.models import AppSettings
-from jasna.media import VideoMetadata
+from jasna.media.probe import VideoMetadata
 
 
 def _metadata() -> VideoMetadata:
@@ -203,6 +203,7 @@ def test_raw_worker_coalesces_seeks_and_invalidates_buffer() -> None:
         settings,
         frame_buffer,
         max_size=(640, 360),
+        on_stopped=lambda: None,
     )
 
     first = worker.play_from(1.0)
@@ -217,6 +218,23 @@ def test_raw_worker_coalesces_seeks_and_invalidates_buffer() -> None:
     worker.close()
 
 
+def test_raw_worker_reports_stop_after_close() -> None:
+    stopped = threading.Event()
+    worker = RawPlayerWorker(
+        "video.mp4",
+        _metadata(),
+        AppSettings(),
+        TimestampFrameBuffer(),
+        max_size=(640, 360),
+        on_stopped=stopped.set,
+    )
+    worker.start()
+
+    worker.close()
+
+    assert stopped.wait(timeout=5)
+
+
 def test_raw_worker_reload_reuses_worker_with_new_settings() -> None:
     frame_buffer = TimestampFrameBuffer()
     initial = AppSettings(secondary_restoration="none")
@@ -227,6 +245,7 @@ def test_raw_worker_reload_reuses_worker_with_new_settings() -> None:
         initial,
         frame_buffer,
         max_size=(640, 360),
+        on_stopped=lambda: None,
     )
 
     generation = worker.reload_from(changed, 4.0)
@@ -253,6 +272,7 @@ def test_raw_worker_rebuilds_changed_settings_on_same_owner_thread(
         initial,
         TimestampFrameBuffer(),
         max_size=(640, 360),
+        on_stopped=lambda: None,
     )
     build_threads: list[int] = []
     pipelines: list[SimpleNamespace] = []
@@ -297,7 +317,6 @@ def test_raw_worker_rebuilds_changed_settings_on_same_owner_thread(
     assert not worker.is_alive()
     assert len(set(build_threads)) == 1
     assert len(pipelines) == 2
-    pipelines[0].close.assert_called_once_with()
     sessions[0].close.assert_called_once_with()
     release_memory.assert_any_call(sessions[0].device)
 
@@ -327,17 +346,18 @@ def test_raw_worker_releases_session_when_pipeline_construction_fails(
         AppSettings(),
         TimestampFrameBuffer(),
         max_size=(640, 360),
+        on_stopped=lambda: None,
     )
 
     with pytest.raises(RuntimeError, match="pipeline failed"):
-        worker._build_pipeline()
+        worker._build_pipeline(AppSettings())
 
     session.close.assert_called_once_with()
     release.assert_called_once_with(session.device)
 
 
 def test_raw_pass_forwards_seek_and_player_writer(monkeypatch) -> None:
-    from jasna import pipeline_threads, vram_offloader
+    from jasna import pipeline_threads
 
     class ImmediateThread:
         def __init__(self, *, target, **_kwargs):
@@ -359,7 +379,7 @@ def test_raw_pass_forwards_seek_and_player_writer(monkeypatch) -> None:
     monkeypatch.setattr(pipeline_threads, "secondary_restore_loop", MagicMock())
     monkeypatch.setattr(pipeline_threads, "blend_encode_loop", blend)
     monkeypatch.setattr(raw_player.threading, "Thread", ImmediateThread)
-    monkeypatch.setattr(vram_offloader, "VramOffloader", MagicMock())
+    monkeypatch.setattr(pipeline_threads, "VramOffloader", MagicMock())
     pipeline = SimpleNamespace(
         input_video=Path("video.mp4"),
         device=torch.device("cpu"),
@@ -374,9 +394,9 @@ def test_raw_pass_forwards_seek_and_player_writer(monkeypatch) -> None:
         min_detection_duration=2,
         enable_crossfade=True,
         scene_detection=False,
-        _vr_projector=None,
-        _job_detection_model=MagicMock(),
-        _vr_resolution=SimpleNamespace(resolved="off"),
+        vr_projector=None,
+        job_detection_model=MagicMock(),
+        vr_resolution=SimpleNamespace(resolved="off"),
     )
     writer = MagicMock()
 
@@ -426,6 +446,7 @@ def test_source_has_audio_uses_ffprobe_process(
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
     monkeypatch.setattr(raw_player, "resolve_executable", lambda name: "/tools/ffprobe")
+    monkeypatch.setattr(raw_player, "subprocess_no_window_kwargs", lambda: {"creationflags": 7})
     monkeypatch.setattr(raw_player.subprocess, "run", run)
 
     assert raw_player.source_has_audio("video.mp4") is expected
@@ -447,6 +468,7 @@ def test_source_has_audio_uses_ffprobe_process(
                 "stdout": raw_player.subprocess.PIPE,
                 "stderr": raw_player.subprocess.PIPE,
                 "text": True,
+                "creationflags": 7,
             },
         )
     ]

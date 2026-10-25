@@ -2,10 +2,25 @@
 
 import sys
 
+import customtkinter as ctk
 
-def _font_families_for_platform(platform: str) -> tuple[str, str]:
+
+_WINDOWS_UI_FAMILY_BY_LANGUAGE = {
+    "zh": "Microsoft YaHei UI",
+    "ja": "Yu Gothic UI",
+    "ko": "Malgun Gothic",
+    "th": "Leelawadee UI",
+}
+
+
+def font_families_for_platform(platform: str, language: str) -> tuple[str, str]:
     if platform.startswith("linux"):
         return "sans-serif", "monospace"
+    if platform == "win32":
+        script_family = _WINDOWS_UI_FAMILY_BY_LANGUAGE.get(language)
+        if script_family is not None:
+            return script_family, script_family
+        return "Segoe UI", "Consolas"
     return "Segoe UI", "Consolas"
 
 
@@ -24,6 +39,9 @@ class Colors:
     PRIMARY_HOVER = "#4338ca"# Indigo-700
     PRIMARY_DARK = "#3730a3" # Indigo-800
 
+    # LTX ranges in the segment editor
+    MODEL_LTX = "#0d9488"    # Teal-600
+
     # Video player call to action
     PLAYER = "#0284c7"       # Sky-600
     PLAYER_HOVER = "#0369a1" # Sky-700
@@ -36,7 +54,7 @@ class Colors:
     # Status indicators
     STATUS_PROCESSING = "#34d399" # Emerald-400
     STATUS_ERROR = "#fb7185"      # Rose-400
-    STATUS_PAUSED = "#fbbf24"     # Amber-400
+    STATUS_WARNING = "#fbbf24"     # Amber-400
     STATUS_COMPLETED = "#22c55e"  # Green-500
     STATUS_PENDING = "#94a3b8"    # Slate-400
     STATUS_CONFLICT = "#fbbf24"   # Amber-400 (output file exists)
@@ -56,9 +74,13 @@ class Colors:
     UNIFANS_PURPLE = "#8B5CF6"    # Violet-500
     UNIFANS_TEXT = "#FFFFFF"      # White text on violet
 
+    # Xianyu branding
+    XIANYU_YELLOW = "#FFE60F"
+    XIANYU_TEXT = "#0f172a"
+
 
 class Fonts:
-    FAMILY, FAMILY_MONO = _font_families_for_platform(sys.platform)
+    FAMILY, FAMILY_MONO = font_families_for_platform(sys.platform, "en")
     
     # Typography hierarchy per spec (+1px from original)
     SIZE_TITLE = 16      # App title "JASNA GUI" - bold
@@ -68,6 +90,11 @@ class Fonts:
     SIZE_HEADING = 14    # Section headings - bold (small caps style)
     SIZE_SMALL = 13      # Secondary text, logs (mono)
     SIZE_TINY = 12       # Small caps labels "QUEUE", "SYSTEM OUTPUT" - bold
+
+
+def apply_ui_fonts(platform: str, language: str) -> None:
+    Fonts.FAMILY, Fonts.FAMILY_MONO = font_families_for_platform(platform, language)
+    ctk.ThemeManager.theme["CTkFont"]["family"] = Fonts.FAMILY
 
 
 class Sizing:

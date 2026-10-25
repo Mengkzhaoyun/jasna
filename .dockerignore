@@ -8,3 +8,9 @@
 !jasna/**
 !.drone
 !.drone/**
+!jasna/protection/keytool/wheels
+!jasna/protection/keytool/native_obfuscation.py
+!jasna/protection/keytool/clang_runner.py
+!jasna/protection/keytool/build-tools-bootstrap.txt
+!jasna/protection/keytool/build-tools.txt
+!jasna/protection/keytool/build-tools-vali.txt

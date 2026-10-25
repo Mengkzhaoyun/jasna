@@ -1,6 +1,7 @@
-"""Unit tests for NvidiaVideoEncoder internals (options, color guard, buffer, worker, audio pump)."""
+"""Unit tests for VideoEncoder internals (options, color guard, buffer, worker, audio pump)."""
 from __future__ import annotations
 
+import logging
 import queue
 import threading
 from contextlib import nullcontext
@@ -16,18 +17,21 @@ from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvCol
 
 import jasna.media.video_encoder as video_encoder_module
 from jasna.accelerator import AcceleratorVendor
-from jasna.media import VideoMetadata
+from jasna.media.probe import VideoMetadata
 from jasna.media.video_encoder import (
     DEFAULT_AV1_ENCODER_OPTIONS,
     DEFAULT_ENCODER_OPTIONS,
     DEFAULT_H264_ENCODER_OPTIONS,
     ENCODER_SPECS,
-    _CODEC_MAP,
+    ENCODE_BUFFER_SIZE,
+    NVENC_SMART_FRAGMENT_OPTIONS,
     _align_yuv_pitch,
     _mov_container_options,
     _normalized_audio_layout,
-    NvidiaVideoEncoder,
+    VideoEncoder,
 )
+
+from factories import write_double_adts_aac_source
 
 
 def _fake_metadata(**overrides) -> VideoMetadata:
@@ -51,8 +55,8 @@ def _fake_metadata(**overrides) -> VideoMetadata:
     return VideoMetadata(**defaults)
 
 
-def _make_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_overrides) -> NvidiaVideoEncoder:
-    return NvidiaVideoEncoder(
+def _make_encoder(tmp_path, encoder_settings=None, codec="hevc", **meta_overrides) -> VideoEncoder:
+    return VideoEncoder(
         file=str(tmp_path / "result.mkv"),
         device=torch.device("cuda:0"),
         metadata=_fake_metadata(**meta_overrides),
@@ -87,7 +91,9 @@ _HEVC_OPTIONS_SNAPSHOT = {
 
 class TestCodecSpecs:
     def test_public_to_ffmpeg_codec_mapping(self):
-        assert _CODEC_MAP == {"hevc": "hevc_nvenc", "h264": "h264_nvenc", "av1": "av1_nvenc"}
+        assert {codec: spec.encoder_name for codec, spec in ENCODER_SPECS.items()} == {
+            "hevc": "hevc_nvenc", "h264": "h264_nvenc", "av1": "av1_nvenc"
+        }
 
     def test_hevc_defaults_snapshot_unchanged(self):
         assert DEFAULT_ENCODER_OPTIONS == _HEVC_OPTIONS_SNAPSHOT
@@ -132,8 +138,7 @@ class TestCodecSpecs:
         assert ENCODER_SPECS["av1"].ten_bit is True
 
     def test_nvenc_smart_fragment_options_are_unchanged(self):
-        for spec in ENCODER_SPECS.values():
-            assert dict(spec.smart_fragment_options) == {"forced-idr": "1"}
+        assert dict(NVENC_SMART_FRAGMENT_OPTIONS) == {"forced-idr": "1"}
 
 
 class TestContainerOptions:
@@ -154,7 +159,7 @@ class TestContainerOptions:
 
     def test_fmp4_defaults_off_and_leaves_encoder_options_alone(self, tmp_path):
         default = _make_encoder(tmp_path)
-        fragmented = NvidiaVideoEncoder(
+        fragmented = VideoEncoder(
             file=str(tmp_path / "result.mp4"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(),
@@ -167,16 +172,17 @@ class TestContainerOptions:
         assert fragmented.encoder_options == default.encoder_options
 
 
-def test_normalizes_count_only_stereo_layout():
-    layout = av.AudioLayout("2 channels")
+@pytest.mark.parametrize(
+    ("count_only", "expected"),
+    [("1 channels", "mono"), ("2 channels", "stereo"), ("6 channels", "5.1"), ("8 channels", "7.1")],
+)
+def test_normalizes_count_only_layout_to_default_layout(count_only, expected):
+    normalized = _normalized_audio_layout(av.AudioLayout(count_only))
 
-    normalized = _normalized_audio_layout(layout)
-
-    assert normalized.name == "stereo"
-    assert [channel.name for channel in normalized.channels] == ["FL", "FR"]
+    assert normalized.name == expected
 
 
-@pytest.mark.parametrize("name", ["stereo", "5.1"])
+@pytest.mark.parametrize("name", ["stereo", "5.1", "9 channels"])
 def test_preserves_named_audio_layout(name):
     layout = av.AudioLayout(name)
 
@@ -244,14 +250,13 @@ class TestSourceContainerPreservation:
         assert output_video.disposition == 3
 
     def test_smart_fragment_does_not_copy_chapters(self, tmp_path):
-        encoder = NvidiaVideoEncoder(
+        encoder = VideoEncoder(
             file=str(tmp_path / "part.nut"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(),
             codec="hevc",
             encoder_settings={},
             smart_fragment=True,
-            mux_audio=False,
         )
         encoder._src = SimpleNamespace(
             metadata={"title": "Source title"},
@@ -310,6 +315,7 @@ class TestSourceContainerPreservation:
 
         encoder.dst = SimpleNamespace(
             format=SimpleNamespace(name="matroska"),
+            supported_codecs=frozenset({"aac", "ass", "h264"}),
             add_stream=MagicMock(),
             add_stream_from_template=MagicMock(side_effect=add_stream_from_template),
         )
@@ -340,6 +346,7 @@ class TestSourceContainerPreservation:
         )
         encoder.dst = SimpleNamespace(
             format=SimpleNamespace(name="mp4"),
+            supported_codecs=frozenset({"h264", "aac", "mov_text"}),
             add_stream=MagicMock(),
             add_stream_from_template=MagicMock(
                 side_effect=ValueError("mp4 does not support pgssub")
@@ -427,43 +434,40 @@ class TestSourceContainerPreservation:
 
 class TestEncoderOptions:
     def test_smart_fragment_preserves_normal_closed_gop_settings(self, tmp_path):
-        enc = NvidiaVideoEncoder(
+        enc = VideoEncoder(
             file=str(tmp_path / "part.nut"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(),
             codec="hevc",
             encoder_settings={},
             smart_fragment=True,
-            mux_audio=False,
         )
         assert enc.encoder_options["g"] == DEFAULT_ENCODER_OPTIONS["g"]
         assert enc.encoder_options["bf"] == DEFAULT_ENCODER_OPTIONS["bf"]
         assert enc.encoder_options["forced-idr"] == "1"
         assert enc.encoder_options["b_ref_mode"] == DEFAULT_ENCODER_OPTIONS["b_ref_mode"]
-        assert enc.mux_audio is False
 
     def test_smart_fragment_preserves_custom_gop_size(self, tmp_path):
-        enc = NvidiaVideoEncoder(
+        enc = VideoEncoder(
             file=str(tmp_path / "part.nut"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(),
             codec="hevc",
             encoder_settings={"g": "180"},
             smart_fragment=True,
-            mux_audio=False,
         )
 
         assert enc.encoder_options["g"] == "180"
 
     @pytest.mark.parametrize("codec", ["hevc", "av1"])
     def test_smart_fragment_can_match_eight_bit_source(self, tmp_path, codec):
-        enc = NvidiaVideoEncoder(
+        enc = VideoEncoder(
             file=str(tmp_path / "part.nut"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(is_10bit=False),
             codec=codec,
             encoder_settings={},
-            match_input_bit_depth=True,
+            smart_fragment=True,
         )
         assert enc.spec.frame_format == "nv12"
         assert enc.spec.ten_bit is False
@@ -475,7 +479,7 @@ class TestEncoderOptions:
         assert enc.output_fps == Fraction(24, 1)
 
     def test_output_fps_can_override_source_rate(self, tmp_path):
-        enc = NvidiaVideoEncoder(
+        enc = VideoEncoder(
             file=str(tmp_path / "result.mkv"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(video_fps_exact=Fraction(60_000, 1_001)),
@@ -500,7 +504,7 @@ class TestEncoderOptions:
     def test_defaults_per_codec(self, tmp_path, codec, defaults):
         enc = _make_encoder(tmp_path, codec=codec)
         assert enc.encoder_options == defaults
-        assert enc.encoder_name == _CODEC_MAP[codec]
+        assert enc.encoder_name == ENCODER_SPECS[codec].encoder_name
 
     @pytest.mark.parametrize("codec", ["hevc", "h264", "av1"])
     def test_settings_override_and_stringify(self, tmp_path, codec):
@@ -565,7 +569,7 @@ class TestEncoderOptions:
 
     def test_unsupported_codec_raises(self, tmp_path):
         with pytest.raises(ValueError, match="Unsupported codec"):
-            NvidiaVideoEncoder(
+            VideoEncoder(
                 file=str(tmp_path / "o.mkv"),
                 device=torch.device("cuda:0"),
                 metadata=_fake_metadata(),
@@ -616,7 +620,7 @@ class TestSharpening:
         assert _make_encoder(tmp_path)._cas is None
 
     def test_sharpener_built_when_requested(self, tmp_path):
-        enc = NvidiaVideoEncoder(
+        enc = VideoEncoder(
             file=str(tmp_path / "result.mkv"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(),
@@ -628,7 +632,7 @@ class TestSharpening:
         assert enc._cas.weight_scale == pytest.approx(-1.0 / (16.0 - 12.0 * 0.4))
 
     def test_sharpener_follows_the_encoder_bit_depth(self, tmp_path):
-        ten_bit = NvidiaVideoEncoder(
+        ten_bit = VideoEncoder(
             file=str(tmp_path / "a.mkv"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(),
@@ -636,16 +640,14 @@ class TestSharpening:
             encoder_settings={},
             sharpen_strength=0.4,
         )
-        eight_bit = NvidiaVideoEncoder(
+        eight_bit = VideoEncoder(
             file=str(tmp_path / "b.nut"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(is_10bit=False),
             codec="hevc",
             encoder_settings={},
             sharpen_strength=0.4,
-            match_input_bit_depth=True,
             smart_fragment=True,
-            mux_audio=False,
         )
         assert ten_bit._cas.ten_bit is True
         assert ten_bit._cas.peak == 1023.0
@@ -684,7 +686,7 @@ class TestSharpening:
         assert torch.equal(torch.cat(seen[0]), packed)
 
     def test_sharpening_runs_before_pitch_alignment(self, tmp_path, monkeypatch):
-        enc = NvidiaVideoEncoder(
+        enc = VideoEncoder(
             file=str(tmp_path / "result.mkv"),
             device=torch.device("cuda:0"),
             metadata=_fake_metadata(),
@@ -769,19 +771,34 @@ class TestColorHandling:
             _make_encoder(tmp_path, codec=codec, color_range=AvColorRange.UNSPECIFIED)
 
 
-def _buffered_encoder(tmp_path) -> NvidiaVideoEncoder:
-    enc = _make_encoder(tmp_path)
+def _buffered_encoder(tmp_path, **meta_overrides) -> VideoEncoder:
+    enc = _make_encoder(tmp_path, **meta_overrides)
     enc.pts_heap = []
     enc.frame_buffer = deque()
     enc.pts_set = set()
     enc._last_emitted_pts = None
     enc._worker_error = None
     enc._encode_queue = MagicMock()
-    enc._build_encode_item = MagicMock(side_effect=lambda frame, pts: (frame, pts, None))
+    enc._build_encode_item = MagicMock(side_effect=lambda frame, pts, apply_lut: (frame, pts, None))
     return enc
 
 
 class TestEncodeBuffer:
+    def test_vc1_wmv_keeps_decoder_pts_across_skipped_frames(self, tmp_path):
+        enc = _buffered_encoder(
+            tmp_path,
+            video_file="source.wmv",
+            codec_name="vc1",
+            video_fps=30_000 / 1_001,
+            video_fps_exact=Fraction(30_000, 1_001),
+            average_fps=30_000 / 1_001,
+            time_base=Fraction(1, 1000),
+        )
+        for pts in (46, 79, 113, 179):
+            enc.encode("frame", pts)
+
+        assert sorted(enc.pts_heap) == [46, 79, 113, 179]
+
     @pytest.mark.parametrize(
         ("dtype", "width", "expected_pitch"),
         [
@@ -934,7 +951,7 @@ class TestEncodeBuffer:
 
     def test_flush_starts_above_half_buffer(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
-        for i in range(enc.BUFFER_MAX_SIZE // 2):
+        for i in range(ENCODE_BUFFER_SIZE // 2):
             enc.encode(f"f{i}", i)
         enc._encode_queue.put.assert_not_called()
         enc.encode("one-more", 99)
@@ -986,19 +1003,20 @@ class TestWorkerErrorChannel:
         enc._worker_error = None
         enc._encode_queue = queue.Queue()
         enc._stop_sentinel = object()
-        enc._handle_encode_item = MagicMock(side_effect=RuntimeError("mux failed"))
+        enc.stream = MagicMock()
+        enc._encode_frame = MagicMock(side_effect=RuntimeError("mux failed"))
 
         worker = threading.Thread(target=enc._encode_worker, daemon=True)
         worker.start()
-        enc._encode_queue.put(("frame", 0, None))
-        enc._encode_queue.put(("frame", 1, None))
+        enc._encode_queue.put((MagicMock(), 0, True, None))
+        enc._encode_queue.put((MagicMock(), 1, True, None))
         enc._encode_queue.join()
         enc._encode_queue.put(enc._stop_sentinel)
         worker.join(timeout=5)
 
         assert not worker.is_alive()
         assert isinstance(enc._worker_error, RuntimeError)
-        assert enc._handle_encode_item.call_count == 1
+        assert enc._encode_frame.call_count == 1
 
 
 def _packet(stream_index, dts, time_base=Fraction(1, 1000), duration=0):
@@ -1013,12 +1031,33 @@ def _packet(stream_index, dts, time_base=Fraction(1, 1000), duration=0):
 
 
 class TestSourceStreamPump:
+    def test_double_adts_aac_is_filtered_for_mp4_copy(self, tmp_path):
+        source = write_double_adts_aac_source(tmp_path)
+        destination = tmp_path / "result.mp4"
+        with av.open(str(source)) as src, av.open(str(destination), "w") as dst:
+            in_stream = src.streams.audio[0]
+            out_stream = dst.add_stream_from_template(in_stream, opaque=True)
+            bitstream_filter = VideoEncoder._aac_copy_filter(
+                in_stream, out_stream, {"mp4"}
+            )
+            for packet in src.demux(in_stream):
+                dst.mux(
+                    VideoEncoder._copy_source_packets(
+                        packet, out_stream, bitstream_filter
+                    )
+                )
+
+        with av.open(str(destination)) as result:
+            assert sum(1 for _ in result.decode(audio=0)) > 1
+
     def _source_encoder(self, tmp_path, packets):
         enc = _make_encoder(tmp_path)
         out_a = MagicMock()
         enc._source_pipes = {1: ("copy", out_a, None)}
         enc._source_backlog = deque()
         enc._source_iter = iter(packets)
+        enc._last_source_dts = {}
+        enc._warned_source_dts = set()
         enc.dst = MagicMock()
         return enc, out_a
 
@@ -1047,6 +1086,44 @@ class TestSourceStreamPump:
 
         enc._pump_source_streams(None)
         assert enc.dst.mux.call_count == 3
+
+    def test_pump_nudges_non_monotonic_dts(self, tmp_path):
+        packets = [_packet(1, dts=0), _packet(1, dts=370390), _packet(1, dts=370390)]
+        enc, _ = self._source_encoder(tmp_path, packets)
+
+        enc._pump_source_streams(None)
+
+        muxed = [call.args[0] for call in enc.dst.mux.call_args_list]
+        assert [p.dts for p in muxed] == [0, 370390, 370391]
+        assert muxed[-1].pts == 370391
+
+    def test_nudge_warns_once_per_stream(self, tmp_path, caplog):
+        packets = [_packet(1, dts=100), _packet(1, dts=0), _packet(1, dts=0), _packet(1, dts=0)]
+        enc, _ = self._source_encoder(tmp_path, packets)
+
+        with caplog.at_level(logging.DEBUG, logger="jasna.media.video_encoder"):
+            enc._pump_source_streams(None)
+
+        nudges = [r for r in caplog.records if "nudging forward" in r.getMessage()]
+        assert [r.levelno for r in nudges] == [logging.WARNING, logging.DEBUG, logging.DEBUG]
+
+    def test_copy_nudges_dts_in_output_time_base(self, tmp_path):
+        enc = _make_encoder(tmp_path)
+        enc._last_source_dts = {}
+        enc._warned_source_dts = set()
+        packets = []
+        with av.open(str(tmp_path / "audio.mkv"), "w") as enc.dst:
+            stream = enc.dst.add_stream("aac", rate=44_100)
+            stream.time_base = Fraction(1, 44_100)
+            for dts in (0, 1024, 1024, 2048):
+                packet = av.Packet(b"\x21\x10\x04\x60")
+                packet.stream = stream
+                packet.time_base = Fraction(1, 44_100)
+                packet.pts = packet.dts = dts
+                enc._mux_source_packet(packet)
+                packets.append(packet)
+
+        assert [packet.dts for packet in packets] == [0, 23, 24, 46]
 
     def test_pump_without_source_streams_is_noop(self, tmp_path):
         enc = _make_encoder(tmp_path)
@@ -1116,3 +1193,30 @@ class TestDropUnsupportedNvencOverrides:
 
     def test_av1_weighted_pred_always_dropped(self):
         assert self._drop("av1", {"weighted_pred": "1", "bf": "0"}) == {"bf": "0"}
+
+
+class TestResolveEncoderOptions:
+    def test_eight_bit_smart_fragment_matches_source_depth(self):
+        from jasna.accelerator import AcceleratorVendor
+        from jasna.media.video_encoder import resolve_encoder_options
+
+        spec, options = resolve_encoder_options(
+            AcceleratorVendor.NVIDIA, "hevc", _fake_metadata(is_10bit=False), {}, smart_fragment=True
+        )
+
+        assert spec.frame_format == "nv12"
+        assert options["profile"] == "main"
+        assert options["forced-idr"] == "1"
+
+    def test_amd_hevc_cq_maps_to_cqp_quantizers_without_bitrate_cap(self):
+        from jasna.accelerator import AcceleratorVendor
+        from jasna.media.video_encoder import resolve_encoder_options
+
+        spec, options = resolve_encoder_options(
+            AcceleratorVendor.AMD, "hevc", _fake_metadata(), {"cq": 21}, smart_fragment=False
+        )
+
+        assert spec.encoder_name == "hevc_amf"
+        assert (options["qp_i"], options["qp_p"]) == ("21", "21")
+        assert "cq" not in options
+        assert "maxrate" not in options

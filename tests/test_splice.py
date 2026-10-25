@@ -8,7 +8,7 @@ import pytest
 from av.video.reformatter import ColorRange, Colorspace
 
 from jasna.accelerator import AcceleratorVendor
-from jasna.media import VideoMetadata
+from jasna.media.probe import VideoMetadata
 from jasna.media.splice import (
     KeyframeIndex,
     SpliceSpan,
@@ -20,7 +20,7 @@ from jasna.media.splice import (
     resolve_smart_encoder_settings,
     validate_smart_render,
 )
-from jasna.segments import SegmentRange
+from jasna.segments import SegmentRange, SegmentRestoration
 
 
 def _metadata(codec: str = "h264", **overrides) -> VideoMetadata:
@@ -70,6 +70,48 @@ def test_plan_merges_two_selections_in_one_gop_bridge() -> None:
     assert len(plan.render_spans) == 1
     assert plan.render_spans[0].effect_ranges == ((66, 72), (90, 96))
 
+
+
+def test_plan_rejects_two_models_in_one_render_span() -> None:
+    ltx = SegmentRestoration("ltx", 1)
+    with pytest.raises(SmartRenderCompatibilityError) as exc:
+        build_splice_plan(
+            [SegmentRange(2.2, 2.4, ltx), SegmentRange(3.0, 3.2, SegmentRestoration("basicvsrpp", None))],
+            _index(),
+            duration=6,
+        )
+    assert exc.value.reason == "mixed_models"
+
+
+def test_plan_splits_models_that_meet_at_a_keyframe() -> None:
+    ltx, basic = SegmentRestoration("ltx", 1), SegmentRestoration("basicvsrpp", None)
+    plan = build_splice_plan(
+        [SegmentRange(1.0, 2.0, basic), SegmentRange(2.0, 3.0, ltx), SegmentRange(4.5, 5.0, ltx)],
+        _index(points=(0, 60, 120, 150)),
+        duration=6,
+    )
+    assert [(span.kind, span.start_pts, span.end_pts) for span in plan.spans] == [
+        ("render", 0, 60),
+        ("render", 60, 150),
+        ("copy", 150, 180),
+    ]
+    assert [[segment.restoration for segment in segments] for segments in plan.render_span_segments()] == [
+        [basic],
+        [ltx, ltx],
+    ]
+
+
+def test_plan_keeps_each_segment_behind_its_render_span_effect_range() -> None:
+    first, third = SegmentRestoration("ltx", 1), SegmentRestoration("ltx", 3)
+    plan = build_splice_plan(
+        [SegmentRange(2.2, 2.4, first), SegmentRange(3.0, 3.2), SegmentRange(5.0, 5.5, third)],
+        _index(points=(0, 60, 120, 150)),
+        duration=6,
+    )
+    assert [[segment.restoration for segment in segments] for segments in plan.render_span_segments()] == [
+        [first, None],
+        [third],
+    ]
 
 def test_plan_offsets_effect_pts_by_stream_start_time() -> None:
     index = KeyframeIndex((900, 960, 1020), Fraction(1, 30), 900, 1080)
@@ -220,12 +262,12 @@ def test_smart_h264_settings_reject_unknown_source_profile() -> None:
 
 @pytest.mark.parametrize("codec", ["h264", "hevc", "av1"])
 def test_validation_accepts_supported_source_matched_codecs(codec: str) -> None:
-    assert validate_smart_render(_metadata(codec), output_path="out.mp4", codec=codec) == codec
+    assert validate_smart_render(_metadata(codec), output_path="out.mp4", codec=codec, retarget_high_fps=False) == codec
 
 
 def test_validation_rejects_codec_mismatch() -> None:
     with pytest.raises(SmartRenderCompatibilityError, match="match the input codec"):
-        validate_smart_render(_metadata("h264"), output_path="out.mp4", codec="hevc")
+        validate_smart_render(_metadata("h264"), output_path="out.mp4", codec="hevc", retarget_high_fps=False)
 
 
 def test_validation_rejects_unsupported_h264_profile() -> None:
@@ -234,6 +276,7 @@ def test_validation_rejects_unsupported_h264_profile() -> None:
             _metadata("h264", profile="Extended"),
             output_path="out.mp4",
             codec="h264",
+            retarget_high_fps=False,
         )
 
 
@@ -243,6 +286,7 @@ def test_validation_rejects_vfr_and_retargeting() -> None:
             _metadata(average_fps=29.0),
             output_path="out.mp4",
             codec="h264",
+            retarget_high_fps=False,
         )
     with pytest.raises(SmartRenderCompatibilityError, match="frame-rate retargeting"):
         validate_smart_render(
@@ -332,3 +376,15 @@ def test_copy_fragment_seeks_before_demux(tmp_path: Path) -> None:
     ]
     assert packet.pts == 5
     assert packet.dts == 3
+
+
+def test_segment_render_span_widens_one_segment_to_its_keyframes() -> None:
+    from fractions import Fraction
+
+    from jasna.media.splice import KeyframeIndex, SpliceSpan, segment_render_span
+    from jasna.segments import SegmentRange
+
+    index = KeyframeIndex(pts=(0, 2000, 4000), time_base=Fraction(1, 1000), start_pts=0, end_pts=6000)
+
+    assert segment_render_span(SegmentRange(2.5, 3.0), index) == SpliceSpan("render", 2000, 4000, ((2500, 3000),))
+    assert segment_render_span(SegmentRange(4.5, 6.0), index) == SpliceSpan("render", 4000, 6000, ((4500, 6000),))

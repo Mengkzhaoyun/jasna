@@ -1,56 +1,61 @@
 from __future__ import annotations
 
-import gc
 import logging
 import os
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from queue import Empty, Queue
 from tempfile import TemporaryDirectory
-
-from jasna.blend_buffer import BlendBuffer
-from jasna.crop_buffer import CropBuffer
-from jasna.frame_queue import FrameQueue
+from typing import TYPE_CHECKING
 
 import psutil
 import torch
 
-from jasna.accelerator import vendor_for_device
-from jasna.media import UnsupportedColorspaceError, get_video_meta_data
-from jasna.media.video_encoder import NvidiaVideoEncoder
+from jasna.accelerator import AcceleratorVendor, vendor_for_device
+from jasna.media.container_utils import MOV_SUFFIXES
+from jasna.media.probe import UnsupportedVideoError, get_video_meta_data
+from jasna.media.video_encoder import VideoEncoder
 from jasna.media.frame_rate import resolve_frame_rate_retarget
 from jasna.media.splice import (
+    KeyframeIndex,
     SplicePlan,
+    SpliceSpan,
     build_splice_plan,
     concatenate_fragments,
     create_copy_fragment,
     mux_final_output,
     normalize_fragment,
     probe_keyframes,
+    require_one_model,
     resolve_smart_encoder_settings,
     validate_smart_render,
 )
-from jasna.mosaic.detection_registry import build_detection_model
-from jasna.pipeline_debug_logging import PipelineDebugMemoryLogger
-from jasna.pipeline_items import FrameMeta, PrimaryRestoreResult, SecondaryLoopStats, _SENTINEL
-from jasna.pipeline_threads import decode_detect_loop, primary_restore_loop, secondary_restore_loop, blend_encode_loop
-from jasna.progressbar import Progressbar
-from jasna.restorer import RestorationPipeline
+from jasna.pipeline_threads import run_restoration_pass
+from jasna.progressbar import JobProgress, ProgressCallback, Progressbar
 from jasna.restorer.secondary_restorer import AsyncSecondaryRestorer
-from jasna.segments import SegmentRange
-from jasna.vram_offloader import VramOffloader
+from jasna.segments import SegmentRange, job_restoration, resolve_restorations
+from jasna.session_config import SessionConfig
 from jasna.vr180 import (
     SbsDetectionAdapter,
+    require_ltx_input,
     resolve_vr_mode,
 )
 from jasna.vr_projection import build_vr_projector
 
+if TYPE_CHECKING:
+    from jasna.ltx.restore import FrameWriter, LtxRender, LtxSpan
+    from jasna.session_factory import RestorationSession
+
 log = logging.getLogger(__name__)
 
 
+def _span_frames(span: SpliceSpan, index: KeyframeIndex, metadata) -> int:
+    return round((span.end_pts - span.start_pts) * index.time_base * metadata.video_fps)
+
+
 class _OfflineFrameWriter:
-    def __init__(self, encoder_ctx: NvidiaVideoEncoder, encode_heartbeat: list[float]):
+    def __init__(self, encoder_ctx: VideoEncoder, encode_heartbeat: list[float]):
         self._encoder_ctx = encoder_ctx
         self._encode_heartbeat = encode_heartbeat
         self._entered = False
@@ -75,71 +80,47 @@ class Pipeline:
     def __init__(
         self,
         *,
+        config: SessionConfig,
+        session: RestorationSession,
         input_video: Path,
         output_video: Path,
-        detection_model_name: str,
-        detection_model_path: Path,
-        detection_score_threshold: float,
-        restoration_pipeline: RestorationPipeline,
-        codec: str,
-        encoder_settings: dict[str, object],
-        batch_size: int,
-        device: torch.device,
-        max_clip_size: int,
-        temporal_overlap: int,
-        max_detection_gap: int,
-        min_detection_duration: int,
-        enable_crossfade: bool = True,
-        scene_detection: bool = True,
-        vr_mode: str = "auto",
-        vr_projection: str = "auto",
-        fp16: bool,
-        disable_progress: bool = False,
-        progress_callback: callable | None = None,
-        lut_path: str | Path | None = None,
-        sharpen_strength: float = 0.0,
-        retarget_high_fps: bool = False,
-        fmp4: bool = False,
-        segments: tuple[SegmentRange, ...] | None = None,
-        splice_plan: SplicePlan | None = None,
-        working_dir: Path | None = None,
+        progress_callback: ProgressCallback | None,
+        segments: tuple[SegmentRange, ...] | None,
+        splice_plan: SplicePlan | None,
     ) -> None:
         self.input_video = input_video
         self.output_video = output_video
-        self.working_dir = working_dir
-        self.codec = str(codec)
-        self.encoder_settings = dict(encoder_settings)
-        self.batch_size = int(batch_size)
-        self.device = device
-        self.max_clip_size = int(max_clip_size)
-        self.temporal_overlap = int(temporal_overlap)
-        self.max_detection_gap = int(max_detection_gap)
-        self.min_detection_duration = int(min_detection_duration)
-        self.enable_crossfade = bool(enable_crossfade)
-        self.scene_detection = bool(scene_detection)
-        self.vr_mode = str(vr_mode)
-        self.vr_projection = str(vr_projection)
-
-        self.detection_model = build_detection_model(
-            detection_model_name,
-            detection_model_path,
-            batch_size=self.batch_size,
-            device=self.device,
-            score_threshold=float(detection_score_threshold),
-            fp16=bool(fp16),
-        )
-        self.restoration_pipeline = restoration_pipeline
-        self.disable_progress = bool(disable_progress)
+        self.working_dir = config.working_dir
+        self.codec = config.codec
+        self.encoder_settings = dict(config.encoder_settings)
+        self.batch_size = config.batch_size
+        self.device = session.device
+        self.max_clip_size = config.max_clip_size
+        self.temporal_overlap = config.temporal_overlap
+        self.max_detection_gap = config.max_detection_gap
+        self.min_detection_duration = config.min_detection_duration
+        self.enable_crossfade = config.enable_crossfade
+        self.scene_detection = config.scene_detection
+        self.vr_mode = config.vr_mode
+        self.vr_projection = config.vr_projection
+        self.detection_model = session.detection_model_for(config)
+        self.restoration_pipeline = session.restoration_pipeline
+        self.ltx_files = session.ltx_files
+        self.restoration_model_name = config.restoration_model_name
+        self.ltx_large_canvas = config.ltx_large_canvas
+        self.ltx_window_hop = config.ltx_window_hop
+        self.ltx_seed = config.ltx_seed
+        self.disable_progress = config.disable_progress
         self.progress_callback = progress_callback
-        self.lut_path = lut_path
-        self.sharpen_strength = float(sharpen_strength)
-        self.retarget_high_fps = bool(retarget_high_fps)
-        self.fmp4 = bool(fmp4)
+        self.lut_path = config.lut_path
+        self.sharpen_strength = config.sharpen_strength
+        self.retarget_high_fps = config.retarget_high_fps
+        self.fmp4 = config.fmp4
         self.segments = tuple(segments) if segments else None
         self.splice_plan = splice_plan
-        self._vr_resolution = None
-        self._vr_projector = None
-        self._job_detection_model = self.detection_model
+        self.vr_resolution = None
+        self.vr_projector = None
+        self.job_detection_model = self.detection_model
         self._cancel_event = threading.Event()
         self.completed = False
 
@@ -152,205 +133,39 @@ class Pipeline:
         self._cancel_event.set()
 
     def configure_vr(self, metadata) -> None:
-        self._vr_resolution = resolve_vr_mode(
+        self.vr_resolution = resolve_vr_mode(
             self.vr_mode,
             metadata,
             self.input_video,
             projection=self.vr_projection,
         )
-        self._job_detection_model = (
+        self.job_detection_model = (
             SbsDetectionAdapter(self.detection_model)
-            if self._vr_resolution.is_sbs
+            if self.vr_resolution.is_sbs
             else self.detection_model
         )
-        self._vr_projector = (
+        self.vr_projector = (
             build_vr_projector(
-                self._vr_resolution.projection,
+                self.vr_resolution.projection,
                 eye_width=int(metadata.video_width) // 2,
                 height=int(metadata.video_height),
                 device=self.device,
             )
-            if self._vr_resolution.is_sbs
+            if self.vr_resolution.is_sbs
             else None
-        )
-
-    def close(self) -> None:
-        if hasattr(self, "detection_model") and self.detection_model is not None:
-            if hasattr(self.detection_model, "close"):
-                self.detection_model.close()
-            self.detection_model = None
-        self.restoration_pipeline = None
-
-    _ASYNC_POLL_TIMEOUT = 0.05
-
-    @staticmethod
-    def _earliest_blocking_seqs(pending_prs: dict[int, PrimaryRestoreResult]) -> set[int] | None:
-        if not pending_prs:
-            return None
-        earliest_frame = min(
-            pr.start_frame + pr.keep_start for pr in pending_prs.values()
-        )
-        return {
-            seq for seq, pr in pending_prs.items()
-            if pr.start_frame + pr.keep_start <= earliest_frame <= pr.start_frame + pr.keep_end - 1
-        }
-
-    _FLUSH_DELAY = 2.0
-    _FLUSH_RETRY_TIMEOUT = 5.0
-
-    def _run_secondary_loop(
-        self,
-        secondary_queue: FrameQueue,
-        encode_queue: FrameQueue,
-        debug_memory: PipelineDebugMemoryLogger | None = None,
-        clip_queue: FrameQueue | None = None,
-        primary_idle_event: threading.Event | None = None,
-    ) -> SecondaryLoopStats:
-        restorer: AsyncSecondaryRestorer = self.restoration_pipeline.secondary_restorer  # type: ignore[assignment]
-        pending_prs: dict[int, PrimaryRestoreResult] = {}
-        push_done = threading.Event()
-        pusher_error: list[BaseException] = []
-        last_push_time = time.monotonic()
-        flushed_since_last_push = False
-        last_flush_time = 0.0
-        pusher_stall_seconds = 0.0
-        clips_pushed = 0
-
-        def _pusher():
-            nonlocal last_push_time, flushed_since_last_push, pusher_stall_seconds, clips_pushed
-            try:
-                while True:
-                    item = secondary_queue.get()
-                    if item is _SENTINEL:
-                        break
-                    pr: PrimaryRestoreResult = item  # type: ignore[assignment]
-                    t0 = time.monotonic()
-                    seq = restorer.push_clip(
-                        pr.primary_raw,
-                        keep_start=pr.keep_start,
-                        keep_end=pr.keep_end,
-                    )
-                    push_elapsed = time.monotonic() - t0
-                    pusher_stall_seconds += push_elapsed
-                    clips_pushed += 1
-                    del pr.primary_raw
-                    pending_prs[seq] = pr
-                    last_push_time = time.monotonic()
-                    flushed_since_last_push = False
-                    if push_elapsed > 0.05:
-                        log.debug("[secondary] push_clip seq=%d took %.0fms", seq, push_elapsed * 1000)
-            except BaseException as e:
-                pusher_error.append(e)
-            finally:
-                push_done.set()
-
-        clips_popped = 0
-
-        def _forward_completed() -> int:
-            nonlocal clips_popped
-            forwarded = 0
-            for seq, frames_np in restorer.pop_completed():
-                pr = pending_prs.pop(seq)
-                batch = restorer._to_tensors(frames_np)
-                if batch.numel() > 0 and pr.frame_device.type != "cpu":
-                    batch = batch.to(pr.frame_device, non_blocking=True)
-                tensors = list(batch.unbind(0)) if batch.numel() > 0 else []
-                sr = self.restoration_pipeline.build_secondary_result(pr, tensors)
-                encode_queue.put(sr, frame_count=sr.keep_end)
-                if debug_memory is not None:
-                    debug_memory.snapshot(
-                        "secondary",
-                        f"clip={pr.track_id} frames={sr.frame_count}",
-                    )
-                forwarded += 1
-                clips_popped += 1
-            return forwarded
-
-        def _no_clips_incoming() -> bool:
-            if primary_idle_event is None or clip_queue is None:
-                return False
-            return primary_idle_event.is_set() and clip_queue.qsize() == 0
-
-        pusher_thread = threading.Thread(target=_pusher, daemon=True)
-        pusher_thread.start()
-
-        starvation_count = 0
-        starvation_seconds = 0.0
-        starvation_start: float | None = None
-
-        while not push_done.is_set():
-            if pusher_error:
-                raise pusher_error[0]
-
-            if _forward_completed() > 0:
-                if starvation_start is not None:
-                    starvation_seconds += time.monotonic() - starvation_start
-                    starvation_start = None
-                flushed_since_last_push = False
-                continue
-
-            now = time.monotonic()
-            if (
-                restorer.has_pending
-                and _no_clips_incoming()
-                and not flushed_since_last_push
-                and now - last_push_time > self._FLUSH_DELAY
-            ):
-                if starvation_start is None:
-                    starvation_start = now
-                target_seqs = self._earliest_blocking_seqs(dict(pending_prs))
-                log.debug("[secondary] starvation flush target_seqs=%s", target_seqs)
-                if restorer.flush_pending(target_seqs=target_seqs):
-                    flushed_since_last_push = True
-                    last_flush_time = now
-                starvation_count += 1
-            elif (
-                flushed_since_last_push
-                and restorer.has_pending
-                and _no_clips_incoming()
-                and now - last_flush_time > self._FLUSH_RETRY_TIMEOUT
-            ):
-                log.warning(
-                    "[secondary] flush retry: no clips forwarded for %.0fs after flush, pending=%d",
-                    now - last_flush_time, len(pending_prs),
-                )
-                flushed_since_last_push = False
-
-            time.sleep(self._ASYNC_POLL_TIMEOUT)
-
-        if starvation_start is not None:
-            starvation_seconds += time.monotonic() - starvation_start
-        pusher_thread.join()
-        if pusher_error:
-            raise pusher_error[0]
-        restorer.flush_all()
-        for _ in range(100):
-            if not pending_prs:
-                break
-            _forward_completed()
-            if pending_prs:
-                time.sleep(self._ASYNC_POLL_TIMEOUT)
-        return SecondaryLoopStats(
-            starvation_flushes=starvation_count,
-            starvation_seconds=starvation_seconds,
-            pusher_stall_seconds=pusher_stall_seconds,
-            clips_pushed=clips_pushed,
-            clips_popped=clips_popped,
         )
 
     def _run_pass(
         self,
         *,
         metadata,
-        encoder_ctx: NvidiaVideoEncoder,
+        encoder_ctx: VideoEncoder,
         progress: Progressbar,
         seek_ts: float | None = None,
         end_pts: int | None = None,
         effect_ranges: tuple[tuple[int, int], ...] | None = None,
         output_frame_count: int | None = None,
     ) -> None:
-        device = self.device
-        secondary_workers = max(1, int(self.restoration_pipeline.secondary_num_workers))
         frame_rate = resolve_frame_rate_retarget(
             metadata.video_fps_exact,
             enabled=self.retarget_high_fps,
@@ -359,177 +174,40 @@ class Pipeline:
         if output_frame_count is None:
             output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
 
-        clip_queue = FrameQueue(max_frames=self.max_clip_size)
-        secondary_queue = FrameQueue(max_frames=self.max_clip_size * secondary_workers)
-        encode_queue = FrameQueue(max_frames=self.max_clip_size)
-        metadata_queue: Queue[FrameMeta | object] = Queue(maxsize=self.max_clip_size * 5)
-
-        error_holder: list[BaseException] = []
-        blend_buffer = BlendBuffer(device=device, vr_projector=self._vr_projector)
-        crop_buffers: dict[int, CropBuffer] = {}
-        crop_lock = threading.Lock()
-        primary_idle_event = threading.Event()
-        frame_shape: list[tuple[int, int]] = []
-
         encode_heartbeat: list[float] = [time.monotonic()]
         frame_writer = _OfflineFrameWriter(encoder_ctx, encode_heartbeat)
-        vram_offloader = VramOffloader(
-            device=device,
-            blend_buffer=blend_buffer,
-            crop_buffers=crop_buffers,
-            crop_lock=crop_lock,
-        )
-        vram_offloader.set_encode_heartbeat(encode_heartbeat)
-        vram_offloader.set_pipeline_queues(clip_queue, secondary_queue, encode_queue, metadata_queue)
-
-        debug_memory = PipelineDebugMemoryLogger(
-            logger=log,
-            blend_buffer=blend_buffer,
-            clip_queue=clip_queue,
-            secondary_queue=secondary_queue,
-            encode_queue=encode_queue,
-        )
-
-        starvation_stats = SecondaryLoopStats()
-
-        def _async_secondary_thread():
-            nonlocal starvation_stats
-            try:
-                torch.cuda.set_device(device)
-                starvation_stats = self._run_secondary_loop(secondary_queue, encode_queue, debug_memory, clip_queue, primary_idle_event)
-            except BaseException as e:
-                log.exception("[secondary-async] thread crashed")
-                error_holder.append(e)
-            finally:
-                encode_queue.put(_SENTINEL)
-
-        use_async_secondary = isinstance(self.restoration_pipeline.secondary_restorer, AsyncSecondaryRestorer)
-        if use_async_secondary:
-            log.debug("Using async secondary restore path")
-            secondary_target = _async_secondary_thread
-        else:
-            secondary_target = lambda: secondary_restore_loop(
-                device=device,
-                restoration_pipeline=self.restoration_pipeline,
-                secondary_queue=secondary_queue,
-                encode_queue=encode_queue,
-                error_holder=error_holder,
-                debug_memory=debug_memory,
-                cancel_event=self._cancel_event,
-            )
-
-        threads = [
-            threading.Thread(
-                target=lambda: decode_detect_loop(
-                    input_video=str(self.input_video),
-                    batch_size=self.batch_size,
-                    device=device,
-                    metadata=metadata,
-                    detection_model=self._job_detection_model,
-                    max_clip_size=self.max_clip_size,
-                    temporal_overlap=self.temporal_overlap,
-                    max_detection_gap=self.max_detection_gap,
-                    min_detection_duration=self.min_detection_duration,
-                    enable_crossfade=self.enable_crossfade,
-                    scene_detection=self.scene_detection,
-                    blend_buffer=blend_buffer,
-                    crop_buffers=crop_buffers,
-                    clip_queue=clip_queue,
-                    metadata_queue=metadata_queue,
-                    error_holder=error_holder,
-                    frame_shape=frame_shape,
-                    progress=progress,
-                    close_progress=False,
-                    seek_ts=seek_ts,
-                    end_pts=end_pts,
-                    effect_ranges=effect_ranges,
-                    debug_memory=debug_memory,
-                    frame_stride=frame_rate.frame_stride,
-                    output_frame_count=output_frame_count,
-                    output_fps=float(frame_rate.output_fps),
-                    vr_mode=self._vr_resolution.resolved,
-                    vr_projector=self._vr_projector,
-                    cancel_event=self._cancel_event,
-                ),
-                name="DecodeDetect", daemon=True,
-            ),
-            threading.Thread(
-                target=lambda: primary_restore_loop(
-                    device=device,
-                    restoration_pipeline=self.restoration_pipeline,
-                    clip_queue=clip_queue,
-                    secondary_queue=secondary_queue,
-                    error_holder=error_holder,
-                    primary_idle_event=primary_idle_event,
-                    debug_memory=debug_memory,
-                    cancel_event=self._cancel_event,
-                ),
-                name="PrimaryRestore", daemon=True,
-            ),
-            threading.Thread(target=secondary_target, name="SecondaryRestore", daemon=True),
-            threading.Thread(
-                target=lambda: blend_encode_loop(
-                    input_video=str(self.input_video),
-                    batch_size=self.batch_size,
-                    device=device,
-                    metadata=metadata,
-                    blend_buffer=blend_buffer,
-                    encode_queue=encode_queue,
-                    metadata_queue=metadata_queue,
-                    error_holder=error_holder,
-                    frame_writer=frame_writer,
-                    vram_offloader=vram_offloader,
-                    frame_stride=frame_rate.frame_stride,
-                    seek_ts=seek_ts,
-                    cancel_event=self._cancel_event,
-                ),
-                name="BlendEncode", daemon=True,
-            ),
-        ]
-        vram_offloader.start()
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        vram_offloader.stop()
-        frame_writer.close()
-
-        _process = psutil.Process(os.getpid())
         try:
-            free, total = torch.cuda.mem_get_info(device)
-            vram_used = total - free
-            log.info("VRAM usage at end — %.1f MiB", vram_used / (1024 ** 2))
-        except Exception:
-            log.debug("Could not read end-of-run VRAM usage", exc_info=True)
-        try:
-            rss = _process.memory_info().rss
-            log.info("RAM usage at end — %.1f MiB", rss / (1024 ** 2))
-        except Exception:
-            log.debug("Could not read end-of-run RAM usage", exc_info=True)
-
-        ss = starvation_stats
-        if ss.clips_pushed > 0 or ss.clips_popped > 0:
-            log.info(
-                "Secondary — clips: %d pushed / %d popped, pusher stall: %.1fs, starvation flushes: %d (%.1fs)",
-                ss.clips_pushed, ss.clips_popped, ss.pusher_stall_seconds, ss.starvation_flushes, ss.starvation_seconds,
+            error = run_restoration_pass(
+                self,
+                metadata,
+                frame_writer,
+                self._cancel_event,
+                seek_ts=seek_ts,
+                use_async_secondary=isinstance(
+                    self.restoration_pipeline.secondary_restorer, AsyncSecondaryRestorer
+                ),
+                end_pts=end_pts,
+                effect_ranges=effect_ranges,
+                frame_stride=frame_rate.frame_stride,
+                output_frame_count=output_frame_count,
+                output_fps=float(frame_rate.output_fps),
+                progress=progress,
+                encode_heartbeat=encode_heartbeat,
             )
+        finally:
+            frame_writer.close()
 
-        err = error_holder[0] if error_holder else None
-        if err is not None:
-            err.__traceback__ = None
+        self._log_memory_at_end()
+        if error is not None:
+            error.__traceback__ = None
+            raise error
 
-        del clip_queue, secondary_queue, encode_queue, metadata_queue
-        del blend_buffer, crop_buffers
-        del error_holder, threads
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-        torch.cuda.reset_peak_memory_stats(self.device)
+    def _log_memory_at_end(self) -> None:
+        free, total = torch.cuda.mem_get_info(self.device)
+        log.info("VRAM usage at end — %.1f MiB", (total - free) / (1024 ** 2))
+        log.info("RAM usage at end — %.1f MiB", psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2))
 
-        if err is not None:
-            raise err
-
-    def _validate_metadata(self, metadata) -> None:
+    def validate_metadata(self, metadata) -> None:
         from av.video.reformatter import Colorspace as AvColorspace
 
         if metadata.color_space not in (
@@ -537,12 +215,12 @@ class Pipeline:
             AvColorspace.ITU601,
             AvColorspace.BT2020,
         ):
-            raise UnsupportedColorspaceError(
+            raise UnsupportedVideoError(
                 f"Unsupported color space: {metadata.color_space!r} in {self.input_video.name}. "
                 "Only BT.709, BT.601, and BT.2020 non-constant-luminance are supported."
             )
 
-    def _run_full(self, metadata) -> None:
+    def _resolve_frame_rate(self, metadata):
         frame_rate = resolve_frame_rate_retarget(
             metadata.video_fps_exact,
             enabled=self.retarget_high_fps,
@@ -567,19 +245,15 @@ class Pipeline:
                 "Frame-rate retargeting requested, but %s fps is not a supported source rate; keeping source rate",
                 frame_rate.source_fps,
             )
-        output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
-        progress = Progressbar(
-            total_frames=output_frame_count,
-            video_fps=float(frame_rate.output_fps),
-            disable=self.disable_progress,
-            callback=self.progress_callback,
-        )
-        if self.fmp4 and self.output_video.suffix.lower() not in {".mp4", ".mov"}:
+        return frame_rate
+
+    def _video_encoder(self, metadata, frame_rate) -> VideoEncoder:
+        if self.fmp4 and self.output_video.suffix.lower() not in MOV_SUFFIXES:
             log.info(
                 "Fragmented MP4 has no effect on %s output; it is already playable while it grows",
                 self.output_video.suffix,
             )
-        encoder_ctx = NvidiaVideoEncoder(
+        return VideoEncoder(
             str(self.output_video),
             device=self.device,
             metadata=metadata,
@@ -590,15 +264,169 @@ class Pipeline:
             output_fps=frame_rate.output_fps,
             fmp4=self.fmp4,
         )
+
+    def _run_full(
+        self, metadata, *, effect_ranges: tuple[tuple[int, int], ...] | None = None
+    ) -> None:
+        frame_rate = self._resolve_frame_rate(metadata)
+        output_frame_count = frame_rate.output_frame_count(metadata.num_frames)
+        progress = Progressbar(
+            total_frames=output_frame_count,
+            video_fps=float(frame_rate.output_fps),
+            disable=self.disable_progress,
+            callback=self.progress_callback,
+        )
+        encoder_ctx = self._video_encoder(metadata, frame_rate)
         try:
             self._run_pass(
                 metadata=metadata,
                 encoder_ctx=encoder_ctx,
                 progress=progress,
+                effect_ranges=effect_ranges,
                 output_frame_count=output_frame_count,
             )
         finally:
             progress.close(ensure_completed_bar=True)
+
+    def _ltx_progress(self, frames: int, callback: ProgressCallback | None):
+        from jasna.ltx.restore import Progress
+
+        report = None
+        if callback is not None:
+            report = lambda fraction, eta, stage: callback(fraction * 100.0, 0.0, eta, 0, 0, stage)
+        return Progress(frames, disable=self.disable_progress, report=report)
+
+    def _run_ltx(self, metadata) -> None:
+        from jasna.ltx.restore import Cancelled, restore_video, video_frames
+        from jasna.ltx.speed import profile_path
+
+        require_ltx_input(self.vr_resolution)
+        frame_rate = self._resolve_frame_rate(metadata)
+        writer = _OfflineFrameWriter(self._video_encoder(metadata, frame_rate), [time.monotonic()])
+        try:
+            restore_video(
+                video_frames(
+                    self.input_video,
+                    metadata,
+                    batch_size=self.batch_size,
+                    device=self.device,
+                    frame_stride=frame_rate.frame_stride,
+                    seek_ts=None,
+                    end_pts=None,
+                ),
+                writer,
+                detector=self.job_detection_model,
+                files=self.ltx_files,
+                frame_h=int(metadata.video_height),
+                frame_w=int(metadata.video_width),
+                batch_size=self.batch_size,
+                large_canvas=self.ltx_large_canvas,
+                window_hop=self.ltx_window_hop,
+                seed=self.ltx_seed,
+                device=self.device,
+                work_dir=self.working_dir or self.output_video.parent,
+                speed_profile=profile_path(),
+                progress=self._ltx_progress(
+                    frame_rate.output_frame_count(metadata.num_frames), self.progress_callback
+                ),
+                cancel=self._cancel_event,
+            )
+        except Cancelled:
+            log.info("LTX restoration cancelled")
+        finally:
+            writer.close()
+        self._log_memory_at_end()
+
+    def ltx_segment_render(self, metadata) -> "LtxRender":
+        """How LTX restores segments: the 768 px decision and the decode tiles follow the
+        GPU's size, never the VRAM free at that moment, so a segment renders the same in a
+        job and in a seed preview."""
+        from jasna.ltx.restore import LtxRender, segment_decode_budget, segment_large_canvas
+        from jasna.ltx.speed import profile_path
+
+        require_ltx_input(self.vr_resolution)
+        total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        return LtxRender(
+            detector=self.job_detection_model,
+            files=self.ltx_files,
+            frame_h=int(metadata.video_height),
+            frame_w=int(metadata.video_width),
+            batch_size=self.batch_size,
+            large_canvas=segment_large_canvas(self.ltx_large_canvas, total_bytes),
+            window_hop=self.ltx_window_hop,
+            budget=segment_decode_budget(total_bytes),
+            budget_name="segment",
+            device=self.device,
+            speed_profile=profile_path(),
+        )
+
+    def ltx_span(
+        self,
+        metadata,
+        index: KeyframeIndex,
+        span: SpliceSpan,
+        segments: tuple[SegmentRange, ...],
+        open_writer: Callable[[], "FrameWriter"],
+    ) -> "LtxSpan":
+        """The LTX work of one render span: decoded from its keyframe, one LTX segment per
+        effect range with that range's seed."""
+        from jasna.ltx.restore import LtxSegment, LtxSpan, video_frames
+
+        return LtxSpan(
+            video_frames(
+                self.input_video,
+                metadata,
+                batch_size=self.batch_size,
+                device=self.device,
+                frame_stride=1,
+                seek_ts=index.seconds_for_pts(span.start_pts),
+                end_pts=span.end_pts,
+            ),
+            tuple(
+                LtxSegment(start, end, segment.restoration.ltx_seed)
+                for (start, end), segment in zip(span.effect_ranges, segments)
+            ),
+            open_writer,
+        )
+
+    def _ltx_estimate_seconds(self, metadata, frames: int) -> float:
+        """About how long LTX takes on ``frames``, before its scan has planned them."""
+        from jasna.ltx.speed import profile_path, segment_estimate_seconds
+
+        return segment_estimate_seconds(
+            profile_path(),
+            torch.cuda.get_device_name(self.device),
+            self.ltx_files.transformer_name,
+            frames=frames,
+            fps=metadata.video_fps,
+            megapixels=metadata.video_height * metadata.video_width / 1e6,
+            window_hop=self.ltx_window_hop,
+        )
+
+    def _run_ltx_spans(
+        self,
+        metadata,
+        index: KeyframeIndex,
+        spans: list[tuple[SpliceSpan, tuple[SegmentRange, ...], Callable[[], _OfflineFrameWriter]]],
+        work_dir: Path,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        """Restore the LTX render spans in one batched run, so every model loads once."""
+        from jasna.ltx.restore import Cancelled, restore_spans
+
+        render = self.ltx_segment_render(metadata)
+        frames = sum(_span_frames(span, index, metadata) for span, _, _ in spans)
+        try:
+            restore_spans(
+                [self.ltx_span(metadata, index, span, segments, open_writer) for span, segments, open_writer in spans],
+                render,
+                work_dir=work_dir,
+                progress=self._ltx_progress(frames, progress_callback),
+                cancel=self._cancel_event,
+            )
+        except Cancelled:
+            log.info("LTX restoration cancelled")
+        self._log_memory_at_end()
 
     def _run_smart(self, metadata) -> None:
         codec = validate_smart_render(
@@ -615,6 +443,38 @@ class Pipeline:
             if plan.segments != tuple(self.segments or ()):
                 raise ValueError("Precomputed splice plan does not match pipeline segments")
             index = plan.index
+        default = job_restoration(self.restoration_model_name, self.ltx_seed)
+        segments_of = {
+            span: resolve_restorations(segments, default)
+            for span, segments in zip(plan.render_spans, plan.render_span_segments())
+        }
+        for segments in segments_of.values():
+            require_one_model(segments)
+        ltx_spans = {span for span, segments in segments_of.items() if segments[0].restoration.model == "ltx"}
+        # AMF's H.264 encoder caps at 3 consecutive B-frames, so it cannot
+        # match sources using more; re-render segments would not stitch
+        # cleanly against the stream-copied ones. Fall back to a full
+        # re-encode instead of failing the job (NVIDIA NVENC has no such cap).
+        if (
+            vendor_for_device(self.device) is AcceleratorVendor.AMD
+            and codec == "h264"
+            and index.max_b_frames > 3
+        ):
+            log.warning(
+                "%s uses %d consecutive B-frames; AMF H.264 smart rendering supports "
+                "at most 3, falling back to a full re-encode",
+                self.input_video,
+                index.max_b_frames,
+            )
+            self._run_full(
+                metadata,
+                effect_ranges=tuple(
+                    effect_range
+                    for span in plan.render_spans
+                    for effect_range in span.effect_ranges
+                ),
+            )
+            return
         smart_encoder_settings = resolve_smart_encoder_settings(
             codec,
             metadata,
@@ -622,18 +482,22 @@ class Pipeline:
             self.encoder_settings,
             vendor=vendor_for_device(self.device),
         )
-        total_frames = max(
-            1,
-            sum(
-                round((span.end_pts - span.start_pts) * index.time_base * metadata.video_fps)
-                for span in plan.render_spans
-            ),
+        standard_frames = sum(
+            _span_frames(span, index, metadata) for span in plan.render_spans if span not in ltx_spans
         )
+        ltx_callback = standard_callback = self.progress_callback
+        if self.progress_callback is not None and ltx_spans and standard_frames:
+            ltx_frames = sum(_span_frames(span, index, metadata) for span in ltx_spans)
+            job_progress = JobProgress(
+                self.progress_callback,
+                {"standard": 0.0, "ltx": self._ltx_estimate_seconds(metadata, ltx_frames)},
+            )
+            standard_callback, ltx_callback = job_progress.part("standard"), job_progress.part("ltx")
         progress = Progressbar(
-            total_frames=total_frames,
+            total_frames=max(1, standard_frames),
             video_fps=metadata.video_fps,
             disable=self.disable_progress,
-            callback=self.progress_callback,
+            callback=standard_callback,
         )
         self.output_video.parent.mkdir(parents=True, exist_ok=True)
         work_root = self.working_dir or self.output_video.parent
@@ -647,43 +511,68 @@ class Pipeline:
                 temp_dir = Path(temp_dir_name)
                 fragments: list[tuple[Path, float]] = []
                 fragment_suffix = ".ts" if codec in {"h264", "hevc"} else ".mkv"
+
+                def raw_path(span_index: int) -> Path:
+                    return temp_dir / f"{span_index:04d}-raw.nut"
+
+                def fragment_encoder(span_index: int, span: SpliceSpan) -> VideoEncoder:
+                    return VideoEncoder(
+                        str(raw_path(span_index)),
+                        device=self.device,
+                        metadata=metadata,
+                        codec=codec,
+                        encoder_settings=smart_encoder_settings,
+                        lut_path=self.lut_path,
+                        sharpen_strength=self.sharpen_strength,
+                        output_fps=metadata.video_fps_exact,
+                        pts_origin=span.start_pts,
+                        smart_fragment=True,
+                    )
+
+                def fragment_writer(span_index: int, span: SpliceSpan) -> Callable[[], _OfflineFrameWriter]:
+                    return lambda: _OfflineFrameWriter(fragment_encoder(span_index, span), [time.monotonic()])
+
+                def duration(span: SpliceSpan) -> float:
+                    return float((span.end_pts - span.start_pts) * index.time_base)
+
                 for span_index, span in enumerate(plan.spans):
                     if self._cancel_event.is_set():
                         return
-                    raw = temp_dir / f"{span_index:04d}-raw.nut"
-                    normalized = temp_dir / f"{span_index:04d}{fragment_suffix}"
-                    duration = float((span.end_pts - span.start_pts) * index.time_base)
-                    if span.is_render:
-                        encoder_ctx = NvidiaVideoEncoder(
-                            str(raw),
-                            device=self.device,
-                            metadata=metadata,
-                            codec=codec,
-                            encoder_settings=smart_encoder_settings,
-                            lut_path=self.lut_path,
-                            sharpen_strength=self.sharpen_strength,
-                            output_fps=metadata.video_fps_exact,
-                            mux_audio=False,
-                            pts_origin=span.start_pts,
-                            match_input_bit_depth=True,
-                            smart_fragment=True,
-                        )
+                    if not span.is_render:
+                        create_copy_fragment(self.input_video, span, index, raw_path(span_index), codec=codec)
+                    elif span not in ltx_spans:
                         self._run_pass(
                             metadata=metadata,
-                            encoder_ctx=encoder_ctx,
+                            encoder_ctx=fragment_encoder(span_index, span),
                             progress=progress,
                             seek_ts=index.seconds_for_pts(span.start_pts),
                             end_pts=span.end_pts,
                             effect_ranges=span.effect_ranges,
-                            output_frame_count=max(1, round(duration * metadata.video_fps)),
+                            output_frame_count=max(1, round(duration(span) * metadata.video_fps)),
                         )
-                    else:
-                        create_copy_fragment(self.input_video, span, index, raw, codec=codec)
-                    normalize_fragment(raw, normalized, codec=codec)
-                    fragments.append((normalized, duration))
-
+                if ltx_spans:
+                    self._run_ltx_spans(
+                        metadata,
+                        index,
+                        [
+                            (
+                                span,
+                                segments_of[span],
+                                fragment_writer(span_index, span),
+                            )
+                            for span_index, span in enumerate(plan.spans)
+                            if span in ltx_spans
+                        ],
+                        work_root,
+                        ltx_callback,
+                    )
                 if self._cancel_event.is_set():
                     return
+                for span_index, span in enumerate(plan.spans):
+                    normalized = temp_dir / f"{span_index:04d}{fragment_suffix}"
+                    normalize_fragment(raw_path(span_index), normalized, codec=codec)
+                    fragments.append((normalized, duration(span)))
+
                 assembled = temp_dir / f"assembled{fragment_suffix}"
                 concatenate_fragments(
                     fragments,
@@ -702,7 +591,7 @@ class Pipeline:
 
     def run(self) -> None:
         metadata = get_video_meta_data(str(self.input_video))
-        self._validate_metadata(metadata)
+        self.validate_metadata(metadata)
         self.configure_vr(metadata)
         if self.segments:
             if self.fmp4:
@@ -712,17 +601,8 @@ class Pipeline:
                 )
                 self.fmp4 = False
             self._run_smart(metadata)
+        elif self.restoration_model_name == "ltx":
+            self._run_ltx(metadata)
         else:
             self._run_full(metadata)
         self.completed = not self._cancel_event.is_set()
-
-    def run_streaming(
-        self,
-        port: int = 8765,
-        segment_duration: float = 4.0,
-        hls_server=None,
-    ) -> None:
-        if self.segments:
-            raise ValueError("Segment processing is not supported in streaming mode")
-        from jasna.streaming_pipeline import run_streaming
-        run_streaming(self, port=port, segment_duration=segment_duration, hls_server=hls_server)

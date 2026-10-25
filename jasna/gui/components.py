@@ -5,15 +5,53 @@ import tkinter
 import customtkinter as ctk
 import webbrowser
 from jasna.gui import scaling
+from jasna.gui.branding import create_xianyu_qr_image
+from jasna.gui import activation_worker
+from jasna.gui.queues import MainThreadCalls
 from jasna.gui.theme import Colors, Fonts, Sizing
-from jasna.gui.locales import t
+from jasna.gui.locales import get_locale, t
+from jasna.license_api import protection_available
 
 logger = logging.getLogger(__name__)
 
 
-# Support page URLs — two ways to back the project
 BMC_URL = "https://buymeacoffee.com/Kruk2"
 UNIFANS_URL = "https://app.unifans.io/c/kruk2"
+
+
+_MODAL_BINDTAG = "JasnaModal"
+
+
+def grab_modal(dialog) -> None:
+    """Make a toplevel modal and focused; X11 refuses a grab until the window is viewable.
+
+    A modal hidden by Win+D would otherwise keep its grab invisibly, so it reappears on focus.
+    """
+    if not dialog.winfo_viewable():
+        dialog.wait_visibility()
+    dialog.grab_set()
+    dialog.lift()
+    dialog.focus_force()
+    bindtags = dialog.bindtags()
+    if _MODAL_BINDTAG not in bindtags:
+        dialog.bindtags((_MODAL_BINDTAG, *bindtags))
+    if not dialog.bind_class(_MODAL_BINDTAG, "<FocusIn>"):
+        dialog.bind_class(_MODAL_BINDTAG, "<FocusIn>", _restore_hidden_modal)
+
+
+def _restore_hidden_modal(event) -> None:
+    if not event.widget.winfo_ismapped():
+        event.widget.deiconify()
+
+
+def format_duration(seconds: float) -> str:
+    mins, secs = divmod(int(seconds), 60)
+    hours, mins = divmod(mins, 60)
+    if hours:
+        return f"{hours}h {mins}m"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
 
 
 class Tooltip:
@@ -75,36 +113,35 @@ class Tooltip:
 
 
 class _SupportButton(ctk.CTkButton):
-    """Brand-styled button that opens a support page and scales 1.05x on hover."""
+    """Brand-styled support button that scales 1.05x on hover."""
 
-    def __init__(self, master, text: str, url: str, fg_color: str, text_color: str, width: int, **kwargs):
+    def __init__(self, master, text: str, command, fg_color: str, text_color: str, width: int, height: int):
         super().__init__(
             master,
             text=text,
             font=(Fonts.FAMILY, Fonts.SIZE_SMALL, "bold"),
             fg_color=fg_color,
-            hover_color=fg_color,  # Keep same, we scale on hover
+            hover_color=fg_color,
             text_color=text_color,
             corner_radius=6,
-            height=28,
+            height=height,
             width=width,
-            command=lambda: webbrowser.open(url),
-            **kwargs
+            command=command,
         )
 
         self._original_width = width
-        self._original_height = 28
+        self._original_height = height
 
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
+        self.bind("<Enter>", self._grow_on_hover)
+        self.bind("<Leave>", self._restore_size)
 
-    def _on_enter(self, event=None):
+    def _grow_on_hover(self, event=None):
         self.configure(
             width=int(self._original_width * 1.05),
             height=int(self._original_height * 1.05),
         )
 
-    def _on_leave(self, event=None):
+    def _restore_size(self, event=None):
         self.configure(width=self._original_width, height=self._original_height)
 
 
@@ -135,50 +172,85 @@ def attach_entry_context_menu(entry: ctk.CTkEntry) -> tkinter.Menu:
 
 
 class BuyMeCoffeeButton(_SupportButton):
-    """Buy Me a Coffee button with brand styling and hover animation."""
-
-    def __init__(self, master, compact: bool = False, **kwargs):
-        if compact:
-            text, width = "BMC", 50
-        else:
-            text, width = t("bmc_support"), 100
+    def __init__(self, master, width: int, height: int):
         super().__init__(
-            master, text=text, url=BMC_URL,
-            fg_color=Colors.BMC_YELLOW, text_color=Colors.BMC_TEXT, width=width, **kwargs,
+            master, text=t("bmc_support"), command=lambda: webbrowser.open(BMC_URL),
+            fg_color=Colors.BMC_YELLOW, text_color=Colors.BMC_TEXT, width=width, height=height,
         )
 
 
 class UnifansButton(_SupportButton):
-    """Unifans button — the other way to support the project, shown next to Buy Me a Coffee."""
-
-    def __init__(self, master, compact: bool = False, **kwargs):
-        if compact:
-            text, width = "Unifans", 70
-        else:
-            text, width = t("unifans_support"), 110
+    def __init__(self, master, width: int, height: int):
         super().__init__(
-            master, text=text, url=UNIFANS_URL,
-            fg_color=Colors.UNIFANS_PURPLE, text_color=Colors.UNIFANS_TEXT, width=width, **kwargs,
+            master, text=t("unifans_support"), command=lambda: webbrowser.open(UNIFANS_URL),
+            fg_color=Colors.UNIFANS_PURPLE, text_color=Colors.UNIFANS_TEXT, width=width, height=height,
         )
 
 
+class XianyuButton(_SupportButton):
+    """Xianyu has no web link to the listing, so the button shows its QR code."""
+
+    def __init__(self, master, width: int, height: int):
+        super().__init__(
+            master, text=t("xianyu_support"), command=lambda: XianyuQrDialog(self.winfo_toplevel()),
+            fg_color=Colors.XIANYU_YELLOW, text_color=Colors.XIANYU_TEXT, width=width, height=height,
+        )
+
+
+class XianyuQrDialog(ctk.CTkToplevel):
+    def __init__(self, master):
+        super().__init__(master)
+        self.title(t("xianyu_dialog_title"))
+        self.configure(fg_color=Colors.BG_MAIN)
+        self.resizable(False, False)
+        self.transient(master)
+
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=20)
+        self.qr_label = ctk.CTkLabel(content, text="", image=create_xianyu_qr_image())
+        self.qr_label.pack(pady=(0, 12))
+        ctk.CTkLabel(
+            content,
+            text=t("xianyu_scan_hint"),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            text_color=Colors.TEXT_PRIMARY,
+            wraplength=280,
+            justify="left",
+        ).pack(pady=(0, 16))
+        ctk.CTkButton(
+            content,
+            text=t("btn_close"),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            fg_color=Colors.BG_CARD,
+            hover_color=Colors.BORDER_LIGHT,
+            text_color=Colors.TEXT_PRIMARY,
+            command=self.destroy,
+        ).pack()
+
+        self.update_idletasks()
+        scaling.place_centered_on_parent(self, master, self.winfo_reqwidth(), self.winfo_reqheight())
+        grab_modal(self)
+
+
+def shows_xianyu_seller(language: str) -> bool:
+    return language == "zh"
+
+
 class LicenseDialog(ctk.CTkToplevel):
-    """Modal popup to enter the supporter email + license key. Persisted by
-    license_store (in the user config dir); on success calls on_activated so the
-    header chip can refresh."""
+    """Activate online or save a manually issued offline Activation key."""
 
     def __init__(self, master, on_activated):
         super().__init__(master)
+        self._closed = False
+        self._busy = True
         self._on_activated = on_activated
+        self._main_thread = MainThreadCalls(self, 50)
 
         self.title(t("supporter_title"))
         self.resizable(False, False)
         self.configure(fg_color=Colors.BG_MAIN)
         self.transient(master)
-        self.wait_visibility()  # X11: window must be viewable before grab_set, else TclError
-        self.grab_set()
-        self.lift()
-        self.focus_force()
+        grab_modal(self)
 
         outer = ctk.CTkFrame(self, fg_color="transparent")
         outer.pack(fill="both", expand=True, padx=24, pady=24)
@@ -189,68 +261,257 @@ class LicenseDialog(ctk.CTkToplevel):
         ).pack(anchor="w", pady=(0, 6))
         ctk.CTkLabel(
             outer, text=t("supporter_blurb"), text_color=Colors.TEXT_PRIMARY,
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=340, justify="left",
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=460, justify="left",
         ).pack(anchor="w", pady=(0, 2))
         ctk.CTkLabel(
             outer, text=t("supporter_perks"), text_color=Colors.TEXT_PRIMARY,
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=340, justify="left",
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=460, justify="left",
         ).pack(anchor="w", pady=(0, 10))
         ctk.CTkLabel(
-            outer, text=t("license_crypto_info"), text_color=Colors.STATUS_PENDING,
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=340, justify="left",
+            outer, text=t("license_official_sellers"), text_color=Colors.STATUS_PENDING,
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=460, justify="left",
         ).pack(anchor="w", pady=(0, 10))
 
-        self._email = ctk.CTkEntry(
-            outer, width=340, fg_color=Colors.BG_PANEL, border_color=Colors.BORDER,
-            text_color=Colors.TEXT_PRIMARY, placeholder_text=t("license_email_placeholder"),
+        ctk.CTkLabel(
+            outer, text=t("license_machine_key"), text_color=Colors.TEXT_PRIMARY,
+        ).pack(anchor="w")
+        machine_row = ctk.CTkFrame(outer, fg_color="transparent")
+        machine_row.pack(fill="x", pady=(0, 10))
+        self._machine = ctk.CTkEntry(
+            machine_row, width=370, fg_color=Colors.BG_PANEL, border_color=Colors.BORDER,
+            text_color=Colors.TEXT_PRIMARY, state="readonly",
         )
-        self._email.pack(fill="x", pady=(0, 6))
-        attach_entry_context_menu(self._email)
+        self._machine.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        attach_entry_context_menu(self._machine)
+        self._copy = ctk.CTkButton(
+            machine_row, text=t("ctx_copy"), width=80,
+            command=self._copy_machine_key, state="disabled",
+        )
+        self._copy.pack(side="right")
+        self._method = ctk.CTkSegmentedButton(
+            outer, values=[t("license_online"), t("license_manual")],
+            command=self._select_method, state="disabled",
+        )
+        self._method.set(t("license_online"))
+        self._method.pack(fill="x", pady=(0, 10))
+
+        self._online_frame = ctk.CTkFrame(outer, fg_color="transparent")
+        self._online_frame.pack(fill="x")
+        ctk.CTkLabel(
+            self._online_frame, text=t("license_code"), text_color=Colors.TEXT_PRIMARY,
+        ).pack(anchor="w")
+        self._code = ctk.CTkEntry(
+            self._online_frame, width=460, fg_color=Colors.BG_PANEL, border_color=Colors.BORDER,
+            text_color=Colors.TEXT_PRIMARY, placeholder_text=t("license_code"),
+        )
+        self._code.pack(fill="x", pady=(0, 10))
+        attach_entry_context_menu(self._code)
+        self._online_activate_button = ctk.CTkButton(
+            self._online_frame, text=t("license_activate_online"),
+            fg_color=Colors.PRIMARY, hover_color=Colors.PRIMARY_HOVER,
+            command=self._activate_online, state="disabled",
+        )
+        self._online_activate_button.pack(anchor="w")
+        ctk.CTkLabel(
+            self._online_frame, text=t("license_online_hint"), text_color=Colors.TEXT_PRIMARY,
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=460, justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        self._manual_frame = ctk.CTkFrame(outer, fg_color="transparent")
+        ctk.CTkLabel(
+            self._manual_frame, text=t("license_activation_steps"), text_color=Colors.TEXT_PRIMARY,
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL), wraplength=460, justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        ctk.CTkLabel(
+            self._manual_frame, text=t("license_activation_key"), text_color=Colors.TEXT_PRIMARY,
+        ).pack(anchor="w")
         self._key = ctk.CTkEntry(
-            outer, width=340, fg_color=Colors.BG_PANEL, border_color=Colors.BORDER,
-            text_color=Colors.TEXT_PRIMARY, placeholder_text=t("license_key_placeholder"),
+            self._manual_frame, width=460, fg_color=Colors.BG_PANEL, border_color=Colors.BORDER,
+            text_color=Colors.TEXT_PRIMARY, placeholder_text=t("license_activation_key"),
         )
         self._key.pack(fill="x", pady=(0, 10))
         attach_entry_context_menu(self._key)
 
-        action = ctk.CTkFrame(outer, fg_color="transparent")
+        action = ctk.CTkFrame(self._manual_frame, fg_color="transparent")
         action.pack(fill="x")
-        ctk.CTkButton(
+        self._activate_button = ctk.CTkButton(
             action, text=t("license_activate"), width=110,
             fg_color=Colors.PRIMARY, hover_color=Colors.PRIMARY_HOVER, text_color=Colors.TEXT_PRIMARY,
-            command=self._activate,
-        ).pack(side="left")
-        self._status = ctk.CTkLabel(action, text="", text_color=Colors.TEXT_PRIMARY)
-        self._status.pack(side="left", padx=10)
+            command=self._activate, state="disabled",
+        )
+        self._activate_button.pack(side="left")
+        self._activation_page_button = ctk.CTkButton(
+            action, text=t("license_activation_page"), width=180,
+            command=self._open_activation_page,
+        )
+        self._activation_page_button.pack(side="left", padx=(12, 0))
+        self._status = ctk.CTkLabel(
+            outer, text="", text_color=Colors.TEXT_PRIMARY,
+            wraplength=460, justify="left",
+        )
+        self._status.pack(anchor="w", pady=(6, 0))
+        if protection_available():
+            activation_worker.start_license_info(
+                lambda info, error: self._post_result(self._loaded, info, error)
+            )
+        else:
+            self._set_busy(True, lock_inputs=True)
+            self._activation_page_button.configure(state="disabled")
+            self._show_error(t("license_source_unavailable"))
 
-        from jasna.protection import license_store
-        stored = license_store.load_license()
-        if stored:
-            self._email.insert(0, stored[0])
-            self._key.insert(0, stored[1])
-            if license_store.is_licensed():
-                self._status.configure(text=t("license_active"), text_color=Colors.STATUS_COMPLETED)
+        self._resize()
 
+    def _open_activation_page(self):
+        from jasna.protection.activation import activation_urls
+
+        webbrowser.open(activation_urls(get_locale().current_language == "zh")[0])
+
+    def _select_method(self, method):
+        self._online_frame.pack_forget()
+        self._manual_frame.pack_forget()
+        frame = self._online_frame if method == t("license_online") else self._manual_frame
+        frame.pack(fill="x", before=self._status)
+        self._resize()
+
+    def _set_busy(self, busy, *, lock_inputs=False):
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        for widget in (self._activate_button, self._method):
+            widget.configure(state=state)
+        for widget in (self._key, self._code):
+            widget.configure(state="disabled" if busy and lock_inputs else "normal")
+        has_machine = bool(self._machine.get()) and not busy
+        self._copy.configure(state="normal" if has_machine else "disabled")
+        self._online_activate_button.configure(state="normal" if has_machine else "disabled")
+
+    def _resize(self):
         self.update_idletasks()
-        minimum_width, _ = scaling.to_physical(self, 388, 0)
+        minimum_width, _ = scaling.to_physical(self, 508, 0)
         scaling.place_centered_on_parent(
             self,
-            master,
+            self.master,
             max(minimum_width, self.winfo_reqwidth()),
             self.winfo_reqheight(),
         )
 
-    def _activate(self):
-        from jasna.protection import ProtectionError, license_store
-        email = self._email.get().strip()
-        key = self._key.get().strip()
-        try:
-            license_store.set_license(email, key)
-        except ProtectionError as exc:
-            self._status.configure(text=str(exc), text_color=Colors.STATUS_ERROR)
+    def destroy(self):
+        if self._closed:
             return
+        self._closed = True
+        self._main_thread.close()
+        super().destroy()
+
+    def _post_result(self, callback, *args):
+        if self._closed:
+            logger.debug("Ignoring worker result for closed activation dialog")
+            return
+        self._main_thread.post(lambda: callback(*args))
+
+    def _loaded(self, info, error):
+        self._set_busy(False)
+        if error is not None:
+            self._show_error(str(error))
+            self._load_machine_key()
+            return
+        key, licensed, identity = info
+        if identity is not None and identity.startswith("JW1-"):
+            self._show_error(t("license_cloud_cli_only"))
+        else:
+            if key:
+                self._key.insert(0, key)
+            if licensed:
+                self._status.configure(text=t("license_active"), text_color=Colors.STATUS_COMPLETED)
+        self._load_machine_key()
+
+    def _load_machine_key(self):
+        self._set_busy(True)
+        self._set_machine_key("")
+        activation_worker.start_machine_key(
+            lambda key, error: self._post_result(self._machine_ready, key, error),
+        )
+
+    def _machine_ready(self, key, error):
+        self._set_busy(False)
+        if error is not None:
+            logger.warning("Machine key unavailable: %s", error)
+            self._show_error(str(error))
+            return
+        self._set_machine_key(key)
+
+    def _set_machine_key(self, key):
+        self._machine.configure(state="normal")
+        self._machine.delete(0, "end")
+        self._machine.insert(0, key)
+        self._machine.configure(state="readonly")
+        state = "normal" if key and not self._busy else "disabled"
+        self._copy.configure(state=state)
+        self._online_activate_button.configure(state=state)
+
+    def _copy_machine_key(self):
+        self.clipboard_clear()
+        self.clipboard_append(self._machine.get())
+
+    def _activate(self):
+        self._set_busy(True, lock_inputs=True)
+        self._status.configure(text=t("license_working"), text_color=Colors.TEXT_PRIMARY)
+        activation_worker.start_activation(
+            self._key.get().strip(),
+            lambda identity, error: self._post_result(self._activation_done, identity, error),
+        )
+
+    def _activate_online(self):
+        code, machine_key = self._code.get().strip(), self._machine.get()
+        self._set_busy(True, lock_inputs=True)
+        self._status.configure(text=t("license_connecting"), text_color=Colors.TEXT_PRIMARY)
+        activation_worker.start_online_activation(
+            code, machine_key,
+            lambda result, error: self._post_result(self._online_activation_done, result, error),
+        )
+
+    def _online_activation_done(self, result, error):
+        if error is None:
+            key, identity = result
+            self._key.configure(state="normal")
+            self._key.delete(0, "end")
+            self._key.insert(0, key)
+            self._code.configure(state="normal")
+            self._code.delete(0, "end")
+        else:
+            identity = None
+        self._activation_done(identity, error)
+
+    def _activation_done(self, identity, error):
+        from jasna.protection.activation import ActivationServiceError
+        from jasna.protection import (
+            ForgedLicenseError, LicenseError, MalformedLicenseError,
+            RetiredLicenseError,
+        )
+        self._set_busy(False)
+        if isinstance(error, ActivationServiceError):
+            self._show_error(t(f"license_service_{error.code}"))
+            return
+        if isinstance(error, ForgedLicenseError):
+            self._show_error(t("license_forged"))
+            return
+        if isinstance(error, RetiredLicenseError):
+            self._show_error(t("license_retired"))
+            return
+        if isinstance(error, MalformedLicenseError):
+            self._show_error(t("license_malformed"))
+            return
+        if isinstance(error, LicenseError):
+            self._show_error(f"{t('license_invalid')}\n{error}")
+            return
+        if error is not None:
+            self._show_error(str(error))
+            return
+        self._set_machine_key(identity)
         self._status.configure(text=t("license_active"), text_color=Colors.STATUS_COMPLETED)
         self._on_activated()
+
+    def _show_error(self, text: str) -> None:
+        self._status.configure(text=text, text_color=Colors.STATUS_ERROR)
+        self._resize()
 
 
 class StatusPill(ctk.CTkFrame):
@@ -382,626 +643,6 @@ class CollapsibleSection(ctk.CTkFrame):
         return self._content
 
 
-class SettingRow(ctk.CTkFrame):
-    """A row containing a label and a control widget."""
-    
-    def __init__(self, master, label: str, tooltip: str = "", **kwargs):
-        super().__init__(master, fg_color="transparent", **kwargs)
-        
-        self._label = ctk.CTkLabel(
-            self,
-            text=label,
-            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
-            text_color=Colors.TEXT_PRIMARY,
-            anchor="w",
-        )
-        self._label.pack(side="left", padx=(0, 8))
-        
-        if tooltip:
-            self._tooltip_icon = ctk.CTkLabel(
-                self,
-                text="ⓘ",
-                font=(Fonts.FAMILY, Fonts.SIZE_TINY),
-                text_color=Colors.TEXT_PRIMARY,
-                cursor="hand2",
-            )
-            self._tooltip_icon.pack(side="left")
-            
-        self._control_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self._control_frame.pack(side="right")
-        
-    @property  
-    def control_frame(self) -> ctk.CTkFrame:
-        return self._control_frame
-
-
-class JobListItem(ctk.CTkFrame):
-    """Individual job item in the queue list."""
-    
-    def __init__(
-        self,
-        master,
-        filename: str,
-        duration: str,
-        status: str,
-        on_remove: callable = None,
-        on_drag_start: callable = None,
-        on_drag_move: callable = None,
-        on_drag_end: callable = None,
-        on_edit_segments: callable = None,
-        on_play: callable = None,
-        on_open_containing_folder: callable = None,
-        on_copy_path: callable = None,
-        on_open_restored_output: callable = None,
-        on_requeue: callable = None,
-        **kwargs
-    ):
-        super().__init__(
-            master,
-            fg_color=Colors.BG_CARD,
-            corner_radius=Sizing.BORDER_RADIUS,
-            height=72,
-            **kwargs
-        )
-        self.pack_propagate(False)
-        
-        self._on_remove = on_remove
-        self._on_edit_segments = on_edit_segments
-        self._on_play = on_play
-        self._on_open_containing_folder = on_open_containing_folder
-        self._on_copy_path = on_copy_path
-        self._on_open_restored_output = on_open_restored_output
-        self._on_requeue = on_requeue
-        # Drag callbacks (set by QueuePanel)
-        self._on_drag_start = on_drag_start
-        self._on_drag_move = on_drag_move
-        self._on_drag_end = on_drag_end
-        self._progress_visible = False
-        self._conflict_visible = False
-        self._segments_editable = True
-        self._player_enabled = True
-        self._action_menu_visible = True
-        self._has_restored_output = False
-        self._requeueable = False
-        self._segment_tooltips: list[Tooltip] = []
-        
-        # Main content container
-        content = ctk.CTkFrame(self, fg_color="transparent")
-        content.pack(fill="both", expand=True, padx=8, pady=6)
-        
-        # Top row: handle + filename + duration
-        top_row = ctk.CTkFrame(content, fg_color="transparent")
-        top_row.pack(fill="x")
-        
-        # Conflict indicator (amber dot)
-        self._conflict_dot = ctk.CTkLabel(
-            top_row,
-            text="●",
-            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
-            text_color=Colors.STATUS_CONFLICT,
-            width=16,
-        )
-        
-        # Drag handle
-        self._handle = ctk.CTkLabel(
-            top_row,
-            text="⋮⋮",
-            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
-            text_color=Colors.TEXT_PRIMARY,
-            width=20,
-            cursor="hand2",
-        )
-        self._handle.pack(side="left")
-        # Bind drag events to handle
-        self._handle.bind("<ButtonPress-1>", self._internal_drag_start)
-        self._handle.bind("<B1-Motion>", self._internal_drag_move)
-        self._handle.bind("<ButtonRelease-1>", self._internal_drag_end)
-        
-        # Info area (filename + duration inline)
-        self._info = ctk.CTkFrame(top_row, fg_color="transparent")
-        self._info.pack(side="left", fill="x", expand=True, padx=4)
-        
-        self._filename = ctk.CTkLabel(
-            self._info,
-            text=filename,
-            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
-            text_color=Colors.TEXT_PRIMARY,
-            anchor="w",
-        )
-        self._filename.pack(side="left")
-        
-        self._duration = ctk.CTkLabel(
-            self._info,
-            text=f"  •  {duration}" if duration else "",
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
-            text_color=Colors.TEXT_PRIMARY,
-            anchor="w",
-        )
-        self._duration.pack(side="left")
-        
-        # Bottom row: status
-        bottom_row = ctk.CTkFrame(content, fg_color="transparent")
-        bottom_row.pack(fill="x", pady=(4, 0))
-        
-        # Status area
-        self._status_frame = ctk.CTkFrame(bottom_row, fg_color="transparent")
-        self._status_frame.pack(side="left")
-        
-        self._status_icon = ctk.CTkLabel(
-            self._status_frame,
-            text="",
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
-            width=16,
-        )
-        
-        self._status_label = ctk.CTkLabel(
-            self._status_frame,
-            text=status,
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
-            text_color=Colors.TEXT_PRIMARY,
-        )
-        self._status_label.pack(side="left")
-
-        self._segment_summary = ctk.CTkLabel(
-            bottom_row,
-            text="",
-            font=(Fonts.FAMILY, Fonts.SIZE_TINY),
-            text_color=Colors.STATUS_PENDING,
-            cursor="hand2" if self._on_edit_segments else "arrow",
-        )
-        self._segment_summary.pack(side="left", padx=(8, 0))
-        if self._on_edit_segments:
-            self._segment_summary.bind("<Button-1>", lambda _event: self._handle_edit_segments())
-        
-        # FPS / ETA small labels on the right of bottom row
-        self._stats_frame = ctk.CTkFrame(bottom_row, fg_color="transparent")
-        self._stats_frame.pack(side="right")
-
-        self._segments_btn = ctk.CTkButton(
-            bottom_row,
-            text="✂",
-            width=30,
-            height=22,
-            fg_color=Colors.BG_PANEL,
-            hover_color=Colors.BORDER_LIGHT,
-            text_color=Colors.TEXT_PRIMARY,
-            cursor="hand2",
-            command=self._handle_edit_segments,
-        )
-        if self._on_edit_segments:
-            self._segments_btn.pack(side="right", padx=(0, 6))
-            self._segment_tooltips = [
-                Tooltip(self._segments_btn, t("segments_edit_tooltip")),
-                Tooltip(self._segment_summary, t("segments_edit_tooltip")),
-            ]
-
-        self._play_btn = ctk.CTkButton(
-            bottom_row,
-            text="▶",
-            width=30,
-            height=22,
-            fg_color=Colors.BG_PANEL,
-            hover_color=Colors.BORDER_LIGHT,
-            text_color=Colors.TEXT_PRIMARY,
-            cursor="hand2",
-            command=self._handle_play,
-        )
-        if self._on_play:
-            self._play_btn.pack(side="right", padx=(0, 6))
-            Tooltip(self._play_btn, t("queue_play_tooltip"))
-
-        self._overflow_btn = ctk.CTkButton(
-            bottom_row,
-            text="⋯",
-            width=24,
-            height=22,
-            fg_color=Colors.BG_PANEL,
-            hover_color=Colors.BORDER_LIGHT,
-            text_color=Colors.TEXT_PRIMARY,
-            cursor="hand2",
-            command=self._show_action_menu,
-        )
-        self._overflow_btn.pack(side="right")
-
-        self._fps_label = ctk.CTkLabel(
-            self._stats_frame,
-            text="",
-            font=(Fonts.FAMILY, Fonts.SIZE_TINY),
-            text_color=Colors.TEXT_PRIMARY,
-        )
-        self._fps_label.pack(side="left", padx=(0, 8))
-
-        self._eta_label = ctk.CTkLabel(
-            self._stats_frame,
-            text="",
-            font=(Fonts.FAMILY, Fonts.SIZE_TINY),
-            text_color=Colors.TEXT_PRIMARY,
-        )
-        self._eta_label.pack(side="left")
-        
-        # Progress bar (hidden by default)
-        self._progress = ctk.CTkProgressBar(
-            self,
-            height=3,
-            fg_color=Colors.BG_PANEL,
-            progress_color=Colors.PRIMARY,
-        )
-        
-        # Store references for hover binding
-        self._top_row = top_row
-        self._bottom_row = bottom_row
-        
-        self._remove_btn = ctk.CTkButton(
-            self,
-            text="✕",
-            width=24,
-            height=24,
-            fg_color="transparent",
-            hover_color=Colors.STATUS_ERROR,
-            text_color=Colors.TEXT_PRIMARY,
-            command=self._handle_remove,
-        )
-        # By default items are removable; can be toggled when queue is running
-        self._removable = True
-        
-        # Show remove on hover
-        # Show remove on hover. Bind both Enter and Leave on children to avoid
-        # flicker when moving between the parent and its child widgets.
-        self.bind("<Enter>", self._on_enter)
-        self.bind("<Leave>", self._on_leave)
-        # Debounce hide to avoid flicker
-        self._hide_after_id = None
-
-        child_widgets = [
-            content, self._handle, self._info, self._filename, self._duration,
-            self._conflict_dot, self._status_frame, self._status_icon,
-            self._status_label, self._stats_frame, self._fps_label, self._eta_label,
-            self._top_row, self._bottom_row, self._segment_summary, self._segments_btn,
-            self._play_btn, self._overflow_btn, self._progress,
-        ]
-        for child in child_widgets:
-            try:
-                child.bind("<Enter>", self._on_enter)
-                child.bind("<Leave>", self._on_leave)
-                child.bind("<Button-3>", self._show_action_menu)
-            except Exception:
-                logger.debug("Failed to bind hover events on child widget", exc_info=True)
-        # Ensure remove button keeps the enter binding so moving onto it still shows
-        self._remove_btn.bind("<Enter>", self._on_enter)
-        self._remove_btn.bind("<Leave>", self._on_leave)
-        self._remove_btn.bind("<Button-3>", self._show_action_menu)
-        self.bind("<Button-3>", self._show_action_menu)
-        
-    def _on_enter(self, event=None):
-        # Only show remove button if the pointer is actually inside this widget
-        if not getattr(self, "_removable", True):
-            return
-        # Cancel any pending hide
-        try:
-            if getattr(self, "_hide_after_id", None):
-                self.after_cancel(self._hide_after_id)
-                self._hide_after_id = None
-        except Exception:
-            logger.debug("Failed to cancel pending hide on enter", exc_info=True)
-        try:
-            x, y = self.winfo_pointerxy()
-            widget_x = self.winfo_rootx()
-            widget_y = self.winfo_rooty()
-            widget_w = self.winfo_width()
-            widget_h = self.winfo_height()
-            if widget_x <= x <= widget_x + widget_w and widget_y <= y <= widget_y + widget_h:
-                self._remove_btn.place(relx=1.0, rely=0, anchor="ne", x=-4, y=4)
-        except Exception:
-            logger.debug("Pointer query failed on enter; showing remove button", exc_info=True)
-            self._remove_btn.place(relx=1.0, rely=0, anchor="ne", x=-4, y=4)
-        
-    def _on_leave(self, event=None):
-        # Debounced hide: schedule hide shortly to prevent flicker when moving
-        # between child widgets
-        try:
-            if self._hide_after_id:
-                self.after_cancel(self._hide_after_id)
-        except Exception:
-            logger.debug("Failed to cancel pending hide on leave", exc_info=True)
-
-        def _hide_if_outside():
-            try:
-                x, y = self.winfo_pointerxy()
-                widget_x = self.winfo_rootx()
-                widget_y = self.winfo_rooty()
-                widget_w = self.winfo_width()
-                widget_h = self.winfo_height()
-                if not (widget_x <= x <= widget_x + widget_w and widget_y <= y <= widget_y + widget_h):
-                    self._remove_btn.place_forget()
-            except Exception:
-                logger.debug("Pointer query failed in delayed hide; forcing hide", exc_info=True)
-                try:
-                    self._remove_btn.place_forget()
-                except Exception:
-                    logger.debug("place_forget failed in delayed hide", exc_info=True)
-
-        # Schedule a short delayed check
-        try:
-            self._hide_after_id = self.after(80, _hide_if_outside)
-        except Exception:
-            logger.debug("Could not schedule delayed hide; hiding now", exc_info=True)
-            _hide_if_outside()
-        
-    def _handle_remove(self):
-        if self._on_remove:
-            self._on_remove()
-
-    def _handle_edit_segments(self):
-        if self._on_edit_segments and self._segments_editable:
-            for tooltip in self._segment_tooltips:
-                tooltip.hide()
-            self._on_edit_segments()
-
-    def _handle_play(self) -> None:
-        if self._on_play and self._player_enabled:
-            self._on_play()
-
-    def _handle_open_containing_folder(self) -> None:
-        if self._on_open_containing_folder:
-            self._on_open_containing_folder()
-
-    def _handle_copy_path(self) -> None:
-        if self._on_copy_path:
-            self._on_copy_path()
-
-    def _handle_open_restored_output(self) -> None:
-        if self._on_open_restored_output:
-            self._on_open_restored_output()
-
-    def _handle_requeue(self) -> None:
-        if self._on_requeue:
-            self._on_requeue()
-
-    def _show_action_menu(self, event=None):
-        if not getattr(self, "_action_menu_visible", True):
-            return "break"
-        menu = getattr(self, "_action_menu", None)
-        if menu is None:
-            menu = tkinter.Menu(self, tearoff=False)
-            menu.bind("<Unmap>", lambda _event: menu.grab_release())
-            self._action_menu = menu
-        else:
-            menu.delete(0, "end")
-        menu.add_command(
-            label=t("open_containing_folder"),
-            command=self._handle_open_containing_folder,
-        )
-        menu.add_command(label=t("copy_path"), command=self._handle_copy_path)
-        if self._has_restored_output:
-            menu.add_command(
-                label=t("open_restored_output"),
-                command=self._handle_open_restored_output,
-            )
-        if self._requeueable:
-            menu.add_separator()
-            menu.add_command(label=t("requeue"), command=self._handle_requeue)
-        if event is None:
-            x = self._overflow_btn.winfo_rootx()
-            y = self._overflow_btn.winfo_rooty() + self._overflow_btn.winfo_height()
-        else:
-            x, y = event.x_root, event.y_root
-        menu.tk_popup(x, y)
-        return "break"
-
-    def set_segment_summary(self, text: str, *, selected: bool = False) -> None:
-        self._segment_summary.configure(
-            text=text,
-            text_color=Colors.PRIMARY if selected else Colors.STATUS_PENDING,
-        )
-
-    def set_segments_editable(self, editable: bool) -> None:
-        if self._on_edit_segments:
-            self._segments_editable = bool(editable)
-            if editable:
-                self._segments_btn.configure(state="normal")
-                if not self._segments_btn.winfo_manager():
-                    self._segments_btn.pack(side="right", padx=(0, 6))
-            else:
-                for tooltip in self._segment_tooltips:
-                    tooltip.hide()
-                self._segments_btn.pack_forget()
-            self._segment_summary.configure(cursor="hand2" if editable else "arrow")
-
-    def set_player_enabled(self, enabled: bool) -> None:
-        if self._on_play:
-            self._player_enabled = bool(enabled)
-            if enabled:
-                self._play_btn.configure(state="normal")
-                if not self._play_btn.winfo_manager():
-                    pack_options = {"side": "right", "padx": (0, 6)}
-                    if self._overflow_btn.winfo_manager():
-                        pack_options["before"] = self._overflow_btn
-                    self._play_btn.pack(**pack_options)
-            else:
-                self._play_btn.pack_forget()
-
-    def set_action_menu_visible(self, visible: bool) -> None:
-        self._action_menu_visible = bool(visible)
-        if visible:
-            if not self._overflow_btn.winfo_manager():
-                self._overflow_btn.pack(side="right")
-        else:
-            self._overflow_btn.pack_forget()
-
-    def set_action_options(
-        self, *, has_restored_output: bool, requeueable: bool
-    ) -> None:
-        self._has_restored_output = bool(has_restored_output)
-        self._requeueable = bool(requeueable)
-
-    # Internal drag event proxies to allow QueuePanel to handle reordering
-    def _internal_drag_start(self, event):
-        if callable(self._on_drag_start):
-            self._on_drag_start(self, event)
-
-    def _internal_drag_move(self, event):
-        if callable(self._on_drag_move):
-            self._on_drag_move(self, event)
-
-    def _internal_drag_end(self, event):
-        if callable(self._on_drag_end):
-            self._on_drag_end(self, event)
-            
-    def set_status(self, status: str, icon: str = "", color: str = Colors.STATUS_PENDING):
-        self._status_label.configure(text=status, text_color=color)
-        if icon:
-            self._status_icon.configure(text=icon, text_color=color)
-            self._status_icon.pack(side="left", padx=(0, 4), before=self._status_label)
-        else:
-            self._status_icon.pack_forget()
-
-    def set_removable(self, removable: bool):
-        """Enable or disable the remove action for this item.
-
-        When not removable the remove button is hidden and user cannot remove
-        the item (used to protect the currently processing job).
-        """
-        self._removable = bool(removable)
-        if not self._removable:
-            try:
-                self._remove_btn.place_forget()
-            except Exception:
-                logger.debug("place_forget failed in set_removable", exc_info=True)
-
-    def set_progress(self, value: float):
-        if not self._progress_visible:
-            self._progress.place(relx=0, rely=1.0, anchor="sw", relwidth=1.0)
-            self._progress_visible = True
-        # value expected in range 0.0-1.0
-        try:
-            self._progress.set(value)
-        except Exception:
-            # if value is percent (0-100), normalize
-            try:
-                self._progress.set(float(value) / 100.0)
-            except Exception:
-                logger.debug("Failed to set progress value %r", value, exc_info=True)
-
-    def set_fps_eta(self, fps: float = 0.0, eta_seconds: float = 0.0):
-        """Update small FPS and ETA labels shown on the tile."""
-        if fps and fps > 0:
-            self._fps_label.configure(text=f"{fps:.1f}fps")
-        else:
-            self._fps_label.configure(text="")
-
-        if eta_seconds and eta_seconds > 0:
-            mins, secs = divmod(int(eta_seconds), 60)
-            hours, mins = divmod(mins, 60)
-            if hours:
-                eta_str = f"{hours}h {mins}m"
-            elif mins:
-                eta_str = f"{mins}m {secs}s"
-            else:
-                eta_str = f"{secs}s"
-            self._eta_label.configure(text=f"ETA: {eta_str}")
-        else:
-            self._eta_label.configure(text="")
-
-    def set_completed(self, elapsed_seconds: float):
-        mins, secs = divmod(int(elapsed_seconds), 60)
-        hours, mins = divmod(mins, 60)
-        if hours:
-            duration_str = f"{hours}h {mins}m"
-        elif mins:
-            duration_str = f"{mins}m {secs}s"
-        else:
-            duration_str = f"{secs}s"
-        self._status_label.configure(text=f"{t('completed_in')} {duration_str}")
-        self._fps_label.configure(text="")
-        self._eta_label.configure(text="")
-        
-    def hide_progress(self):
-        self._progress.place_forget()
-        self._progress_visible = False
-
-    def set_conflict(self, has_conflict: bool, tooltip: str = ""):
-        """Show or hide the conflict indicator (amber dot)."""
-        if has_conflict and not self._conflict_visible:
-            self._conflict_dot.pack(side="left", before=self._handle)
-            self._conflict_visible = True
-            if tooltip:
-                # Create tooltip on hover
-                self._conflict_dot.bind("<Enter>", lambda e: self._show_tooltip(tooltip))
-                self._conflict_dot.bind("<Leave>", lambda e: self._hide_tooltip())
-        elif not has_conflict and self._conflict_visible:
-            self._conflict_dot.pack_forget()
-            self._conflict_visible = False
-            
-    def _show_tooltip(self, text: str):
-        """Show tooltip near the conflict indicator."""
-        if hasattr(self, '_tooltip'):
-            self._tooltip.destroy()
-        self._tooltip = ctk.CTkLabel(
-            self.winfo_toplevel(),
-            text=text,
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
-            fg_color=Colors.BG_CARD,
-            corner_radius=4,
-            text_color=Colors.STATUS_CONFLICT,
-            padx=8,
-            pady=4,
-        )
-        x = self._conflict_dot.winfo_rootx() + 20
-        y = self._conflict_dot.winfo_rooty() - 10
-        self._tooltip.place(x=x - self.winfo_toplevel().winfo_rootx(), 
-                           y=y - self.winfo_toplevel().winfo_rooty())
-        
-    def _hide_tooltip(self):
-        """Hide the tooltip."""
-        if hasattr(self, '_tooltip'):
-            self._tooltip.destroy()
-            del self._tooltip
-
-
-class LogEntry(ctk.CTkFrame):
-    """Single log entry with timestamp and colored level."""
-    
-    def __init__(self, master, timestamp: str, level: str, message: str, **kwargs):
-        super().__init__(master, fg_color="transparent", height=20, **kwargs)
-        self.pack_propagate(False)
-        
-        level_colors = {
-            "INFO": Colors.LOG_INFO,
-            "WARNING": Colors.LOG_WARNING,
-            "ERROR": Colors.LOG_ERROR,
-            "DEBUG": Colors.LOG_DEBUG,
-        }
-        
-        self._time = ctk.CTkLabel(
-            self,
-            text=timestamp,
-            font=(Fonts.FAMILY_MONO, Fonts.SIZE_TINY),
-            text_color=Colors.TEXT_PRIMARY,
-            width=80,
-            anchor="w",
-        )
-        self._time.pack(side="left")
-        
-        self._level = ctk.CTkLabel(
-            self,
-            text=level,
-            font=(Fonts.FAMILY_MONO, Fonts.SIZE_TINY, "bold"),
-            text_color=level_colors.get(level, Colors.TEXT_PRIMARY),
-            width=60,
-            anchor="w",
-        )
-        self._level.pack(side="left")
-        
-        self._message = ctk.CTkLabel(
-            self,
-            text=message,
-            font=(Fonts.FAMILY_MONO, Fonts.SIZE_TINY),
-            text_color=Colors.TEXT_PRIMARY,
-            anchor="w",
-        )
-        self._message.pack(side="left", fill="x", expand=True)
-
-
 class Toast(ctk.CTkFrame):
     """Toast notification that auto-dismisses."""
     
@@ -1021,7 +662,7 @@ class Toast(ctk.CTkFrame):
         colors = {
             "success": Colors.STATUS_COMPLETED,
             "error": Colors.STATUS_ERROR,
-            "warning": Colors.STATUS_PAUSED,
+            "warning": Colors.STATUS_WARNING,
             "info": Colors.PRIMARY,
         }
         accent = colors.get(type_, Colors.PRIMARY)
@@ -1054,8 +695,7 @@ class PresetDialog(ctk.CTkToplevel):
         self.configure(fg_color=Colors.BG_MAIN)
         self.resizable(False, False)
         self.transient(master)
-        self.wait_visibility()  # X11: window must be viewable before grab_set, else TclError
-        self.grab_set()
+        grab_modal(self)
         
         self._on_create = on_create
         self._existing_names = [n.lower() for n in existing_names]
@@ -1147,8 +787,7 @@ class ConfirmDialog(ctk.CTkToplevel):
         self.configure(fg_color=Colors.BG_MAIN)
         self.resizable(False, False)
         self.transient(master)
-        self.wait_visibility()  # X11: window must be viewable before grab_set, else TclError
-        self.grab_set()
+        grab_modal(self)
         
         self._on_confirm = on_confirm
         
@@ -1194,3 +833,134 @@ class ConfirmDialog(ctk.CTkToplevel):
     def _do_confirm(self):
         self._on_confirm()
         self.destroy()
+
+
+class CloseWhileProcessingDialog(ctk.CTkToplevel):
+    def __init__(self, master, on_minimize: callable, on_quit: callable):
+        super().__init__(master)
+
+        self.title(t("close_running_title"))
+        self.configure(fg_color=Colors.BG_MAIN)
+        self.resizable(False, False)
+        self.transient(master)
+        grab_modal(self)
+
+        self._on_minimize = on_minimize
+        self._on_quit = on_quit
+
+        self.update_idletasks()
+        scaling.place_centered_on_parent(self, master, *scaling.to_physical(self, 380, 140))
+
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=20)
+
+        ctk.CTkLabel(
+            content,
+            text=t("close_running_message"),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            text_color=Colors.TEXT_PRIMARY,
+            wraplength=340,
+        ).pack(pady=(0, 16))
+
+        btn_frame = ctk.CTkFrame(content, fg_color="transparent")
+        btn_frame.pack(fill="x")
+
+        ctk.CTkButton(
+            btn_frame,
+            text=t("btn_cancel"),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            fg_color="transparent",
+            hover_color=Colors.BG_CARD,
+            text_color=Colors.TEXT_PRIMARY,
+            width=80,
+            command=self.destroy,
+        ).pack(side="right", padx=(8, 0))
+
+        self.quit_button = ctk.CTkButton(
+            btn_frame,
+            text=t("btn_stop_and_quit"),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            fg_color=Colors.STATUS_ERROR,
+            hover_color="#dc2626",
+            text_color=Colors.TEXT_PRIMARY,
+            command=self._quit,
+        )
+        self.quit_button.pack(side="right", padx=(8, 0))
+
+        self.minimize_button = ctk.CTkButton(
+            btn_frame,
+            text=t("btn_minimize"),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            fg_color=Colors.PRIMARY,
+            hover_color=Colors.PRIMARY_HOVER,
+            text_color=Colors.TEXT_PRIMARY,
+            command=self._minimize,
+        )
+        self.minimize_button.pack(side="right")
+
+    def _minimize(self):
+        self.destroy()
+        self._on_minimize()
+
+    def _quit(self):
+        self.destroy()
+        self._on_quit()
+
+
+class ShutdownCountdownDialog(ctk.CTkToplevel):
+    """Counts down before shutting the PC down; Cancel or closing the window aborts it."""
+
+    def __init__(self, master, seconds: int, on_expired, on_cancelled):
+        super().__init__(master)
+        self._remaining = seconds
+        self._on_expired = on_expired
+        self._on_cancelled = on_cancelled
+
+        self.title(t("shutdown_countdown_title"))
+        self.configure(fg_color=Colors.BG_MAIN)
+        self.resizable(False, False)
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+
+        content = ctk.CTkFrame(self, fg_color="transparent")
+        content.pack(fill="both", expand=True, padx=20, pady=20)
+        self._message = ctk.CTkLabel(
+            content,
+            text=t("shutdown_countdown_message", seconds=seconds),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            text_color=Colors.TEXT_PRIMARY,
+            wraplength=280,
+        )
+        self._message.pack(pady=(0, 16))
+        self.cancel_button = ctk.CTkButton(
+            content,
+            text=t("btn_cancel"),
+            font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
+            fg_color=Colors.BG_CARD,
+            hover_color=Colors.BORDER_LIGHT,
+            text_color=Colors.TEXT_PRIMARY,
+            command=self.cancel,
+        )
+        self.cancel_button.pack()
+
+        self.update_idletasks()
+        minimum_width, _ = scaling.to_physical(self, 320, 0)
+        scaling.place_centered_on_parent(
+            self, master, max(minimum_width, self.winfo_reqwidth()), self.winfo_reqheight()
+        )
+        grab_modal(self)
+        self._tick_id = self.after(1000, self._tick)
+
+    def _tick(self):
+        self._remaining -= 1
+        if self._remaining > 0:
+            self._message.configure(text=t("shutdown_countdown_message", seconds=self._remaining))
+            self._tick_id = self.after(1000, self._tick)
+            return
+        self.destroy()
+        self._on_expired()
+
+    def cancel(self):
+        self.after_cancel(self._tick_id)
+        self.destroy()
+        self._on_cancelled()

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import math
 
 import torch
 
@@ -47,7 +46,7 @@ class RestorationPipeline:
     @property
     def secondary_prefers_cpu_input(self) -> bool:
         if self.secondary_restorer is not None:
-            return bool(getattr(self.secondary_restorer, "prefers_cpu_input", False))
+            return self.secondary_restorer.prefers_cpu_input
         return False
 
     def _apply_denoise(self, frames: torch.Tensor) -> torch.Tensor:
@@ -72,19 +71,10 @@ class RestorationPipeline:
 
     def _run_secondary(self, primary_raw: torch.Tensor, keep_start: int, keep_end: int) -> list[torch.Tensor]:
         if self.secondary_restorer is not None:
-            result = self.secondary_restorer.restore(primary_raw, keep_start=keep_start, keep_end=keep_end)
-            if isinstance(result, torch.Tensor):
-                restored_frames = list(result.unbind(0)) if result.dim() > 3 else [result]
-            else:
-                restored_frames = result
+            restored_frames = self.secondary_restorer.restore(primary_raw, keep_start=keep_start, keep_end=keep_end)
         else:
             kept = primary_raw[keep_start:keep_end]
             restored_frames = list(kept.clamp(0, 1).mul(255.0).round().clamp(0, 255).to(dtype=torch.uint8).unbind(0))
-
-        if self._denoise_step is DenoiseStep.AFTER_SECONDARY:
-            batch_u8 = torch.stack(restored_frames, dim=0)
-            batch_u8 = apply_denoise_u8(batch_u8, self._denoise_strength)
-            restored_frames = list(batch_u8.unbind(0))
 
         return restored_frames
 

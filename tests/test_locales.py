@@ -7,9 +7,9 @@ import pytest
 
 from jasna.accelerator import AcceleratorVendor
 from jasna.gui.locales import TRANSLATIONS
-from jasna.media.encoder_quality import encoder_cq_spec
+from jasna.media.encoder_settings import encoder_cq_spec
 
-_FULL_LOCALES = ["zh", "ja"]
+_FULL_LOCALES = ["zh", "ja", "ko", "th"]
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
 
 
@@ -42,27 +42,6 @@ def test_no_locale_defines_keys_outside_english(lang: str) -> None:
     assert not extra, f"{lang} defines keys absent from English (en): {sorted(extra)}"
 
 
-def test_gui_tooltip_lookup_uses_help_table_not_argparse(monkeypatch) -> None:
-    import jasna.gui.locales as loc
-    from jasna.cli_help import CLI_HELP, GUI_TOOLTIP_KEY_BY_DEST
-
-    # Break the CLI parser import: tooltip lookup must not depend on argparse internals.
-    monkeypatch.setitem(sys.modules, "jasna.main", None)
-    monkeypatch.setattr(loc, "_CLI_DESCRIPTIONS", None)
-
-    descriptions = loc.get_cli_descriptions()
-
-    assert set(descriptions) == set(GUI_TOOLTIP_KEY_BY_DEST.values())
-    assert descriptions["fp16_mode"] == CLI_HELP["fp16"]
-    assert descriptions["max_clip_size"] == "Maximum clip size for tracking"
-    assert descriptions["max_detection_gap"] == (
-        "Fill detection dropouts up to N frames when the mosaic reappears at the same spot. 0 disables"
-    )
-    assert descriptions["min_detection_duration"] == (
-        "Drop detections shorter than N frames as false positives. 0 disables"
-    )
-
-
 @pytest.mark.parametrize("lang", _FULL_LOCALES)
 def test_locale_values_are_not_empty(lang: str) -> None:
     empty = [key for key, value in TRANSLATIONS[lang].items() if not value.strip()]
@@ -75,7 +54,7 @@ def test_queue_button_text_does_not_depend_on_emoji_fonts(lang: str, key: str) -
     assert not TRANSLATIONS[lang][key].startswith(("📁", "🗑"))
 
 
-@pytest.mark.parametrize("lang", _FULL_LOCALES)
+@pytest.mark.parametrize("lang", sorted(TRANSLATIONS))
 def test_format_placeholders_match(lang: str) -> None:
     mismatches: list[str] = []
     for key in TRANSLATIONS["en"]:
@@ -101,11 +80,13 @@ _LICENSE_KEYS = {
     "supporter_title",
     "supporter_blurb",
     "supporter_perks",
-    "license_email_placeholder",
-    "license_key_placeholder",
+    "license_machine_key",
+    "license_activation_key",
+    "license_activation_steps",
+    "license_cloud_cli_only",
+    "license_working",
     "license_activate",
     "license_active",
-    "license_crypto_info",
     "license_chip_inactive",
     "license_chip_active",
 }
@@ -202,7 +183,6 @@ _SEGMENT_EDITOR_KEYS = {
     "segments_scan_help_title",
     "segments_scan_help_body",
     "segments_scan_progress",
-    "segments_scan_stopped",
     "segments_scan_low_vram",
     "segments_scan_low_vram_short",
     "segments_scan_failed",
@@ -214,7 +194,9 @@ _SEGMENT_EDITOR_KEYS = {
     "segments_scan_model_changed",
     "segments_timeline_title",
     "segments_timeline_hint",
-    "segments_legend_selected",
+    "segments_mixed_models_too_close",
+    "segments_restore_with",
+    "segments_use_for_all",
     "segments_legend_detected",
     "segments_legend_playhead",
 }
@@ -281,7 +263,7 @@ def test_english_activation_copy_uses_app_activation_language() -> None:
     en = TRANSLATIONS["en"]
     assert en["supporter_title"] == "Activate Jasna"
     assert en["license_chip_inactive"] == "Activate Jasna"
-    assert en["secondary_unet_4x_hint"] == "high-quality, fast"
+    assert en["secondary_unet_4x_hint"] == "high quality, fast"
     assert "supporter" not in en["supporter_title"].lower()
     assert "license" not in en["supporter_title"].lower()
 
@@ -333,7 +315,6 @@ _MASK_FEEDBACK_KEYS = [
     "mask_editor_quick_help",
     "mask_editor_opacity",
     "mask_editor_loading_frame",
-    "mask_editor_frame_failed",
     "mask_feedback_uploaded",
     "mask_feedback_upload_failed",
 ]
@@ -343,3 +324,14 @@ _MASK_FEEDBACK_KEYS = [
 @pytest.mark.parametrize("key", _MASK_FEEDBACK_KEYS)
 def test_all_languages_define_mask_feedback_keys(lang: str, key: str) -> None:
     assert TRANSLATIONS[lang][key].strip()
+
+
+def test_first_run_language_follows_system_locale(monkeypatch, tmp_path) -> None:
+    import locale
+
+    import jasna.gui.locales as locales
+
+    monkeypatch.setattr(locales, "get_settings_path", lambda: tmp_path / "missing.json")
+    monkeypatch.setattr(locale, "getdefaultlocale", lambda: ("ja_JP", "UTF-8"))
+
+    assert locales.LocaleManager()._current_lang == "ja"

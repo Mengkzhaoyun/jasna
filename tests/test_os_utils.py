@@ -1,10 +1,77 @@
 import os
 import sys
 import types
+from pathlib import Path
 
 import pytest
 
 from jasna import os_utils
+
+
+def test_frozen_linux_application_executable_ignores_the_python_placeholder(monkeypatch) -> None:
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: True)
+    monkeypatch.setattr(os_utils.sys, "platform", "linux")
+    monkeypatch.setattr(os_utils.sys, "executable", "/moved/app/python")
+    monkeypatch.setattr(os_utils.os, "readlink", lambda path: "/moved/app/jasna.bin")
+
+    assert os_utils.get_application_executable() == "/moved/app/jasna.bin"
+
+
+@pytest.mark.parametrize("platform,frozen", [("linux", False), ("win32", False), ("darwin", True)])
+def test_other_application_executables_keep_sys_executable(monkeypatch, platform, frozen) -> None:
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: frozen)
+    monkeypatch.setattr(os_utils.sys, "platform", platform)
+    monkeypatch.setattr(os_utils.sys, "executable", "/application/python")
+
+    assert os_utils.get_application_executable() == "/application/python"
+
+
+@pytest.mark.parametrize("path", ["C:/relocated/app/jasna.exe", "C:/" + "folder/" * 100 + "jasna.exe"])
+def test_frozen_windows_application_executable_uses_complete_running_module_path(monkeypatch, path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    calls = []
+    def module_path(module, buffer, size):
+        calls.append((module, size))
+        buffer.value = path[:size - 1]
+        return len(path) if len(path) < size else size
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kwargs: types.SimpleNamespace(GetModuleFileNameW=module_path), raising=False)
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: True)
+    monkeypatch.setattr(os_utils.sys, "platform", "win32")
+    monkeypatch.setattr(os_utils.sys, "executable", "C:/relocated/app/python.exe")
+
+    assert os_utils.get_application_executable() == path
+    assert all(module is None for module, size in calls)
+    assert calls[-1][1] > len(path)
+    assert module_path.argtypes == [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+    assert module_path.restype is wintypes.DWORD
+
+
+def test_frozen_windows_application_executable_reports_module_lookup_failure(monkeypatch) -> None:
+    import ctypes
+
+    def module_path(module, buffer, size):
+        return 0
+    monkeypatch.setattr(ctypes, "WinDLL", lambda name, **kwargs: types.SimpleNamespace(GetModuleFileNameW=module_path), raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    monkeypatch.setattr(ctypes, "WinError", lambda error: OSError(error, "module path unavailable"), raising=False)
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: True)
+    monkeypatch.setattr(os_utils.sys, "platform", "win32")
+    monkeypatch.setattr(os_utils.sys, "executable", "C:/relocated/app/python.exe")
+
+    with pytest.raises(OSError, match="module path unavailable") as failure:
+        os_utils.get_application_executable()
+    assert failure.value.errno == 5
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows native module path API")
+def test_frozen_windows_application_executable_ignores_placeholder_using_native_api(monkeypatch) -> None:
+    expected = sys.executable
+    monkeypatch.setattr(os_utils, "is_frozen", lambda: True)
+    monkeypatch.setattr(os_utils.sys, "executable", "C:/relocated/app/python.exe")
+
+    assert os_utils.get_application_executable().casefold() == expected.casefold()
 
 
 class _FakeKernel32:
@@ -428,6 +495,54 @@ def test_check_supported_gpu_returns_compute_too_low_when_below_min(monkeypatch)
     assert result == ("compute_too_low", 6, 1)
 
 
+def _fake_rocm_torch(gcn_arch_name: str, arch_list: list[str]):
+    def _no_kernels(*_args, **_kwargs):
+        raise AssertionError("the GPU check must not launch a kernel")
+
+    return types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_properties=lambda device: types.SimpleNamespace(gcnArchName=gcn_arch_name),
+            get_arch_list=lambda: arch_list,
+            get_device_name=lambda device: "AMD Radeon 780M Graphics",
+        ),
+        zeros=_no_kernels,
+    )
+
+
+def _as_amd_build(monkeypatch, fake_torch) -> None:
+    import jasna.accelerator as accelerator
+
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(accelerator, "vendor_for_device", lambda _device: accelerator.AcceleratorVendor.AMD)
+
+
+def test_check_supported_gpu_rejects_amd_arch_missing_from_build(monkeypatch) -> None:
+    _as_amd_build(monkeypatch, _fake_rocm_torch("gfx1103", ["gfx1100", "gfx1101", "gfx1102", "gfx1201"]))
+    ok, result = os_utils.check_supported_gpu()
+    assert ok is False
+    assert result == ("arch_unsupported", "gfx1103")
+
+
+def test_check_supported_gpu_accepts_amd_arch_ignoring_feature_suffixes(monkeypatch) -> None:
+    _as_amd_build(monkeypatch, _fake_rocm_torch("gfx90a:sramecc+:xnack-", ["gfx90a:xnack-", "gfx1100"]))
+    ok, result = os_utils.check_supported_gpu()
+    assert ok is True
+    assert result == "AMD Radeon 780M Graphics"
+
+
+def test_check_supported_gpu_accepts_amd_when_build_reports_no_arch_list(monkeypatch) -> None:
+    _as_amd_build(monkeypatch, _fake_rocm_torch("gfx1103", []))
+    ok, _ = os_utils.check_supported_gpu()
+    assert ok is True
+
+
+def test_gpu_check_error_names_each_failure() -> None:
+    assert "No compatible GPU" in os_utils.gpu_check_error("no_cuda")
+    assert "gfx1103" in os_utils.gpu_check_error(("arch_unsupported", "gfx1103"))
+    assert "6.1" in os_utils.gpu_check_error(("compute_too_low", 6, 1))
+
+
 def test_check_supported_gpu_returns_ok_at_exactly_min_compute(monkeypatch) -> None:
     import types
 
@@ -591,3 +706,59 @@ def test_check_ascii_install_path_uses_executable_when_frozen(monkeypatch, tmp_p
     monkeypatch.setattr(os_utils.sys, "executable", str(exe_path), raising=False)
     ok, info = os_utils.check_ascii_install_path()
     assert ok is True
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows module lookup")
+def test_windows_module_loaded_reports_modules_of_this_process() -> None:
+    assert os_utils.windows_module_loaded("kernel32.dll") is True
+    assert os_utils.windows_module_loaded("jasna-not-a-loaded-module.dll") is False
+
+
+def test_windows_module_loaded_is_false_off_windows(monkeypatch) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "linux")
+
+    assert os_utils.windows_module_loaded("kernel32.dll") is False
+
+
+def _sysfs_disk(root, name: str, rotational: str):
+    disk = root / "devices" / name
+    (disk / "queue").mkdir(parents=True)
+    (disk / "queue" / "rotational").write_text(rotational + "\n")
+    partition = disk / f"{name}1"
+    partition.mkdir()
+    (partition / "partition").write_text("1\n")
+    return disk, partition
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sysfs device names like 8:1 are not valid Windows file names")
+def test_partition_on_a_spinning_disk_reports_its_disk_as_rotational(tmp_path) -> None:
+    _hdd, hdd_partition = _sysfs_disk(tmp_path, "sda", "1")
+    ssd, _ssd_partition = _sysfs_disk(tmp_path, "nvme0n1", "0")
+    links = tmp_path / "dev" / "block"
+    links.mkdir(parents=True)
+    (links / "8:1").symlink_to(hdd_partition)
+    (links / "259:0").symlink_to(ssd)
+
+    assert os_utils.sysfs_block_is_rotational(links / "8:1")
+    assert not os_utils.sysfs_block_is_rotational(links / "259:0")
+    assert not os_utils.sysfs_block_is_rotational(links / "0:79")
+
+
+def test_mount_source_is_the_innermost_mount_holding_the_path() -> None:
+    mountinfo = "\n".join([
+        "29 1 0:26 / / rw,relatime shared:1 - btrfs /dev/mapper/root rw,subvol=/root",
+        "40 29 8:2 / /mnt/media rw,relatime shared:5 - ext4 /dev/sda2 rw",
+        "41 40 0:50 / /mnt/media/old\\040disk rw,relatime shared:6 - btrfs /dev/sdb1 rw",
+        "42 29 0:79 / /mnt/pool rw,relatime shared:7 - fuse.mergerfs pool rw",
+    ])
+
+    assert os_utils.mount_source(mountinfo, Path("/mnt/media/old disk/jasna")) == "/dev/sdb1"
+    assert os_utils.mount_source(mountinfo, Path("/mnt/media/jasna")) == "/dev/sda2"
+    assert os_utils.mount_source(mountinfo, Path("/mnt/mediaX/jasna")) == "/dev/mapper/root"
+    assert os_utils.mount_source(mountinfo, Path("/mnt/pool/jasna")) == "pool"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows storage query")
+def test_windows_seek_penalty_query_answers_for_a_drive_and_skips_network_paths() -> None:
+    assert isinstance(os_utils._windows_drive_has_seek_penalty(Path(os.environ["SystemDrive"] + "\\")), bool)
+    assert not os_utils._windows_drive_has_seek_penalty(Path(r"\\server\share\jasna"))

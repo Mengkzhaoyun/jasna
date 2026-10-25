@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import queue
 import sys
@@ -14,8 +15,10 @@ from PIL import Image, ImageTk
 from tkinter import filedialog, messagebox
 
 from jasna.gui import scaling
+from jasna.gui.components import grab_modal
 from jasna.gui.locales import t
 from jasna.gui.models import AppSettings
+from jasna.gui.queues import MainThreadCalls
 from jasna.gui.raw_player import (
     PREROLL_SECONDS,
     PlaybackClock,
@@ -31,7 +34,7 @@ from jasna.gui.raw_player import (
 )
 from jasna.gui.settings_sections.widgets import ValueOptionMenu
 from jasna.gui.theme import Colors, Fonts, Sizing
-from jasna.media import VideoMetadata, get_video_meta_data
+from jasna.media.probe import VideoMetadata, get_video_meta_data
 from jasna.media.media_files import VIDEO_EXTENSIONS
 from jasna.mosaic.detection_registry import (
     detection_model_choices,
@@ -48,6 +51,8 @@ _SEEK_STEP_SECONDS = 30.0
 _FULLSCREEN_EDGE_PX = 8
 _BUFFER_STATUS_INTERVAL_SECONDS = 0.25
 _SEEK_UPDATE_INTERVAL_SECONDS = 0.1
+
+logger = logging.getLogger(__name__)
 
 
 def _load_windows_multimedia_timer():
@@ -232,6 +237,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
         on_closed,
     ) -> None:
         super().__init__(master)
+        self._main_thread = MainThreadCalls(self, 50)
         self.withdraw()
         self._base_settings = settings
         self._on_closed = on_closed
@@ -277,9 +283,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
         self.update_idletasks()
         self._show_centered(master)
         self._native_renderer = _create_native_video_renderer(self._video_surface)
-        self.grab_set()
-        self.lift()
-        self.focus_force()
+        grab_modal(self)
         self.bind("<F11>", self._toggle_fullscreen)
         self.bind("<Escape>", self._exit_fullscreen)
         self.bind("<Left>", lambda event: self._seek_relative(-_SEEK_STEP_SECONDS, event))
@@ -589,7 +593,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
                 result = (metadata, "")
             except Exception as exc:
                 result = (None, str(exc))
-            self._ui_after(lambda: self._video_probed(generation, *result))
+            self._main_thread.post(lambda: self._video_probed(generation, *result))
 
         threading.Thread(
             target=probe,
@@ -661,6 +665,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
             settings,
             self._frame_buffer,
             max_size=self._surface_size(),
+            on_stopped=lambda: self._main_thread.post(self._finish_stop),
         )
         self._worker.start()
         self._generation = self._worker.play_from(seconds)
@@ -681,6 +686,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
     def _playback_settings(self) -> AppSettings:
         return replace(
             self._base_settings,
+            restoration_model="basicvsrpp",
             detection_model=self._model.get(),
             detection_score_threshold=float(self._threshold.get()),
             secondary_restoration=self._secondary.get_value(),
@@ -736,7 +742,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
             self._aligned_generation = self._generation
             self._update_time_label(first.seconds)
             if not self._desired_playing:
-                self._set_status(t("player_paused"), Colors.STATUS_PAUSED)
+                self._set_status(t("player_paused"), Colors.STATUS_WARNING)
 
         if self._desired_playing and not self._playing:
             if self._frame_buffer.ready(PREROLL_SECONDS):
@@ -755,7 +761,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
                 )
             elif first is not None:
                 self._buffering = True
-                self._set_status(t("player_buffering"), Colors.STATUS_PAUSED)
+                self._set_status(t("player_buffering"), Colors.STATUS_WARNING)
 
         if not self._playing:
             return
@@ -784,7 +790,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
                 self._set_status(t("player_finished"), Colors.STATUS_COMPLETED)
             else:
                 self._buffering = True
-                self._set_status(t("player_buffering"), Colors.STATUS_PAUSED)
+                self._set_status(t("player_buffering"), Colors.STATUS_WARNING)
 
     def _show_frame(self, frame) -> None:
         if frame.generation != self._generation:
@@ -820,7 +826,7 @@ class VideoPlayerDialog(ctk.CTkToplevel):
             self._buffering = False
             self._clock.pause()
             self._play_btn.configure(text="▶")
-            self._set_status(t("player_paused"), Colors.STATUS_PAUSED)
+            self._set_status(t("player_paused"), Colors.STATUS_WARNING)
             return
         if (self._eof or self._frame_buffer.eof) and self._frame_buffer.empty():
             self._desired_playing = True
@@ -1014,18 +1020,11 @@ class VideoPlayerDialog(ctk.CTkToplevel):
         if self._clock is not None:
             self._clock.close()
             self._clock = None
-        worker = self._worker
-        worker.close()
+        self._worker.close()
         self._set_status(t("player_stopping"), Colors.STATUS_PENDING)
         self._set_config_enabled(False)
         self._play_btn.configure(state="disabled")
         self._seek.configure(state="disabled")
-
-        def join_worker() -> None:
-            worker.join()
-            self._ui_after(self._finish_stop)
-
-        threading.Thread(target=join_worker, name="player-stop", daemon=True).start()
 
     def _finish_stop(self) -> None:
         self._worker = None
@@ -1113,20 +1112,11 @@ class VideoPlayerDialog(ctk.CTkToplevel):
             return
         self._closed = True
         self._probe_generation += 1
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
+        self.grab_release()
         if self._native_renderer is not None:
             self._native_renderer.close()
         self._timer_resolution.close()
+        self._main_thread.close()
         self.destroy()
         self._on_closed()
 
-    def _ui_after(self, callback) -> None:
-        if self._closed:
-            return
-        try:
-            self.after(0, callback)
-        except (tk.TclError, RuntimeError):
-            pass

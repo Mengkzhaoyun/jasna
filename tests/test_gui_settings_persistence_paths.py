@@ -165,3 +165,29 @@ def test_preset_manager_saves_and_loads_last_output_pattern(monkeypatch, tmp_pat
 
     mgr2 = PresetManager()
     assert mgr2.get_last_output_pattern() == "{original}_done.mkv"
+
+
+def test_preset_manager_saves_do_not_overwrite_keys_changed_elsewhere(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+
+    panel_mgr = PresetManager()
+    app_mgr = PresetManager()
+    assert panel_mgr.create_preset("MyPreset", AppSettings())
+    app_mgr.set_system_check_passed_version("9.9.9")
+    panel_mgr.set_last_selected("MyPreset")
+
+    reloaded = PresetManager()
+    assert reloaded.get_preset("MyPreset") is not None
+    assert reloaded.get_system_check_passed_version() == "9.9.9"
+    assert reloaded.get_last_selected() == "MyPreset"
+
+
+def test_preset_manager_persists_ltx_settings(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
+    ltx = AppSettings(restoration_model="ltx", ltx_seed=42, ltx_fast=True, ltx_large_canvas=True, ltx_less_overlap=True)
+
+    assert PresetManager().create_preset("Ltx", ltx)
+
+    assert PresetManager().get_preset("Ltx") == ltx

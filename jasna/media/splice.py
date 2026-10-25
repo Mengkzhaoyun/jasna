@@ -12,9 +12,10 @@ from pathlib import Path
 import av
 
 from jasna.accelerator import AcceleratorVendor
-from jasna.media import VideoMetadata, resolve_video_start_pts
-from jasna.media.audio_utils import needs_audio_reencode
+from jasna.media.probe import VideoMetadata, resolve_video_start_pts
+from jasna.media.audio_utils import aac_reencode_args, needs_audio_reencode
 from jasna.media.container_utils import (
+    MOV_SUFFIXES,
     is_mov_chapter_stream,
     subtitle_transcode_codec,
 )
@@ -79,8 +80,28 @@ class SplicePlan:
     def render_spans(self) -> tuple[SpliceSpan, ...]:
         return tuple(span for span in self.spans if span.is_render)
 
+    def render_span_segments(self) -> tuple[tuple[SegmentRange, ...], ...]:
+        """Per render span, the segment behind each of its effect ranges."""
+        remaining = iter(self.segments)
+        return tuple(tuple(next(remaining) for _ in span.effect_ranges) for span in self.render_spans)
 
-def _canonical_codec(name: str) -> str:
+
+def _models(segments: tuple[SegmentRange, ...] | list[SegmentRange]) -> set[str]:
+    """The models ``segments`` name; segments still on the job's model match any."""
+    return {segment.restoration.model for segment in segments if segment.restoration is not None}
+
+
+def require_one_model(segments: tuple[SegmentRange, ...]) -> None:
+    """One render span is restored by one model."""
+    if len(_models(segments)) > 1:
+        raise SmartRenderCompatibilityError(
+            "Ranges restored by different models are too close together to split the video "
+            "between them; move them apart or use one model for both",
+            reason="mixed_models",
+        )
+
+
+def canonical_codec(name: str) -> str:
     value = str(name).lower()
     if value in {"h265", "h.265"}:
         return "hevc"
@@ -96,10 +117,10 @@ def validate_smart_render(
     *,
     output_path: str | Path,
     codec: str,
-    retarget_high_fps: bool = False,
+    retarget_high_fps: bool,
 ) -> str:
-    input_codec = _canonical_codec(metadata.codec_name)
-    output_codec = _canonical_codec(codec)
+    input_codec = canonical_codec(metadata.codec_name)
+    output_codec = canonical_codec(codec)
     if input_codec not in SUPPORTED_SMART_CODECS:
         raise SmartRenderCompatibilityError(
             f"Smart rendering does not support input codec {metadata.codec_name!r}; "
@@ -122,13 +143,13 @@ def validate_smart_render(
     if find_executable("ffmpeg") is None:
         raise SmartRenderCompatibilityError("Smart rendering requires ffmpeg")
 
-    pixel_format = str(getattr(metadata, "pixel_format", "") or "").lower()
+    pixel_format = metadata.pixel_format.lower()
     supported_formats = {"", "yuv420p", "yuvj420p", "nv12", "yuv420p10le", "p010le"}
     if pixel_format not in supported_formats:
         raise SmartRenderCompatibilityError(
             f"Smart rendering requires 4:2:0 input; pixel format {pixel_format!r} is unsupported"
         )
-    field_order = str(getattr(metadata, "field_order", "") or "").lower()
+    field_order = metadata.field_order.lower()
     if field_order not in {"", "unknown", "progressive"}:
         raise SmartRenderCompatibilityError("Smart rendering currently requires progressive video")
     if input_codec == "h264" and metadata.is_10bit:
@@ -228,7 +249,7 @@ def resolve_smart_encoder_settings(
     if source_gop_size is not None:
         resolved["g"] = source_gop_size
 
-    if _canonical_codec(codec) != "h264":
+    if canonical_codec(codec) != "h264":
         return resolved
 
     profile = str(metadata.profile or "").strip().lower()
@@ -249,9 +270,9 @@ def resolve_smart_encoder_settings(
 def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
     keyframes: list[int] = []
     packet_pts: list[int] = []
-    with av.open(str(path)) as container:
+    with av.open(str(path), metadata_errors="replace") as container:
         stream = container.streams.video[0]
-        codec = _canonical_codec(metadata.codec_name)
+        codec = canonical_codec(metadata.codec_name)
         extradata = bytes(stream.codec_context.extradata or b"")
         length_size = 4
         length_prefixed = codec == "h264" and len(extradata) > 4 and extradata[0] == 1
@@ -356,6 +377,30 @@ def _is_safe_random_access_packet(
     return any(16 <= nal_type <= 20 for nal_type in nal_types)
 
 
+def segment_render_span(segment: SegmentRange, index: KeyframeIndex) -> SpliceSpan:
+    """The render span of one segment alone: from the keyframe at or before it to the
+    keyframe at or after it, with the segment as its one effect range."""
+    effect_start = index.start_pts + round(segment.start / index.time_base)
+    effect_end = index.start_pts + round(segment.end / index.time_base)
+    if effect_end <= effect_start:
+        raise SmartRenderCompatibilityError(
+            "A selected range is shorter than one video timestamp interval",
+            reason="range_too_short",
+        )
+    left_index = bisect.bisect_right(index.pts, effect_start) - 1
+    if left_index < 0:
+        raise SmartRenderCompatibilityError(
+            "The first selected segment begins before the first random-access keyframe",
+            reason="before_first_keyframe",
+        )
+    render_start = index.pts[left_index]
+    right_index = bisect.bisect_left(index.pts, effect_end)
+    render_end = index.pts[right_index] if right_index < len(index.pts) else index.end_pts
+    if render_end <= render_start:
+        render_end = index.end_pts
+    return SpliceSpan("render", render_start, render_end, ((effect_start, effect_end),))
+
+
 def build_splice_plan(
     segments: tuple[SegmentRange, ...] | list[SegmentRange],
     index: KeyframeIndex,
@@ -368,37 +413,25 @@ def build_splice_plan(
 
     expanded: list[tuple[int, int, list[tuple[int, int]]]] = []
     for segment in normalized:
-        effect_start = index.start_pts + round(segment.start / index.time_base)
-        effect_end = index.start_pts + round(segment.end / index.time_base)
-        if effect_end <= effect_start:
-            raise SmartRenderCompatibilityError(
-                "A selected range is shorter than one video timestamp interval",
-                reason="range_too_short",
-            )
-        left_index = bisect.bisect_right(index.pts, effect_start) - 1
-        if left_index < 0:
-            raise SmartRenderCompatibilityError(
-                "The first selected segment begins before the first random-access keyframe",
-                reason="before_first_keyframe",
-            )
-        render_start = index.pts[left_index]
-        right_index = bisect.bisect_left(index.pts, effect_end)
-        render_end = index.pts[right_index] if right_index < len(index.pts) else index.end_pts
-        if render_end <= render_start:
-            render_end = index.end_pts
-        expanded.append((render_start, render_end, [(effect_start, effect_end)]))
+        span = segment_render_span(segment, index)
+        expanded.append((span.start_pts, span.end_pts, list(span.effect_ranges), [segment]))
 
-    merged: list[tuple[int, int, list[tuple[int, int]]]] = []
-    for start, end, effects in expanded:
-        if merged and start <= merged[-1][1]:
-            old_start, old_end, old_effects = merged[-1]
-            merged[-1] = (old_start, max(old_end, end), old_effects + effects)
+    merged: list[tuple[int, int, list[tuple[int, int]], list[SegmentRange]]] = []
+    for start, end, effects, owners in expanded:
+        if merged and (
+            start < merged[-1][1]
+            or (start == merged[-1][1] and len(_models(merged[-1][3] + owners)) <= 1)
+        ):
+            old_start, old_end, old_effects, old_owners = merged[-1]
+            merged[-1] = (old_start, max(old_end, end), old_effects + effects, old_owners + owners)
         else:
-            merged.append((start, end, effects))
+            merged.append((start, end, effects, owners))
+    for *_, owners in merged:
+        require_one_model(tuple(owners))
 
     spans: list[SpliceSpan] = []
     cursor = index.start_pts
-    for start, end, effects in merged:
+    for start, end, effects, _owners in merged:
         if cursor < start:
             spans.append(SpliceSpan("copy", cursor, start))
         spans.append(SpliceSpan("render", start, end, tuple(effects)))
@@ -442,11 +475,11 @@ def create_copy_fragment(
     index: KeyframeIndex,
     destination: Path,
     *,
-    codec: str | None = None,
+    codec: str,
 ) -> None:
     if destination.exists():
         destination.unlink()
-    if _canonical_codec(codec or _codec_name(source)) == "av1":
+    if canonical_codec(codec) == "av1":
         start = index.seconds_for_pts(span.start_pts)
         duration = float((span.end_pts - span.start_pts) * index.time_base)
         args: list[str] = []
@@ -464,7 +497,10 @@ def create_copy_fragment(
         ]
         _run_ffmpeg(args, purpose=f"copy AV1 smart-render span at {start:.3f}s")
         return
-    with av.open(str(source)) as src, av.open(str(destination), "w", format="nut") as dst:
+    with (
+        av.open(str(source), metadata_errors="replace") as src,
+        av.open(str(destination), "w", format="nut") as dst,
+    ):
         in_stream = src.streams.video[0]
         out_stream = dst.add_stream_from_template(in_stream)
         src.seek(span.start_pts, stream=in_stream, backward=True)
@@ -476,11 +512,6 @@ def create_copy_fragment(
                 packet.dts -= span.start_pts
             packet.stream = out_stream
             dst.mux(packet)
-
-
-def _codec_name(path: Path) -> str:
-    with av.open(str(path)) as container:
-        return container.streams.video[0].codec_context.codec.canonical_name
 
 
 def normalize_fragment(source: Path, destination: Path, *, codec: str) -> None:
@@ -561,7 +592,7 @@ def mux_final_output(
         "-i", str(source),
         "-map", "0:v:0",
     ]
-    with av.open(str(source)) as container:
+    with av.open(str(source), metadata_errors="replace") as container:
         primary_video_index = container.streams.video[0].index
         copied_streams = []
         transcoded_subtitles = {}
@@ -594,10 +625,7 @@ def mux_final_output(
                 if stream.codec_context is not None
                 else None
             )
-            same_container_family = output_format in source_formats
-            if codec_name in supported_codecs or (
-                stream.type == "data" and same_container_family
-            ):
+            if codec_name in supported_codecs:
                 copied_streams.append(stream)
                 continue
             transcode_codec = subtitle_transcode_codec(
@@ -642,10 +670,12 @@ def mux_final_output(
         ]
         for output_index, stream in enumerate(audio_streams):
             name = stream.codec_context.name
-            if needs_audio_reencode(name, destination.suffix):
-                args += [f"-c:a:{output_index}", "aac", f"-b:a:{output_index}", "256k"]
+            if needs_audio_reencode(name, destination.suffix, supported_codecs):
+                args += aac_reencode_args(output_index)
             else:
                 args += [f"-c:a:{output_index}", "copy"]
+                if name == "aac" and destination.suffix.lower() in MOV_SUFFIXES:
+                    args += [f"-bsf:a:{output_index}", "aac_adtstoasc"]
         subtitle_streams = [
             stream for stream in copied_streams if stream.type == "subtitle"
         ]
@@ -653,7 +683,7 @@ def mux_final_output(
             transcode_codec = transcoded_subtitles.get(stream.index)
             if transcode_codec is not None:
                 args += [f"-c:s:{output_index}", transcode_codec]
-    if destination.suffix.lower() in {".mp4", ".mov"}:
+    if destination.suffix.lower() in MOV_SUFFIXES:
         tag = {"h264": "avc3", "hevc": "hev1", "av1": "av01"}[codec]
         args += ["-tag:v:0", tag, "-movflags", "+faststart"]
     args.append(str(temporary))

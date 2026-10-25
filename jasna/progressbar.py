@@ -1,9 +1,56 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 from tqdm import tqdm
+
+
+@dataclass(frozen=True)
+class StageProgress:
+    """The LTX pass running: pass ``number`` of ``count``, how far it is and its seconds
+    left (0 while not known)."""
+
+    name: str
+    number: int
+    count: int
+    fraction: float
+    seconds_left: float
+
+
+ProgressCallback = Callable[[float, float, float, int, int, StageProgress | None], None]
+"""``(percent, fps, eta_seconds, frames_done, total_frames, stage)``; ``stage`` is the LTX
+pass running, or None for frame-by-frame restoration."""
+
+class JobProgress:
+    """One bar for a job made of parts run one after another (e.g. BasicVSR++ ranges, then
+    LTX ranges). ``estimates`` holds each part's seconds before it runs, in run order. Time
+    left is the running part's own estimate (else its share of ``estimates``) plus the
+    estimates of the parts after it; the bar shows the elapsed share of the whole and never
+    goes back when an estimate grows."""
+
+    def __init__(self, callback: ProgressCallback, estimates: dict[str, float]) -> None:
+        self._callback = callback
+        self._estimates = estimates
+        self._started = time.monotonic()
+        self._reported_percent = 0.0
+
+    def part(self, name: str) -> ProgressCallback:
+        parts = list(self._estimates)
+        later = sum(self._estimates[part] for part in parts[parts.index(name) + 1 :])
+
+        def report(
+            percent: float, fps: float, eta_seconds: float, done: int, total: int, stage: StageProgress | None
+        ) -> None:
+            own = eta_seconds if eta_seconds > 0 else self._estimates[name] * (1.0 - percent / 100.0)
+            left = own + later
+            elapsed = time.monotonic() - self._started
+            job_percent = 100.0 * elapsed / (elapsed + left) if elapsed + left > 0 else 0.0
+            self._reported_percent = max(self._reported_percent, job_percent)
+            self._callback(self._reported_percent, fps, left, done, total, stage)
+
+        return report
 
 
 class Progressbar:
@@ -14,7 +61,7 @@ class Progressbar:
         total_frames: int,
         video_fps: float,
         disable: bool = False,
-        callback: Callable[[float, float, float, int, int], None] | None = None,
+        callback: ProgressCallback | None = None,
     ):
         """Initialize progressbar.
         
@@ -22,7 +69,7 @@ class Progressbar:
             total_frames: Total number of frames to process
             video_fps: Video FPS for buffer sizing
             disable: If True, suppress tqdm console output
-            callback: Optional callback(progress_pct, fps, eta_seconds, frames_done, total_frames)
+            callback: Optional ``ProgressCallback``
         """
         self.total_frames = total_frames
         self.callback = callback
@@ -104,7 +151,7 @@ class Progressbar:
                 fps = 1.0 / mean_duration if mean_duration > 0 else 0.0
                 remaining = self.total_frames - self.frames_processed
                 eta_seconds = remaining * mean_duration
-            self.callback(progress_pct, fps, eta_seconds, self.frames_processed, self.total_frames)
+            self.callback(progress_pct, fps, eta_seconds, self.frames_processed, self.total_frames, None)
 
     def _get_mean_processing_duration(self) -> float:
         """Calculate mean frame processing duration from the buffer."""

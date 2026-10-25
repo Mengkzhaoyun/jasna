@@ -8,7 +8,8 @@ import torch
 from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
 
 from jasna.crop_buffer import RawCrop
-from jasna.media import VideoMetadata
+from jasna.media.probe import VideoMetadata
+from factories import make_pipeline
 from jasna.pipeline import Pipeline
 from jasna.pipeline_items import ClipRestoreItem, FrameMeta, PrimaryRestoreResult, SecondaryRestoreResult
 from jasna.tracking.clip_tracker import TrackedClip
@@ -42,11 +43,9 @@ def _make_pipeline() -> Pipeline:
         rest_pipeline.secondary_restorer = None
         rest_pipeline.secondary_num_workers = 1
         rest_pipeline.secondary_prefers_cpu_input = False
-        p = Pipeline(
+        p = make_pipeline(
             input_video=Path("in.mp4"),
             output_video=Path("out.mkv"),
-            detection_model_name="rfdetr-v5",
-            detection_model_path=Path("model.onnx"),
             detection_score_threshold=0.25,
             restoration_pipeline=rest_pipeline,
             codec="hevc",
@@ -68,7 +67,7 @@ def _mock_inference_mode() -> MagicMock:
 
 
 def _make_two_readers(frames_batches: list[tuple[torch.Tensor, list[int]]]):
-    """Create a side_effect for NvidiaVideoReader that returns two independent readers."""
+    """Create a side_effect for VideoReader that returns two independent readers."""
     def _make_reader(batches):
         r = MagicMock()
         r.__enter__ = MagicMock(return_value=r)
@@ -99,8 +98,8 @@ class TestPipelineRunSync:
 
         with (
             patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
-            patch("jasna.pipeline_threads.NvidiaVideoReader", reader_cls),
-            patch("jasna.pipeline.NvidiaVideoEncoder", return_value=mock_encoder),
+            patch("jasna.pipeline_threads.VideoReader", reader_cls),
+            patch("jasna.pipeline.VideoEncoder", return_value=mock_encoder),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
             patch("jasna.pipeline_threads.torch.inference_mode", return_value=_mock_inference_mode()),
             patch("jasna.pipeline.torch.cuda.mem_get_info", return_value=(8 * 1024**3, 24 * 1024**3)),
@@ -193,8 +192,8 @@ class TestPipelineRunSync:
 
         with (
             patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
-            patch("jasna.pipeline_threads.NvidiaVideoReader", reader_cls),
-            patch("jasna.pipeline.NvidiaVideoEncoder", return_value=mock_encoder),
+            patch("jasna.pipeline_threads.VideoReader", reader_cls),
+            patch("jasna.pipeline.VideoEncoder", return_value=mock_encoder),
             patch("jasna.pipeline_threads.process_frame_batch", side_effect=fake_process_batch),
             patch("jasna.pipeline_threads.finalize_processing"),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
@@ -249,8 +248,8 @@ class TestPipelineRunSync:
 
         with (
             patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
-            patch("jasna.pipeline_threads.NvidiaVideoReader", reader_cls),
-            patch("jasna.pipeline.NvidiaVideoEncoder", return_value=mock_encoder),
+            patch("jasna.pipeline_threads.VideoReader", reader_cls),
+            patch("jasna.pipeline.VideoEncoder", return_value=mock_encoder),
             patch("jasna.pipeline_threads.process_frame_batch", side_effect=fake_process_batch),
             patch("jasna.pipeline_threads.finalize_processing"),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),
@@ -318,8 +317,8 @@ class TestPipelineRunSync:
 
         with (
             patch("jasna.pipeline.get_video_meta_data", return_value=_fake_metadata()),
-            patch("jasna.pipeline_threads.NvidiaVideoReader", reader_cls),
-            patch("jasna.pipeline.NvidiaVideoEncoder", return_value=mock_encoder),
+            patch("jasna.pipeline_threads.VideoReader", reader_cls),
+            patch("jasna.pipeline.VideoEncoder", return_value=mock_encoder),
             patch("jasna.pipeline_threads.process_frame_batch", side_effect=fake_process_batch),
             patch("jasna.pipeline_threads.finalize_processing"),
             patch("jasna.pipeline_threads.torch.cuda.set_device"),

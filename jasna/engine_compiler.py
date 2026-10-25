@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import subprocess
 import sys
 import typing
@@ -11,6 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from jasna._frozen import is_frozen
+from jasna.engine_paths import all_basicvsrpp_sub_engines_exist
+from jasna.license_api import require_protection
+from jasna.os_utils import get_application_executable, subprocess_no_window_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -43,11 +45,6 @@ class EngineCompilationRequest:
 @dataclass
 class EngineCompilationResult:
     use_basicvsrpp_tensorrt: bool = False
-
-
-def _basicvsrpp_engines_exist(model_path: str, fp16: bool) -> bool:
-    from jasna.engine_paths import all_basicvsrpp_sub_engines_exist
-    return all_basicvsrpp_sub_engines_exist(model_path, fp16)
 
 
 def _detection_engine_exists(
@@ -104,6 +101,7 @@ def _unet4x_engine_exists(fp16: bool) -> bool:
     if not engine_path.exists():
         return False
 
+    require_protection()
     from jasna.protection import ProtectionError, protected_model
     try:
         protected_model.decrypt_engine_bytes("unet-4x", engine_path.read_bytes())
@@ -112,55 +110,63 @@ def _unet4x_engine_exists(fp16: bool) -> bool:
     return True
 
 
+class _MissingEngines(typing.NamedTuple):
+    basicvsrpp: bool
+    detection: bool
+    unet4x: bool
+
+
+def _missing_engines(req: EngineCompilationRequest, *, nvidia: bool) -> _MissingEngines:
+    return _MissingEngines(
+        basicvsrpp=nvidia and req.basicvsrpp and req.fp16
+        and not all_basicvsrpp_sub_engines_exist(req.basicvsrpp_model_path, req.fp16),
+        detection=req.detection and not _detection_engine_exists(
+            req.detection_model_name,
+            req.detection_model_path,
+            req.detection_batch_size,
+            req.fp16,
+            req.device,
+        ),
+        unet4x=nvidia and req.unet4x and not _unet4x_engine_exists(req.fp16),
+    )
+
+
 def ensure_engines_compiled(
     req: EngineCompilationRequest,
     log_callback: typing.Callable[[str], None] | None = None,
 ) -> EngineCompilationResult:
     import torch
 
-    from jasna.accelerator import is_amd_device, is_nvidia_device
+    from jasna.accelerator import is_nvidia_device
 
     result = EngineCompilationResult()
     device = torch.device(req.device)
     nvidia = is_nvidia_device(device)
-    amd = is_amd_device(device)
 
     if req.unet4x and not nvidia:
         raise RuntimeError("unet-4x currently requires the NVIDIA TensorRT build")
 
-    need_basicvsrpp = nvidia and req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
-        req.basicvsrpp_model_path, req.fp16
-    )
-    need_detection = req.detection and not _detection_engine_exists(
-        req.detection_model_name,
-        req.detection_model_path,
-        req.detection_batch_size,
-        req.fp16,
-        req.device,
-    )
-    need_unet4x = nvidia and req.unet4x and not _unet4x_engine_exists(req.fp16)
-
-    if need_unet4x:
+    missing = _missing_engines(req, nvidia=nvidia)
+    if missing.unet4x:
         from jasna.engine_paths import unet4x_plaintext_available
-        from jasna.protection import license_store
-        if not unet4x_plaintext_available() and not license_store.is_licensed():
-            raise RuntimeError("unet-4x is a supporter feature. Enter your license to enable it.")
+        if not unet4x_plaintext_available():
+            require_protection()
+            from jasna.protection import license_store
+
+            if not license_store.is_licensed():
+                raise RuntimeError("unet-4x is a supporter feature. Enter your license to enable it.")
 
     if req.basicvsrpp and nvidia:
         if not req.fp16:
             result.use_basicvsrpp_tensorrt = False
-        elif not need_basicvsrpp:
+        elif not missing.basicvsrpp:
             result.use_basicvsrpp_tensorrt = True
 
-    if not (need_basicvsrpp or need_detection or need_unet4x):
+    if not any(missing):
         return result
 
     logger.info("Spawning GPU model compilation subprocess...")
-    start_msg = (
-        "Preparing MIGraphX model cache (this may take several minutes)..."
-        if amd
-        else "Compiling TensorRT engines (this may take several minutes)..."
-    )
+    start_msg = "Compiling TensorRT engines (this may take several minutes)..."
     # The frozen GUI drops its console (FreeConsole), leaving stdout invalid — an
     # unconditional print() there raises WinError 6. Print only on the CLI (no callback).
     if log_callback:
@@ -168,8 +174,9 @@ def ensure_engines_compiled(
     else:
         print(start_msg)
 
-    if is_frozen():
-        cmd = [sys.executable, "--compile-engines", req.to_json()]
+    frozen = is_frozen()
+    if frozen:
+        cmd = [get_application_executable(), "--compile-engines", req.to_json()]
     else:
         cmd = [sys.executable, "-m", "jasna.engine_compiler", req.to_json()]
 
@@ -180,10 +187,10 @@ def ensure_engines_compiled(
         "text": True,
         "bufsize": 1,
     }
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    proc = subprocess.Popen(cmd, **kwargs)
+    if frozen:
+        from jasna.protection.runtime import subprocess_environment
+        kwargs["env"] = subprocess_environment()
+    proc = subprocess.Popen(cmd, **kwargs, **subprocess_no_window_kwargs())
     assert proc.stdout is not None
     for line in proc.stdout:
         line = line.rstrip("\n\r")
@@ -200,7 +207,7 @@ def ensure_engines_compiled(
         raise RuntimeError(f"Engine compilation subprocess failed (exit code {returncode})")
 
     if req.basicvsrpp and nvidia:
-        result.use_basicvsrpp_tensorrt = _basicvsrpp_engines_exist(
+        result.use_basicvsrpp_tensorrt = all_basicvsrpp_sub_engines_exist(
             req.basicvsrpp_model_path, req.fp16
         )
 
@@ -223,29 +230,19 @@ def _subprocess_compile(req: EngineCompilationRequest) -> None:
     # In the compiled (Nuitka) binary that introspection raises; patch before any such import.
     from jasna._frozen import patch_frozen_torch
     patch_frozen_torch()
+    from jasna.accelerator import configure_rocm_process_env
+    configure_rocm_process_env()
 
     device = torch.device(req.device)
-    nvidia = is_nvidia_device(device)
+    missing = _missing_engines(req, nvidia=is_nvidia_device(device))
 
-    if nvidia and req.basicvsrpp and req.fp16 and not _basicvsrpp_engines_exist(
-        req.basicvsrpp_model_path, req.fp16
-    ):
-        from jasna.restorer.basicvrspp_tenorrt_compilation import compile_mosaic_restoration_model
+    if missing.basicvsrpp:
+        from jasna.restorer.basicvsrpp_sub_engines import compile_basicvsrpp_engines
         print("Compiling BasicVSR++ sub-engines...")
-        compile_mosaic_restoration_model(
-            mosaic_restoration_model_path=req.basicvsrpp_model_path,
-            device=device,
-            fp16=req.fp16,
-        )
+        compile_basicvsrpp_engines(req.basicvsrpp_model_path, device, req.fp16)
         print("BasicVSR++ sub-engines compiled.")
 
-    if req.detection and not _detection_engine_exists(
-        req.detection_model_name,
-        req.detection_model_path,
-        req.detection_batch_size,
-        req.fp16,
-        req.device,
-    ):
+    if missing.detection:
         from jasna.mosaic.detection_registry import precompile_detection_engine
         print(f"Compiling detection engine ({req.detection_model_name})...")
         precompile_detection_engine(
@@ -257,7 +254,7 @@ def _subprocess_compile(req: EngineCompilationRequest) -> None:
         )
         print("Detection engine compiled.")
 
-    if nvidia and req.unet4x and not _unet4x_engine_exists(req.fp16):
+    if missing.unet4x:
         from jasna.restorer.unet4x_secondary_restorer import compile_unet4x_engine
         print("Compiling Unet4x engine...")
         compile_unet4x_engine(device, fp16=req.fp16)

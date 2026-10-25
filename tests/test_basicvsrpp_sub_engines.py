@@ -17,10 +17,12 @@ from jasna.restorer.basicvsrpp_sub_engines import (
     _SPyNetWrapper,
     _UpsampleWrapper,
     _get_inference_generator,
-    _sub_engine_dir,
-    all_sub_engines_exist,
-    get_sub_engine_paths,
     load_sub_engines,
+)
+from jasna.engine_paths import (
+    all_basicvsrpp_sub_engines_exist as all_sub_engines_exist,
+    basicvsrpp_sub_engine_dir as _sub_engine_dir,
+    get_basicvsrpp_sub_engine_paths as get_sub_engine_paths,
 )
 
 
@@ -336,3 +338,22 @@ def test_preprocess_single_batch_calls_engine_once() -> None:
     lqs_flat = torch.zeros(PREPROCESS_BATCH, 3, 4, 4)
     assert split._preprocess(lqs_flat) == ("f", "fwd", "bwd")
     assert engine.call_count == 1
+
+
+def test_benchmark_profile_split_forward_runs_on_fused_preprocess(monkeypatch) -> None:
+    from jasna.benchmark import basicvsrpp_restoration
+    from jasna.models.basicvsrpp.mmagic.basicvsr_plusplus_net import BasicVSRPlusPlusNet
+
+    monkeypatch.setenv("JASNA_TRT_CUDAGRAPHS", "0")
+    monkeypatch.setattr(basicvsrpp_restoration, "CLIP_LENGTH", 5)
+    monkeypatch.setattr(basicvsrpp_restoration, "SIZE", 256)
+    monkeypatch.setattr(basicvsrpp_restoration, "WARMUP", 1)
+    monkeypatch.setattr(basicvsrpp_restoration, "RUNS", 1)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+    net = BasicVSRPlusPlusNet(mid_channels=16, num_blocks=2, spynet_pretrained=None)
+    net.eval()
+    split = _build_split_from_net(net)
+
+    with torch.inference_mode():
+        basicvsrpp_restoration._profile_split_forward(split, torch.device("cpu"), torch.float32)

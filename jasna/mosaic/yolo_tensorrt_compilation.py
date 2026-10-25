@@ -6,8 +6,12 @@ import logging
 import os
 import warnings
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from jasna.engine_paths import get_yolo_tensorrt_engine_path  # noqa: F401
+from jasna.engine_paths import get_yolo_tensorrt_engine_path
+
+if TYPE_CHECKING:
+    import torch
 
 
 def compile_yolo_to_tensorrt_engine(
@@ -45,6 +49,7 @@ def compile_yolo_to_tensorrt_engine(
     log.info("%s", msg)
 
     os.environ["YOLO_VERBOSE"] = "False"
+    import torch
     from ultralytics import YOLO
     from ultralytics.utils import LOGGER as YOLO_LOGGER
 
@@ -69,11 +74,15 @@ def compile_yolo_to_tensorrt_engine(
             with contextlib.redirect_stdout(null_stream), contextlib.redirect_stderr(null_stream):
                 exported = model.export(
                     format="onnx",
+                    # A CPU device object skips Ultralytics' Windows CUDA/NVML probe.
+                    device=torch.device("cpu"),
                     imgsz=int(imgsz) if isinstance(imgsz, int) else tuple(int(x) for x in imgsz),
                     dynamic=False,
                     nms=False,
                     batch=int(batch),
-                    half=bool(fp16),
+                    # Simplify and CPU FP16 conversion need onnxruntime, which releases do not bundle;
+                    # TensorRT builds the FP16 engine from the FP32 ONNX.
+                    simplify=False,
                 )
     finally:
         YOLO_LOGGER.setLevel(_prev_yolo_level)

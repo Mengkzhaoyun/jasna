@@ -68,11 +68,6 @@ RFDETR_MODEL_NAMES: frozenset[str] = frozenset(
         "rfdetr-vr-v1",
     }
 )
-YOLO_MODEL_NAMES: frozenset[str] = frozenset(
-    name
-    for name, spec in DETECTION_MODEL_SPECS.items()
-    if spec.backend == "yolo"
-)
 
 DEFAULT_DETECTION_MODEL_NAME = "rfdetr-v6"
 
@@ -178,6 +173,22 @@ def require_detection_model_weights(name: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"Detection model weights not found: {path}")
     return path
+
+
+def resolve_detection_model(
+    name: str, explicit_path: str, score_threshold: float | None
+) -> tuple[str, Path, float]:
+    """Canonical name, existing weights path and score threshold for user detector options.
+
+    An empty ``explicit_path`` means the bundled weights for ``name``; a missing
+    ``score_threshold`` means the model's recommended one.
+    """
+    name = coerce_detection_model_name(name)
+    path = Path(explicit_path) if explicit_path.strip() else require_detection_model_weights(name)
+    if not path.exists():
+        raise FileNotFoundError(f"Detection model weights not found: {path}")
+    threshold = recommended_score_threshold(name) if score_threshold is None else float(score_threshold)
+    return name, path, threshold
 
 
 def build_detection_model(

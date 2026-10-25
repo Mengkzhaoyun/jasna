@@ -18,12 +18,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from jasna.gui.queues import replace_pending
 from jasna.gui.models import AppSettings
-from jasna.media import VideoMetadata
-from jasna.segments import SegmentRange, normalize_segments
+from jasna.media.probe import VideoMetadata
+from jasna.mosaic_scan import SCAN_MASK_HW, mosaic_sizes, scan_sample_stride
 
 SCAN_SCORE_FLOOR = 0.05
-SCAN_MASK_HW = (90, 160)
 SCAN_VRAM_RESERVE_BYTES = 750 * 1024**2
 SCAN_SPILL_CHUNK_BYTES = 64 * 1024**2
 
@@ -35,13 +35,15 @@ class MosaicScanResult:
     Sample ``i`` was taken at ``times[i]`` seconds. ``scores`` holds the best
     detection score per sample (0.0 when nothing was detected), ``masks`` a
     uint8 [N, H, W] tensor of merged detection masks downscaled to
-    ``mask_size``. ``completed_until`` is the last scanned timestamp; earlier
-    than ``duration`` when the scan was stopped.
+    ``mask_size``, and ``sizes`` each sample's biggest mosaic (``mosaic_sizes``).
+    ``completed_until`` is the last scanned timestamp; earlier than ``duration``
+    when the scan was stopped.
     """
 
     times: tuple[float, ...]
     scores: tuple[float, ...]
     masks: object
+    sizes: tuple[float, ...]
     stride: float
     duration: float
     completed_until: float
@@ -58,12 +60,6 @@ class MosaicScanResult:
         if abs(self.times[index] - seconds) > float(tolerance):
             return None
         return self.times[index], self.scores[index], self.masks[index]
-
-
-def scan_sample_stride(fps: float, *, seconds: float = 1.0) -> int:
-    """Frame stride for one detection sample roughly every ``seconds``."""
-
-    return max(1, round(float(fps) * float(seconds)))
 
 
 SCAN_PARALLEL_DECODERS = 2
@@ -101,35 +97,6 @@ def segment_sample_indices(
     keeps everything from ``start``)."""
 
     return [i for i, t in enumerate(times) if t >= start and (is_last or t < end)]
-
-
-def segments_from_scores(
-    times: tuple[float, ...] | list[float],
-    scores: tuple[float, ...] | list[float],
-    *,
-    threshold: float,
-    stride: float,
-    duration: float,
-    pad: float | None = None,
-) -> tuple[SegmentRange, ...]:
-    """Merge above-threshold samples into padded, normalized time ranges."""
-
-    if len(times) != len(scores):
-        raise ValueError("times and scores must have the same length")
-    stride = float(stride)
-    if stride <= 0:
-        raise ValueError("stride must be greater than zero")
-    if pad is None:
-        pad = stride / 2
-    hits = []
-    for seconds, score in zip(times, scores):
-        if score < threshold:
-            continue
-        start = max(0.0, float(seconds) - pad)
-        end = min(float(duration), float(seconds) + stride + pad)
-        if end > start:
-            hits.append(SegmentRange(start, end))
-    return normalize_segments(hits, duration=duration)
 
 
 @dataclass(frozen=True)
@@ -220,6 +187,8 @@ class _ScanTensorCollector:
         self._spilling = False
         self._cpu_masks = None
         self._cpu_scores = None
+        self._gpu_masks = None
+        self._gpu_scores = None
 
         sample_bytes = self.mask_h * self.mask_w + 4
         required_bytes = self.capacity * sample_bytes
@@ -272,7 +241,7 @@ class _ScanTensorCollector:
         if self._spilling:
             return
         self._allocate_cpu()
-        if hasattr(self, "_gpu_masks"):
+        if self._gpu_masks is not None:
             if self.count:
                 self._cpu_masks[: self.count].copy_(self._gpu_masks[: self.count])
                 self._cpu_scores[: self.count].copy_(self._gpu_scores[: self.count])
@@ -343,7 +312,7 @@ class _ScanTensorCollector:
 class MosaicScanWorker:
     """One-shot background scan of a whole video with the detection model.
 
-    Decodes with ``NvidiaVideoReader(frame_stride=N)``, runs the configured
+    Decodes with ``VideoReader(frame_stride=N)``, runs the configured
     detector on every sampled frame at the ``SCAN_SCORE_FLOOR`` threshold, and
     collects per-sample scores plus merged low-res masks into preallocated
     tensors. A 750 MiB VRAM reserve switches collection to a reusable GPU
@@ -404,15 +373,7 @@ class MosaicScanWorker:
     ) -> None:
         if self._closed.is_set() and not allow_closed:
             return
-        try:
-            while True:
-                self._commands.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self._commands.put_nowait(command)
-        except queue.Full:
-            pass
+        replace_pending(self._commands, command)
 
     def _run(self) -> None:
         try:
@@ -434,8 +395,7 @@ class MosaicScanWorker:
             if self._on_stopped is not None:
                 self._on_stopped()
         finally:
-            if hasattr(detector, "close"):
-                detector.close()
+            detector.close()
             import gc
 
             import torch
@@ -449,66 +409,44 @@ class MosaicScanWorker:
         _install_noise_filters()
         import torch
 
-        from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
-        from jasna.mosaic.detection_registry import (
-            build_detection_model,
-            coerce_detection_model_name,
-            require_detection_model_weights,
-        )
+        from jasna.mosaic.detection_registry import resolve_detection_model
+        from jasna.session_factory import build_compiled_detection_model
 
         settings = self.settings
         device = torch.device("cuda:0")
-        det_name = coerce_detection_model_name(str(settings.detection_model))
-        detection_model_path = require_detection_model_weights(det_name)
-        ensure_engines_compiled(
-            EngineCompilationRequest(
-                device=str(device),
-                fp16=settings.fp16_mode,
-                detection=True,
-                detection_model_name=det_name,
-                detection_model_path=str(detection_model_path),
-                detection_batch_size=settings.batch_size,
-            ),
-            log_callback=lambda message: self.events.put(ScanStatus(message)),
+        detection_model_name, detection_model_path, _ = resolve_detection_model(
+            str(settings.detection_model), "", None
         )
-        detector = build_detection_model(
-            det_name,
+        detector = build_compiled_detection_model(
+            detection_model_name,
             detection_model_path,
-            batch_size=settings.batch_size,
             device=device,
-            score_threshold=SCAN_SCORE_FLOOR,
+            batch_size=settings.batch_size,
             fp16=bool(settings.fp16_mode),
+            score_threshold=SCAN_SCORE_FLOOR,
+            log_callback=lambda message: self.events.put(ScanStatus(message)),
         )
         from jasna.vr180 import (
             SbsDetectionAdapter,
             resolve_vr_mode,
         )
 
-        self._vr_resolution = resolve_vr_mode(
+        self.vr_resolution = resolve_vr_mode(
             settings.vr_mode,
             self.metadata,
             self.path,
         )
         return (
             SbsDetectionAdapter(detector)
-            if self._vr_resolution.is_sbs
+            if self.vr_resolution.is_sbs
             else detector
         )
-
-    def _prepare_detection_batch(self, batch):
-        # Detection runs on the source projection; the SBS adapter splits the
-        # eyes internally, so no whole-frame reprojection is applied here.
-        return batch
-
-    def _source_projection_masks(self, masks):
-        # Scan masks already come back in full-SBS source space.
-        return masks
 
     def _scan(self, detector) -> None:
         import torch
 
         from jasna.accelerator import is_amd_device
-        from jasna.media.video_decoder import NvidiaVideoReader
+        from jasna.media.video_decoder import VideoReader
 
         metadata = self.metadata
         device = torch.device("cuda:0")
@@ -540,7 +478,7 @@ class MosaicScanWorker:
             start_s, end_s = bounds[index], bounds[index + 1]
             is_last = index == decoders - 1
             try:
-                reader = NvidiaVideoReader(
+                reader = VideoReader(
                     str(self.path),
                     batch_size,
                     device,
@@ -607,11 +545,7 @@ class MosaicScanWorker:
                 if batch.shape[0] < batch_size:
                     pad = batch[-1:].expand(batch_size - batch.shape[0], -1, -1, -1)
                     batch = torch.cat((batch, pad))
-                detection_batch = self._prepare_detection_batch(batch)
-                batch_scores, batch_masks = detector.scan_scores_masks(
-                    detection_batch, mask_hw=SCAN_MASK_HW
-                )
-                batch_masks = self._source_projection_masks(batch_masks)
+                batch_scores, batch_masks = detector.scan_scores_masks(batch, mask_hw=SCAN_MASK_HW)
                 if collectors[index] is None:
                     collectors[index] = _ScanTensorCollector(
                         torch,
@@ -668,6 +602,11 @@ class MosaicScanWorker:
             times=tuple(times),
             scores=tuple(scores),
             masks=masks,
+            sizes=mosaic_sizes(
+                masks.numpy(),
+                frame_width=int(metadata.video_width),
+                frame_height=int(metadata.video_height),
+            ),
             stride=sample_stride_seconds,
             duration=duration,
             completed_until=completed_until,
@@ -692,12 +631,12 @@ class MosaicScanWorker:
     def _detect_mask(self, detector, command: _MaskRequest) -> ScanMaskReady:
         import torch
 
-        from jasna.media.video_decoder import NvidiaVideoReader
+        from jasna.media.video_decoder import VideoReader
 
         metadata = self.metadata
         device = torch.device("cuda:0")
         batch_size = int(self.settings.batch_size)
-        reader = NvidiaVideoReader(
+        reader = VideoReader(
             str(self.path),
             batch_size,
             device,
@@ -711,12 +650,7 @@ class MosaicScanWorker:
             if batch.shape[0] < batch_size:
                 pad = batch[-1:].expand(batch_size - batch.shape[0], -1, -1, -1)
                 batch = torch.cat((batch, pad))
-            detection_batch = self._prepare_detection_batch(batch)
-            scores, masks = detector.scan_scores_masks(
-                detection_batch,
-                mask_hw=SCAN_MASK_HW,
-            )
-            masks = self._source_projection_masks(masks)
+            scores, masks = detector.scan_scores_masks(batch, mask_hw=SCAN_MASK_HW)
             start_pts = reader.start_pts
             seconds = max(
                 0.0,

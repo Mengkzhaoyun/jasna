@@ -4,7 +4,6 @@ import atexit
 import json
 import logging
 import math
-import os
 import shutil
 import tempfile
 import threading
@@ -15,11 +14,12 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, urlparse
 
-from jasna.media import VideoMetadata
+from jasna.media.probe import VideoMetadata
 
 log = logging.getLogger(__name__)
 
 _FORWARD_SEEK_THRESHOLD = 5
+SEGMENT_WAIT_SECONDS = 30.0
 
 _PAGE_HTML = """\
 <!DOCTYPE html>
@@ -82,17 +82,17 @@ function showPlayer(){
 function startHls(){
   var v=document.getElementById('v');
   if(hls){hls.destroy();hls=null}
-  if(Hls.isSupported()){hls=new Hls({maxBufferLength:10,maxMaxBufferLength:30});hls.loadSource('/stream.m3u8');hls.attachMedia(v)}
+  if(Hls.isSupported()){hls=new Hls({maxBufferLength:10,maxMaxBufferLength:30,fragLoadPolicy:{default:{maxTimeToFirstByteMs:__FIRST_BYTE_MS__,maxLoadTimeMs:120000,timeoutRetry:{maxNumRetry:4,retryDelayMs:0,maxRetryDelayMs:0},errorRetry:{maxNumRetry:6,retryDelayMs:1000,maxRetryDelayMs:8000}}}});hls.loadSource('/stream.m3u8');hls.attachMedia(v)}
   else if(v.canPlayType('application/vnd.apple.mpegurl')){v.src='/stream.m3u8'}}
 async function changeVideo(){
-  await fetch('/stop',{method:'POST'});
+  await fetch('/open',{method:'DELETE'});
   if(hls){hls.destroy();hls=null}
   document.getElementById('v').removeAttribute('src');
   document.getElementById('player').style.display='none';
   document.getElementById('picker').style.display='flex';
   loaded=false}
 </script></body></html>
-"""
+""".replace("__FIRST_BYTE_MS__", str(int((SEGMENT_WAIT_SECONDS + 5) * 1000)))
 
 
 def _generate_vod_playlist(
@@ -130,7 +130,7 @@ class _StreamRequestHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         super().end_headers()
 
@@ -149,6 +149,13 @@ class _StreamRequestHandler(SimpleHTTPRequestHandler):
             self._handle_post()
         except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
             pass
+
+    def do_DELETE(self):
+        if self.path.split("?")[0] != "/open":
+            self.send_error(404)
+            return
+        self._state.stop_current()
+        self._send_json({"status": "stopped"})
 
     def _handle_get(self):
         path = self.path.split("?")[0]
@@ -194,12 +201,15 @@ class _StreamRequestHandler(SimpleHTTPRequestHandler):
             if not self._state.is_loaded:
                 self.send_error(404)
                 return
+            epoch = parse_qs(urlparse(self.path).query).get("epoch", [None])[0]
+            if epoch is not None and epoch != str(self._state.playback_epoch):
+                self.send_error(404)
+                return
             seg_name = path.lstrip("/")
             seg_path = self._state.segments_dir / seg_name
             seg_num = self._parse_segment_number(seg_name)
-            if seg_num is not None:
+            if self._state.segment_is_ready(seg_path):
                 self._state.notify_segment_requested(seg_num)
-            if seg_path.exists() and seg_path.stat().st_size > 0:
                 self._serve_file(seg_path)
                 return
 
@@ -207,22 +217,26 @@ class _StreamRequestHandler(SimpleHTTPRequestHandler):
                 self.send_error(404)
                 return
 
-            if self._state.needs_seek(seg_num):
-                self._state.request_seek(seg_num)
+            generation = self._state.pass_generation
+            seeking = self._state.needs_seek(seg_num)
+            if seeking and (epoch is None or not self._state.request_seek(seg_num, expected_epoch=int(epoch))):
+                self.send_error(404)
+                return
+            self._state.notify_segment_requested(seg_num)
 
-            deadline = time.monotonic() + 30.0
+            deadline = time.monotonic() + SEGMENT_WAIT_SECONDS
             while time.monotonic() < deadline:
                 if not self._state.is_loaded:
                     self.send_error(404)
                     return
-                try:
+                if self._state.segment_is_ready(seg_path):
                     sz = seg_path.stat().st_size
-                except OSError:
-                    sz = -1
-                if sz > 0:
                     log.debug("[stream-server] serving %s (%d bytes, waited %.1fs)",
-                              seg_name, sz, 30.0 - (deadline - time.monotonic()))
+                              seg_name, sz, SEGMENT_WAIT_SECONDS - (deadline - time.monotonic()))
                     self._serve_file(seg_path)
+                    return
+                if not self._state.can_wait_for_segment(seg_num, generation, seeking):
+                    self.send_error(404)
                     return
                 time.sleep(0.2)
 
@@ -241,39 +255,36 @@ class _StreamRequestHandler(SimpleHTTPRequestHandler):
             self._send_json({"path": selected})
             return
 
-        if path in ("/api/stop", "/stop"):
-            self._state.stop_current()
-            self._send_json({"ok": True})
-            return
-
-        if path in ("/api/load", "/open"):
+        if path == "/open":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length)) if length > 0 else {}
             video_path = str(body.get("path", "")).strip()
             if not video_path or not Path(video_path).is_file():
                 self._send_json({"error": "File not found"}, status=400)
                 return
-            start = float(body.get("start", 0))
+            try:
+                start = float(body.get("start", 0))
+            except (TypeError, ValueError):
+                self._send_json({"error": "Invalid start time"}, status=400)
+                return
+            if not math.isfinite(start):
+                self._send_json({"error": "Invalid start time"}, status=400)
+                return
             same_video = (
                 self._state.is_loaded
                 and self._state._current_video_path == Path(video_path)
             )
-            if path == "/open":
-                if same_video:
-                    if start > 0:
-                        target_seg = int(start / self._state.segment_duration)
-                        self._state.request_seek(target_seg)
+            if same_video:
+                if start > 0:
+                    target_seg = int(start / self._state.segment_duration)
+                    self._state.request_seek(target_seg, new_playback=True)
+                self._send_json({"status": "ready"})
+            else:
+                self._state.select_video(Path(video_path), start)
+                if self._state.wait_until_first_segment(timeout=30.0):
                     self._send_json({"status": "ready"})
                 else:
-                    self._state.select_video(Path(video_path))
-                    ok = self._state.wait_until_first_segment(timeout=30.0)
-                    if ok:
-                        self._send_json({"status": "ready"})
-                    else:
-                        self._send_json({"error": "Timed out waiting for stream to be ready"}, status=500)
-            else:
-                self._state.select_video(Path(video_path))
-                self._send_json({"ok": True, "filename": Path(video_path).name})
+                    self._send_json({"error": "Timed out waiting for stream to be ready"}, status=500)
             return
 
         self.send_error(404)
@@ -351,6 +362,8 @@ class HlsStreamingServer:
         self._finished = False
 
         self._pending_video: Path | None = None
+        self.initial_start_segment = 0
+        self.playback_epoch = 0
         self._current_video_path: Path | None = None
         self._video_selected = threading.Event()
         self.video_change = threading.Event()
@@ -359,7 +372,6 @@ class HlsStreamingServer:
         self._seek_lock = threading.Lock()
         self.seek_requested = threading.Event()
         self.seek_target_segment: int = -1
-        self._last_seek_time: float = 0.0
 
         self._max_segments_kept: int = 2 * max_segments_ahead
 
@@ -367,6 +379,8 @@ class HlsStreamingServer:
         self._highest_requested_segment: int = -1
         self._current_pass_start: int = 0
         self._produced_segment: int = -1
+        self._evicted_through: int = -1
+        self._pass_generation = 0
 
         self._httpd: HTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -380,8 +394,11 @@ class HlsStreamingServer:
         self._vod_playlist = ""
         self.video_change.set()
 
-    def select_video(self, path: Path) -> None:
+    def select_video(self, path: Path, start: float) -> None:
         self._pending_video = path
+        self.initial_start_segment = max(0, int(start / self.segment_duration))
+        with self._seek_lock:
+            self.playback_epoch += 1
         self._current_video_path = path
         self._first_segment_ready.clear()
         if self.metadata is not None:
@@ -403,6 +420,7 @@ class HlsStreamingServer:
             total_duration=metadata.duration,
             segment_duration=self.segment_duration,
         )
+        self.initial_start_segment = min(self.initial_start_segment, self.segment_count - 1)
         self._finished = False
         self.video_change.clear()
         self.seek_requested.clear()
@@ -411,6 +429,8 @@ class HlsStreamingServer:
             self._highest_requested_segment = -1
             self._current_pass_start = 0
             self._produced_segment = -1
+            self._evicted_through = -1
+            self._pass_generation += 1
 
     def unload_video(self) -> None:
         self.metadata = None
@@ -426,16 +446,53 @@ class HlsStreamingServer:
 
     @property
     def playlist_text(self) -> str:
-        return self._vod_playlist
+        return self._vod_playlist.replace(".ts\n", f".ts?epoch={self.playback_epoch}\n")
 
     def playlist_text_from(self, start_segment: int) -> str:
         if start_segment <= 0 or self.metadata is None:
-            return self._vod_playlist
+            return self.playlist_text
         text, _ = _generate_vod_playlist(self.metadata.duration, self.segment_duration, start_segment)
-        return text
+        return text.replace(".ts\n", f".ts?epoch={self.playback_epoch}\n")
 
     def mark_finished(self) -> None:
         self._finished = True
+
+    def segment_is_ready(self, segment_path: Path) -> bool:
+        if not segment_path.is_file():
+            return False
+        try:
+            playlist = (self.segments_dir / "_hls_internal.m3u8").read_text()
+        except FileNotFoundError:
+            return False
+        return segment_path.name in playlist.splitlines()
+
+    @property
+    def pass_generation(self) -> int:
+        with self._demand_lock:
+            return self._pass_generation
+
+    def can_wait_for_segment(self, segment: int, generation: int, seeking: bool) -> bool:
+        with self._seek_lock:
+            pending_target = self.seek_target_segment if self.seek_requested.is_set() else None
+            latest_target = self.seek_target_segment
+        with self._demand_lock:
+            if self._pass_generation != generation:
+                return (
+                    seeking
+                    and self._pass_generation == generation + 1
+                    and self._current_pass_start == segment
+                    and pending_target in (None, segment)
+                    and latest_target == segment
+                )
+            if pending_target is not None and pending_target != segment:
+                return False
+            if (
+                segment < self._current_pass_start
+                or segment <= self._evicted_through
+                or self._finished
+            ):
+                return seeking and latest_target == segment
+            return True
 
     def wait_until_first_segment(self, timeout: float = 30.0) -> bool:
         return self._first_segment_ready.wait(timeout=timeout)
@@ -454,12 +511,21 @@ class HlsStreamingServer:
     def frames_per_segment(self) -> int:
         return max(1, int(self.metadata.video_fps * self.segment_duration))
 
-    def request_seek(self, segment_index: int) -> None:
+    def request_seek(
+        self,
+        segment_index: int,
+        *,
+        new_playback: bool = False,
+        expected_epoch: int | None = None,
+    ) -> bool:
         with self._seek_lock:
-            now = time.monotonic()
+            if expected_epoch is not None and expected_epoch != self.playback_epoch:
+                return False
+            if new_playback:
+                self.playback_epoch += 1
             self.seek_target_segment = segment_index
-            self._last_seek_time = now
             self.seek_requested.set()
+            return True
 
     def consume_seek(self) -> int | None:
         with self._seek_lock:
@@ -471,7 +537,9 @@ class HlsStreamingServer:
 
     def consume_seek_for_pass(self, start_segment: int) -> int | None:
         target = self.consume_seek()
-        if target == start_segment:
+        with self._demand_lock:
+            evicted = target is not None and target <= self._evicted_through
+        if target == start_segment and not evicted:
             log.debug(
                 "[stream-server] ignoring seek to active segment %d",
                 start_segment,
@@ -500,6 +568,8 @@ class HlsStreamingServer:
                 continue
             if num < min_keep:
                 f.unlink(missing_ok=True)
+                with self._demand_lock:
+                    self._evicted_through = max(self._evicted_through, num)
 
     def wait_for_demand(
         self,
@@ -508,20 +578,26 @@ class HlsStreamingServer:
         cancel_event: threading.Event,
     ) -> None:
         with self._demand_lock:
-            if (
-                self._highest_requested_segment >= 0
-                and current_segment > self._highest_requested_segment + max_ahead
-            ):
+            if self._writer_is_ahead_of_player(current_segment, max_ahead):
                 log.debug(
                     "[stream-server] pausing pipeline at segment %d (player at %d, max_ahead=%d)",
                     current_segment, self._highest_requested_segment, max_ahead,
                 )
             while (
-                self._highest_requested_segment >= 0
-                and current_segment > self._highest_requested_segment + max_ahead
+                self._writer_is_ahead_of_player(current_segment, max_ahead)
                 and not cancel_event.is_set()
             ):
                 self._demand_lock.wait(timeout=0.5)
+
+    def _writer_is_ahead_of_player(self, current_segment: int, max_ahead: int) -> bool:
+        # current_segment is a frame-count estimate that drifts ahead of the muxer's
+        # keyframe cuts; pausing before the requested segment is muxed would deadlock.
+        requested = self._highest_requested_segment
+        return (
+            requested >= 0
+            and current_segment > requested + max_ahead
+            and self.segment_is_ready(self.segments_dir / f"seg_{requested:05d}.ts")
+        )
 
     def update_production(self, segment: int) -> None:
         with self._demand_lock:
@@ -532,7 +608,7 @@ class HlsStreamingServer:
 
     def needs_seek(self, segment: int) -> bool:
         with self._demand_lock:
-            if segment < self._current_pass_start:
+            if segment < self._current_pass_start or segment <= self._evicted_through or self._finished:
                 return True
             if segment > self._produced_segment + _FORWARD_SEEK_THRESHOLD:
                 return True
@@ -544,6 +620,9 @@ class HlsStreamingServer:
             self._highest_requested_segment = start_segment - 1
             self._current_pass_start = start_segment
             self._produced_segment = start_segment - 1
+            self._evicted_through = -1
+            self._pass_generation += 1
+            self._finished = False
             self._demand_lock.notify_all()
 
     def start(self) -> str:

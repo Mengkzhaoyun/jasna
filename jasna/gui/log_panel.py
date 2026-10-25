@@ -1,5 +1,6 @@
 """Log panel - collapsible bottom section for processing logs."""
 
+from collections import deque
 from collections.abc import Callable
 import customtkinter as ctk
 from datetime import datetime
@@ -8,6 +9,9 @@ from jasna.gui.theme import Colors, Fonts, Sizing
 from jasna.gui.locales import t
 from jasna.gui.log_export import export_log_entries_txt
 from jasna.gui.log_filter import should_include_log_entry
+from jasna.gui.settings_sections.widgets import ValueOptionMenu
+
+_MAX_LOG_ENTRIES = 5000
 
 
 class LogPanel(ctk.CTkFrame):
@@ -23,7 +27,7 @@ class LogPanel(ctk.CTkFrame):
         )
         self.pack_propagate(False)
         
-        self._entries: list[tuple[str, str, str]] = []  # (timestamp, level, message)
+        self._entries: deque[tuple[str, str, str]] = deque(maxlen=_MAX_LOG_ENTRIES)  # (timestamp, level, message)
         self._filter_level = "all"
         self._filter_changed_callback: Callable[[str], None] | None = None
         
@@ -52,9 +56,14 @@ class LogPanel(ctk.CTkFrame):
         )
         filter_icon.pack(side="left", padx=(8, 2))
         
-        self._filter_dropdown = ctk.CTkOptionMenu(
+        self._filter_dropdown = ValueOptionMenu(
             toolbar,
-            values=[t("filter_debug"), t("filter_info"), t("filter_warn"), t("filter_error")],
+            options={
+                "debug": t("filter_debug"),
+                "info": t("filter_info"),
+                "warning": t("filter_warn"),
+                "error": t("filter_error"),
+            },
             font=(Fonts.FAMILY, Fonts.SIZE_TINY),
             fg_color=Colors.BG_PANEL,
             button_color=Colors.BG_PANEL,
@@ -67,8 +76,8 @@ class LogPanel(ctk.CTkFrame):
             command=self._on_filter_changed,
         )
         self._filter_dropdown.pack(side="left")
-        self._filter_dropdown.set(t("filter_info"))
-        self._filter_level = "info"  # Default to Info
+        self._filter_dropdown.set_value("info")
+        self._filter_level = "info"
         
         # Right side buttons
         self._export_btn = ctk.CTkButton(
@@ -103,15 +112,8 @@ class LogPanel(ctk.CTkFrame):
         self._log_text._textbox.tag_config("timestamp", foreground=Colors.TEXT_PRIMARY)
         self._log_text._textbox.tag_config("message", foreground=Colors.TEXT_PRIMARY)
         
-    def _on_filter_changed(self, value: str):
-        # Map translated values to internal filter levels
-        filter_map = {
-            t("filter_debug"): "debug",
-            t("filter_error"): "error",
-            t("filter_warn"): "warning",
-            t("filter_info"): "info",
-        }
-        self._filter_level = filter_map.get(value, "debug")
+    def _on_filter_changed(self, level: str):
+        self._filter_level = level
         if self._filter_changed_callback is not None:
             self._filter_changed_callback(self._filter_level)
         self._refresh_display()
@@ -152,13 +154,18 @@ class LogPanel(ctk.CTkFrame):
     def add_log(self, level: str, message: str):
         timestamp = datetime.now().strftime("%I:%M:%S %p")
         level = level.upper()
+        self._log_text.configure(state="normal")
+        if len(self._entries) == self._entries.maxlen:
+            _, oldest_level, oldest_message = self._entries[0]
+            if should_include_log_entry(level=oldest_level, filter_level=self._filter_level):
+                oldest_line_count = oldest_message.count("\n") + 1
+                self._log_text._textbox.delete("1.0", f"{oldest_line_count + 1}.0")
         self._entries.append((timestamp, level, message))
 
         if should_include_log_entry(level=level, filter_level=self._filter_level):
-            self._log_text.configure(state="normal")
             self._insert_entry(timestamp, level, message)
-            self._log_text.configure(state="disabled")
             self._log_text.see("end")
+        self._log_text.configure(state="disabled")
             
     def info(self, message: str):
         self.add_log("INFO", message)

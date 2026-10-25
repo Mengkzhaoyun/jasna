@@ -5,6 +5,7 @@ import tkinter as tk
 import customtkinter as ctk
 
 from jasna.gui import scaling
+from jasna.gui.components import Tooltip
 from jasna.gui.locales import t
 from jasna.gui.theme import Colors, Fonts
 
@@ -12,6 +13,19 @@ from jasna.gui.theme import Colors, Fonts
 def get_tooltip(key: str) -> str:
     """Get localized tooltip for a setting key."""
     return t(f"tip_{key}")
+
+
+def add_setting_label(row, label_key: str, tooltip_key: str | None = None, *, in_card: bool = False) -> None:
+    """Pack a setting's name and its ⓘ tooltip icon at the left of ``row``."""
+    label = ctk.CTkLabel(row, text=t(label_key), text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_NORMAL))
+    tip = ctk.CTkLabel(row, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
+    if in_card:
+        label.pack(side="left", padx=12, pady=8)
+        tip.pack(side="left")
+    else:
+        label.pack(side="left")
+        tip.pack(side="left", padx=4)
+    Tooltip(tip, get_tooltip(tooltip_key or label_key))
 
 
 def create_slider_value_label(
@@ -39,7 +53,7 @@ class ValueOptionMenu(ctk.CTkOptionMenu):
     reading the selection never requires a reverse lookup through translations.
     """
 
-    def __init__(self, master, *, options: dict[str, str], command, **kwargs):
+    def __init__(self, master, *, options: dict[str, str], command=None, **kwargs):
         self._value_to_label = dict(options)
         self._label_to_value = {label: value for value, label in options.items()}
         self._value_command = command
@@ -51,7 +65,8 @@ class ValueOptionMenu(ctk.CTkOptionMenu):
         )
 
     def _on_label_selected(self, label: str):
-        self._value_command(self._label_to_value[label])
+        if self._value_command is not None:
+            self._value_command(self._label_to_value[label])
 
     def get_value(self) -> str:
         return self._label_to_value[self.get()]
@@ -61,3 +76,12 @@ class ValueOptionMenu(ctk.CTkOptionMenu):
         if label is None:
             label = next(iter(self._value_to_label.values()))
         self.set(label)
+
+
+def pack_rows(rows: list[tuple[tk.Misc, dict]], hidden: tuple[tk.Misc, ...]) -> None:
+    """Pack ``rows`` (widget, pack options) in order, leaving out ``hidden``."""
+    for row, _options in rows:
+        row.pack_forget()
+    for row, options in rows:
+        if row not in hidden:
+            row.pack(**options)

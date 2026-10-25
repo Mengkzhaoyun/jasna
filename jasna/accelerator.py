@@ -2,17 +2,20 @@ from __future__ import annotations
 
 from collections.abc import MutableMapping
 from contextlib import nullcontext
-from dataclasses import dataclass
+import ctypes
 from enum import StrEnum
+import functools
 import os
+import sys
 from typing import Any
 
 import torch
 
-# NORMAL benchmarks every unseen convolution problem. BasicVSR++ has fixed
-# spatial dimensions but a variable temporal clip length (and therefore variable
-# effective convolution batches), so FAST avoids repeated runtime profiling while
-# still using MIOpen's system/user performance databases. Users can override this.
+# BasicVSR++ meets a new convolution batch for every clip length. FAST never
+# writes the user FindDb, and the Windows ROCm wheels ship no system FindDb
+# (ROCm/TheRock#7958), so every miss falls back to slow heuristic kernels forever.
+# HYBRID runs a real find once per new problem and keeps the result across runs
+# (issue #481: 4x faster primary restoration once the DB is seeded).
 #
 # Expandable segments release memory by unmapping virtual address ranges rather
 # than by a device-synchronizing free, so a VramOffloader empty_cache() could
@@ -20,69 +23,33 @@ import torch
 # #252 caught a restorer fp16 GEMM faulting with "Page not present". The env
 # names cover the versions in the field; whichever one the build reads wins.
 def apply_rocm_env_defaults(environ: MutableMapping[str, str]) -> None:
-    environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+    environ.setdefault("MIOPEN_FIND_MODE", "HYBRID")
     environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:False")
     environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
+    environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 
 
-if getattr(torch.version, "hip", None):
-    apply_rocm_env_defaults(os.environ)
+def configure_rocm_process_env() -> None:
+    """Apply the ROCm defaults to this process; call at entry points before GPU work."""
+    if torch.version.hip:
+        apply_rocm_env_defaults(os.environ)
 
 
 class AcceleratorVendor(StrEnum):
     NVIDIA = "nvidia"
     AMD = "amd"
-    INTEL = "intel"
     CPU = "cpu"
-
-
-@dataclass(frozen=True)
-class AcceleratorCapabilities:
-    vendor: AcceleratorVendor
-    pytorch_device_type: str
-    tensorrt: bool
-    nvcodec: bool
-    amf: bool
-    xpu: bool
 
 
 def vendor_for_device(device: torch.device | str | None = None) -> AcceleratorVendor:
     resolved = torch.device(device) if device is not None else None
     if resolved is not None and resolved.type == "cpu":
         return AcceleratorVendor.CPU
-    if resolved is not None and resolved.type == "xpu":
-        return AcceleratorVendor.INTEL
-    if getattr(torch.version, "hip", None):
+    if torch.version.hip:
         return AcceleratorVendor.AMD
-    if resolved is None:
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None and xpu.is_available():
-            return AcceleratorVendor.INTEL
-    if getattr(torch.version, "cuda", None):
+    if torch.version.cuda:
         return AcceleratorVendor.NVIDIA
     return AcceleratorVendor.CPU
-
-
-def capabilities_for_device(
-    device: torch.device | str | None = None,
-) -> AcceleratorCapabilities:
-    vendor = vendor_for_device(device)
-    device_type = (
-        torch.device(device).type
-        if device is not None
-        else "xpu" if vendor is AcceleratorVendor.INTEL else "cuda" if vendor in {
-            AcceleratorVendor.NVIDIA,
-            AcceleratorVendor.AMD,
-        } else "cpu"
-    )
-    return AcceleratorCapabilities(
-        vendor=vendor,
-        pytorch_device_type=device_type,
-        tensorrt=vendor is AcceleratorVendor.NVIDIA,
-        nvcodec=vendor is AcceleratorVendor.NVIDIA,
-        amf=vendor is AcceleratorVendor.AMD,
-        xpu=vendor is AcceleratorVendor.INTEL,
-    )
 
 
 def is_nvidia_device(device: torch.device | str | None = None) -> bool:
@@ -168,6 +135,41 @@ def reset_peak_memory_stats(device: torch.device | str) -> None:
 def mem_get_info(device: torch.device | str) -> tuple[int, int]:
     module = device_module(torch.device(device))
     return module.mem_get_info(torch.device(device))
+
+
+class _NvmlMemory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
+
+
+@functools.cache
+def _nvml_device(uuid: str):
+    nvml = ctypes.WinDLL("nvml.dll")
+    _nvml_check(nvml, nvml.nvmlInit_v2())
+    handle = ctypes.c_void_p()
+    _nvml_check(nvml, nvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}".encode(), ctypes.byref(handle)))
+    return nvml, handle
+
+
+def _nvml_check(nvml, status: int) -> None:
+    if status:
+        nvml.nvmlErrorString.restype = ctypes.c_char_p
+        raise RuntimeError(f"NVML: {nvml.nvmlErrorString(status).decode()}")
+
+
+def _nvml_free_bytes(device: torch.device) -> int:
+    nvml, handle = _nvml_device(str(torch.cuda.get_device_properties(device).uuid))
+    memory = _NvmlMemory()
+    _nvml_check(nvml, nvml.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory)))
+    return memory.free
+
+
+def device_free_bytes(device: torch.device) -> int:
+    """VRAM free on the whole GPU. On Windows, CUDA counts only this process's memory (WDDM
+    hides every other process's), so NVML's device-wide figure caps it there."""
+    free = torch.cuda.mem_get_info(device)[0]
+    if sys.platform == "win32":
+        return min(free, _nvml_free_bytes(device))
+    return free
 
 
 def device_name(device: torch.device | str) -> str:

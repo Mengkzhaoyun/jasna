@@ -1,34 +1,9 @@
 import pytest
 import torch
 
-from jasna.tensor_utils import to_device, pad_batch_with_last
+from jasna.tensor_utils import pad_batch_with_last
 
 REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-
-
-def test_to_device_same_device_returns_same_tensor() -> None:
-    t = torch.randn(3, 4)
-    result = to_device(t, torch.device("cpu"))
-    assert result is t
-
-
-@REQUIRES_CUDA
-def test_to_device_cpu_to_cuda_contiguous() -> None:
-    src = torch.randn(3, 4)
-    result = to_device(src, torch.device("cuda:0"))
-    assert result.device.type == "cuda"
-    assert result.is_contiguous()
-    assert torch.equal(result.cpu(), src)
-
-
-@REQUIRES_CUDA
-def test_to_device_cpu_to_cuda_non_contiguous() -> None:
-    src = torch.randn(4, 4).t()
-    assert not src.is_contiguous()
-    result = to_device(src, torch.device("cuda:0"))
-    assert result.device.type == "cuda"
-    assert result.is_contiguous()
-    assert torch.equal(result.cpu(), src)
 
 
 def test_pad_batch_with_last_no_padding() -> None:
@@ -63,3 +38,26 @@ def test_pad_batch_with_last_rejects_empty_batch() -> None:
 def test_pad_batch_with_last_rejects_oversized_batch() -> None:
     with pytest.raises(ValueError, match="exceeds target batch_size 4"):
         pad_batch_with_last(torch.ones((5, 1)), batch_size=4)
+
+
+def test_compile_static_runs_eager_where_inductor_has_no_bf16(monkeypatch) -> None:
+    from jasna.tensor_utils import compile_static
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (7, 5))
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: pytest.fail("compiled before SM 8.0"))
+
+    def double(x):
+        return x * 2
+
+    assert compile_static(double, mode="default", device=torch.device("cuda")) is double
+
+
+def test_compile_static_compiles_from_sm80(monkeypatch) -> None:
+    from jasna.tensor_utils import compile_static
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (8, 6))
+    calls = []
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: calls.append(kwargs) or "compiled")
+
+    assert compile_static(lambda x: x, mode="default", device=torch.device("cuda")) == "compiled"
+    assert calls == [{"dynamic": False, "mode": "default"}]

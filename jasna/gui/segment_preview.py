@@ -10,12 +10,25 @@ from typing import Iterator
 import av
 from PIL import Image
 
-from jasna.media import VideoMetadata, get_video_meta_data, resolve_video_start_pts
+from jasna.gui.queues import replace_pending
+from jasna.media.container_utils import demux_video
+from jasna.media.probe import VideoMetadata, get_video_meta_data, resolve_video_start_pts
+from jasna.media.splice import KeyframeIndex, probe_keyframes
+
+
+def _decode_video(container, stream) -> Iterator[av.VideoFrame]:
+    return (frame for packet in demux_video(container, stream) for frame in packet.decode())
 
 
 @dataclass(frozen=True)
 class PreviewLoaded:
     metadata: VideoMetadata
+
+
+@dataclass(frozen=True)
+class PreviewKeyframes:
+    index: KeyframeIndex | None
+    error: str | None
 
 
 @dataclass(frozen=True)
@@ -69,7 +82,7 @@ class _Stop:
     pass
 
 
-PreviewEvent = PreviewLoaded | PreviewFrame | PreviewFullFrame | PreviewEnded | PreviewFailed
+PreviewEvent = PreviewLoaded | PreviewKeyframes | PreviewFrame | PreviewFullFrame | PreviewEnded | PreviewFailed
 _Command = _Seek | _Next | _Previous | _GrabFull | _Stop
 
 
@@ -108,10 +121,8 @@ class SegmentPreviewWorker:
     def next_frame(self) -> None:
         if self._closed.is_set():
             return
-        try:
+        if self._commands.empty():
             self._commands.put_nowait(_Next(self._generation))
-        except queue.Full:
-            pass
 
     def previous_frame(self, seconds: float) -> int:
         self._generation += 1
@@ -133,15 +144,7 @@ class SegmentPreviewWorker:
     def _replace_command(self, command: _Command, *, allow_closed: bool = False) -> None:
         if self._closed.is_set() and not allow_closed:
             return
-        try:
-            while True:
-                self._commands.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            self._commands.put_nowait(command)
-        except queue.Full:
-            pass
+        replace_pending(self._commands, command)
 
     def _run(self) -> None:
         try:
@@ -156,7 +159,13 @@ class SegmentPreviewWorker:
                 self.path,
             ).is_sbs
             self.events.put(PreviewLoaded(metadata))
-            with av.open(str(self.path)) as container:
+            threading.Thread(
+                target=self._probe_keyframes,
+                args=(metadata,),
+                name=f"segment-keyframes-{self.path.name}",
+                daemon=True,
+            ).start()
+            with av.open(str(self.path), metadata_errors="replace") as container:
                 stream = container.streams.video[0]
                 start_pts = resolve_video_start_pts(stream.start_time, metadata.start_pts)
                 if not stream.codec_context.is_hwaccel:
@@ -211,10 +220,18 @@ class SegmentPreviewWorker:
             if not self._closed.is_set():
                 self.events.put(PreviewFailed(str(exc)))
 
+    def _probe_keyframes(self, metadata: VideoMetadata) -> None:
+        try:
+            event = PreviewKeyframes(probe_keyframes(self.path, metadata), None)
+        except Exception as exc:
+            event = PreviewKeyframes(None, str(exc))
+        if not self._closed.is_set():
+            self.events.put(event)
+
     def _seek(self, container, stream, seconds: float, start_pts: int):
         target_pts = start_pts + round(float(seconds) / stream.time_base)
         container.seek(target_pts, stream=stream, backward=True)
-        decoded = container.decode(stream)
+        decoded = _decode_video(container, stream)
         closest = None
         for frame in decoded:
             closest = frame
@@ -230,7 +247,7 @@ class SegmentPreviewWorker:
             stream=stream,
             backward=True,
         )
-        decoded = container.decode(stream)
+        decoded = _decode_video(container, stream)
         previous = None
         for frame in decoded:
             if frame.pts is None or frame.pts >= target_pts:

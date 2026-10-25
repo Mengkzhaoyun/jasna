@@ -4,9 +4,13 @@ import threading
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+import pytest
+
 from jasna.gui.processor import Processor, ProgressUpdate
 from jasna.gui.models import JobItem, JobStatus, AppSettings
 from jasna.post_export_action import PostExportVideoCommandError
+
+pytestmark = pytest.mark.usefixtures("no_gpu_cleanup", "tk_garbage_collected")
 
 
 def _make_jobs(*names: str) -> list[JobItem]:
@@ -56,7 +60,7 @@ class TestProcessorPullLoop:
         p = Processor()
         jobs = _make_jobs("a.mp4", "b.mp4", "c.mp4")
 
-        def fake_pipeline(job_id, inp, out):
+        def fake_pipeline(job_id, inp, out, **_kwargs):
             processed_ids.append(job_id)
 
         with patch.object(p, "_run_pipeline", side_effect=fake_pipeline):
@@ -65,12 +69,26 @@ class TestProcessorPullLoop:
                 AppSettings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
         assert processed_ids == [jobs[0].id, jobs[1].id, jobs[2].id]
         assert all(j.status == JobStatus.COMPLETED for j in jobs)
+
+    def test_unsupported_video_is_skipped_with_its_reason_and_the_queue_continues(self):
+        from jasna.media.probe import UnsupportedVideoError
+
+        updates: list[ProgressUpdate] = []
+        p = Processor(on_progress=updates.append)
+        jobs = _make_jobs("a_vr.mp4", "b_clip.mp4")
+        reason = "LTX does not support VR180 side-by-side video; restore it with BasicVSR++"
+
+        with patch.object(p, "_run_pipeline", side_effect=[UnsupportedVideoError(reason), None]):
+            p.start(jobs, AppSettings(), output_folder="", output_pattern="{original}_restored.mp4")
+            p.join(timeout=5.0)
+
+        assert [j.status for j in jobs] == [JobStatus.SKIPPED, JobStatus.COMPLETED]
+        assert any(u.job_id == jobs[0].id and u.status is JobStatus.SKIPPED and u.message == reason for u in updates)
 
     def test_skips_removed_pending_job(self):
         processed_ids: list[int] = []
@@ -79,7 +97,7 @@ class TestProcessorPullLoop:
 
         call_count = [0]
 
-        def fake_pipeline(job_id, inp, out):
+        def fake_pipeline(job_id, inp, out, **_kwargs):
             processed_ids.append(job_id)
             call_count[0] += 1
             if call_count[0] == 1:
@@ -92,7 +110,6 @@ class TestProcessorPullLoop:
                 AppSettings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
@@ -111,7 +128,6 @@ class TestProcessorPullLoop:
                 AppSettings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
@@ -126,7 +142,7 @@ class TestProcessorPullLoop:
 
         call_count = [0]
 
-        def fake_pipeline(job_id, inp, out):
+        def fake_pipeline(job_id, inp, out, **_kwargs):
             processed_filenames.append(inp.name)
             call_count[0] += 1
             if call_count[0] == 1:
@@ -143,42 +159,36 @@ class TestProcessorPullLoop:
                 AppSettings(),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
         assert processed_filenames == ["a.mp4", "c.mp4", "b.mp4"]
 
-    def test_runs_post_export_action_after_queue_completes(self):
-        calls: list[tuple[str, str]] = []
-        p = Processor()
+    def test_reports_finished_queue_on_complete(self):
+        finished: list[bool] = []
+        p = Processor(on_complete=finished.append)
         jobs = _make_jobs("a.mp4")
 
-        with (
-            patch.object(p, "_run_pipeline"),
-            patch("jasna.post_export_action.run_post_export_action", lambda action, command: calls.append((action, command))),
-        ):
+        with patch.object(p, "_run_pipeline"):
             p.start(
                 jobs,
-                AppSettings(post_export_action="command", post_export_command="echo done"),
+                AppSettings(post_export_action="shutdown"),
                 output_folder="",
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
-        assert calls == [("command", "echo done")]
+        assert finished == [True]
 
-    def test_skips_post_export_action_when_stopped(self):
-        calls: list[tuple[str, str]] = []
-        p = Processor()
+    def test_reports_stopped_queue_on_complete(self):
+        finished: list[bool] = []
+        p = Processor(on_complete=finished.append)
         p._settings = AppSettings(post_export_action="shutdown")
         p._stop_event.set()
 
-        with patch("jasna.post_export_action.run_post_export_action", lambda action, command: calls.append((action, command))):
-            p._run()
+        p._run()
 
-        assert calls == []
+        assert finished == [False]
 
     def test_runs_post_export_video_command_after_each_video(self, tmp_path):
         calls: list[tuple[str, Path, Path]] = []
@@ -199,7 +209,6 @@ class TestProcessorPullLoop:
                 AppSettings(post_export_video_command="remux {output}"),
                 output_folder=str(tmp_path),
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
@@ -237,7 +246,6 @@ class TestProcessorPullLoop:
                 AppSettings(post_export_video_command="remux {output}"),
                 output_folder=str(tmp_path),
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
@@ -258,7 +266,6 @@ class TestProcessorPullLoop:
                 AppSettings(post_export_video_command="remux {output}"),
                 output_folder=str(tmp_path),
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
@@ -282,42 +289,10 @@ class TestProcessorPullLoop:
                 ),
                 output_folder=str(tmp_path),
                 output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
             )
             p.join(timeout=5.0)
 
         assert command.call_args.args[2] == tmp_path / "clip_restored (1).mp4"
-
-    def test_per_video_and_queue_wide_actions_both_run(self, tmp_path):
-        calls: list[str] = []
-        p = Processor()
-        jobs = _make_jobs(str(tmp_path / "clip.mp4"))
-
-        with (
-            patch.object(p, "_run_pipeline"),
-            patch(
-                "jasna.post_export_action.run_post_export_video_command",
-                side_effect=lambda *_args: calls.append("video"),
-            ),
-            patch(
-                "jasna.post_export_action.run_post_export_action",
-                side_effect=lambda *_args: calls.append("queue"),
-            ),
-        ):
-            p.start(
-                jobs,
-                AppSettings(
-                    post_export_video_command="remux {output}",
-                    post_export_action="command",
-                    post_export_command="notify",
-                ),
-                output_folder=str(tmp_path),
-                output_pattern="{original}_restored.mp4",
-                disable_basicvsrpp_tensorrt=False,
-            )
-            p.join(timeout=5.0)
-
-        assert calls == ["video", "queue"]
 
 
 class TestJobItemId:

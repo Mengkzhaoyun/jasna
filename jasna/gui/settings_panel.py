@@ -3,6 +3,7 @@
 import logging
 
 import customtkinter as ctk
+import tkinter as tk
 from dataclasses import asdict
 
 from jasna.gui.theme import Colors, Fonts, Sizing
@@ -16,6 +17,7 @@ from jasna.gui.components import (
 )
 from jasna.gui.icons import NativeIconButton
 from jasna.gui.locales import t
+from jasna.gui.ltx_models import LtxModels
 from jasna.gui.settings_sections.advanced import (
     TEMPORAL_FILTER_SLIDER_MAX,
     AdvancedSection,
@@ -24,15 +26,18 @@ from jasna.gui.settings_sections.basic import BasicSection
 from jasna.gui.settings_sections.encoding import EncodingSection
 from jasna.gui.settings_sections.image_restoration import ImageRestorationSection
 from jasna.gui.settings_sections.post_export import PostExportSection
+from jasna.gui.settings_sections.restoration_model import RestorationModelSection
 from jasna.gui.settings_sections.secondary import SecondarySection
 
 logger = logging.getLogger(__name__)
+
+_EDITABLE_WHILE_PROCESSING = frozenset({"post_export_action", "post_export_command"})
 
 
 class SettingsPanel(ctk.CTkFrame):
     """Right panel composing the settings sections; widgets live in the sections."""
 
-    def __init__(self, master, **kwargs):
+    def __init__(self, master, preset_manager: PresetManager, *, ltx_models: LtxModels, **kwargs):
         super().__init__(
             master,
             fg_color=Colors.BG_PANEL,
@@ -40,7 +45,7 @@ class SettingsPanel(ctk.CTkFrame):
             **kwargs
         )
 
-        self._preset_manager = PresetManager()
+        self._preset_manager = preset_manager
         self._current_preset = self._preset_manager.get_last_selected()
         self._saved_preset_settings: AppSettings | None = None  # Snapshot of preset when loaded
         self._is_modified = False
@@ -50,7 +55,7 @@ class SettingsPanel(ctk.CTkFrame):
 
         self._build_preset_bar()
         self._build_scrollable()
-        self._build_sections()
+        self._build_sections(ltx_models)
         self._apply_preset(self._current_preset)
 
     def _build_preset_bar(self):
@@ -161,18 +166,6 @@ class SettingsPanel(ctk.CTkFrame):
         self._update_dropdown_values()
         self._preset_dropdown.configure(values=self._dropdown_values)
 
-    def get_last_output_folder(self) -> str:
-        return self._preset_manager.get_last_output_folder()
-
-    def set_last_output_folder(self, path: str):
-        self._preset_manager.set_last_output_folder(path)
-
-    def get_last_output_pattern(self) -> str:
-        return self._preset_manager.get_last_output_pattern()
-
-    def set_last_output_pattern(self, pattern: str):
-        self._preset_manager.set_last_output_pattern(pattern)
-
     def _update_button_states(self):
         """Update button states based on current preset."""
         is_factory = self._preset_manager.is_factory_preset(self._current_preset)
@@ -204,7 +197,7 @@ class SettingsPanel(ctk.CTkFrame):
 
         display_name = self._display_name(self._current_preset)
         if self._is_modified:
-            display_name += " (Modified)*"
+            display_name = t("preset_modified", name=display_name)
         self._preset_dropdown.set(display_name)
 
     def _show_toast(self, message: str, type_: str = "info"):
@@ -221,16 +214,26 @@ class SettingsPanel(ctk.CTkFrame):
         )
         self._scroll.pack(fill="both", expand=True, padx=Sizing.PADDING_MEDIUM, pady=(0, Sizing.PADDING_MEDIUM))
 
-    def _build_sections(self):
+    def _build_sections(self, ltx_models: LtxModels):
+        self._model_section = RestorationModelSection(
+            self._scroll,
+            self._widgets,
+            self._mark_modified,
+            self._on_restoration_model_changed,
+            ltx_models=ltx_models,
+        )
+        basic_section = BasicSection(
+            self._scroll,
+            self._widgets,
+            self._mark_modified,
+            self._sync_temporal_filter_limits,
+        )
+        advanced_section = AdvancedSection(self._scroll, self._widgets, self._mark_modified)
+        self._secondary_section = SecondarySection(self._scroll, self._widgets)
+        self._model_aware_sections = [basic_section, advanced_section, self._secondary_section]
         self._sections = [
-            BasicSection(
-                self._scroll,
-                self._widgets,
-                self._mark_modified,
-                self._sync_temporal_filter_limits,
-            ),
-            AdvancedSection(self._scroll, self._widgets, self._mark_modified),
-            SecondarySection(self._scroll, self._widgets),
+            self._model_section,
+            *self._model_aware_sections,
             ImageRestorationSection(
                 self._scroll,
                 self._widgets,
@@ -242,6 +245,26 @@ class SettingsPanel(ctk.CTkFrame):
             PostExportSection(self._scroll, self._widgets, self._mark_modified),
         ]
 
+    def _on_restoration_model_changed(self, model: str):
+        for section in self._model_aware_sections:
+            section.set_model(model)
+
+    def ltx_unavailable_reason(self) -> str | None:
+        """Locale key saying why the chosen LTX model cannot run now, or None when it can."""
+        return self._model_section.unavailable_reason()
+
+    def set_ltx_trial(self, trial: bool):
+        self._model_section.set_trial(trial)
+        self._update_modified_indicator()
+
+    def refresh_ltx_models(self):
+        self._model_section.refresh()
+        self._update_modified_indicator()
+
+    def set_gpu_support(self, *, nvidia: bool, blackwell: bool):
+        self._model_section.set_gpu_support(nvidia=nvidia, blackwell=blackwell)
+        self._update_modified_indicator()
+
     def set_on_interactive_image_restore(self, callback: callable):
         self._on_interactive_image_restore = callback
 
@@ -250,11 +273,9 @@ class SettingsPanel(ctk.CTkFrame):
             self._on_interactive_image_restore()
 
     def _on_preset_changed(self, preset_display_name: str):
-        # Strip modified indicator if present
-        if preset_display_name.endswith(" (Modified)*"):
-            return  # User re-selected current modified preset
-        # Convert display name to actual name
-        preset_name = self._display_to_name.get(preset_display_name, preset_display_name)
+        if preset_display_name not in self._display_to_name:
+            return
+        preset_name = self._display_to_name[preset_display_name]
         self._apply_preset(preset_name)
 
     def _apply_preset(self, preset_name: str):
@@ -364,7 +385,7 @@ class SettingsPanel(ctk.CTkFrame):
         )
 
     def set_enabled(self, enabled: bool):
-        """Enable or disable all settings controls."""
+        """Enable or disable the settings; the queue-wide post-export action stays editable while processing."""
         state = "normal" if enabled else "disabled"
 
         # Preset bar buttons
@@ -372,14 +393,15 @@ class SettingsPanel(ctk.CTkFrame):
         self._create_btn.configure(state=state)
         self._save_btn.configure(state=state)
         self._reset_btn.configure(state=state)
-        if hasattr(self, "_delete_btn"):
-            self._delete_btn.configure(state=state)
+        self._delete_btn.configure(state=state)
 
         # All interactive widgets
         for key, widget in self._widgets.items():
-            if key.endswith("_val"):  # Skip value labels
+            if key.endswith("_val") or key in _EDITABLE_WHILE_PROCESSING or isinstance(widget, tk.Variable):
                 continue
             try:
                 widget.configure(state=state)
             except Exception:
                 logger.debug("Widget %r does not support state=%s", key, state, exc_info=True)
+        self._model_section.set_enabled(enabled)
+        self._secondary_section.set_enabled(enabled)

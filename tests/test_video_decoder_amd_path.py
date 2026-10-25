@@ -19,7 +19,7 @@ from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvCol
 
 import jasna.media.video_decoder as module
 from jasna.accelerator import AcceleratorVendor
-from jasna.media import VideoMetadata
+from jasna.media.probe import VideoMetadata
 
 H, W = 8, 8
 BATCH = 3
@@ -72,8 +72,8 @@ def _cpu_group(n: int = BATCH) -> list:
     return frames
 
 
-def _reader(vendor: AcceleratorVendor) -> module.NvidiaVideoReader:
-    reader = module.NvidiaVideoReader(
+def _reader(vendor: AcceleratorVendor) -> module.VideoReader:
+    reader = module.VideoReader(
         "soft.mkv",
         BATCH,
         torch.device("cpu"),
@@ -186,6 +186,7 @@ def test_nvidia_software_path_reuses_single_staging_on_private_stream(monkeypatc
     assert len(set(luma_ptrs)) == 1
 
     assert new_calls, "NVIDIA software fallback must use a private new_stream"
-    assert not current_calls, "NVIDIA software fallback must not switch to current_stream"
+    assert current_calls == [True], "NVIDIA software fallback reads current_stream only to wait on it"
+    stream.wait_stream.assert_called_once_with(stream)
     assert events == ["convert"] * BATCH + ["sync"]
     stream.synchronize.assert_called_once_with()

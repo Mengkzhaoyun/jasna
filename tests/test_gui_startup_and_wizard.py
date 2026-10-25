@@ -1,8 +1,10 @@
 import sys
 import types
 
+import pytest
+
 from jasna import startup_timing
-from jasna.gui.wizard import _evaluate_check_results
+from jasna.gui.system_checks import evaluate_check_results
 
 
 def test_elapsed_ms_is_monotonic_nonnegative():
@@ -14,7 +16,7 @@ def test_elapsed_ms_is_monotonic_nonnegative():
 
 def test_evaluate_all_passed():
     results = {"ascii_path": (True, ""), "gpu": (True, ""), "sysmem": (True, "")}
-    all_passed, required_failure = _evaluate_check_results(results, results.keys())
+    all_passed, required_failure = evaluate_check_results(results, results.keys())
     assert all_passed is True
     assert required_failure is False
 
@@ -22,7 +24,7 @@ def test_evaluate_all_passed():
 def test_evaluate_missing_check_counts_as_required_failure():
     # gpu/cuda never ran (e.g. check thread died) -> must read as failure, never "ready".
     results = {"ascii_path": (True, "")}
-    all_passed, required_failure = _evaluate_check_results(
+    all_passed, required_failure = evaluate_check_results(
         results, ["ascii_path", "gpu", "cuda"]
     )
     assert all_passed is False
@@ -31,32 +33,79 @@ def test_evaluate_missing_check_counts_as_required_failure():
 
 def test_evaluate_sysmem_only_failure_is_warning_not_required():
     results = {"gpu": (True, ""), "sysmem": (False, "")}
-    all_passed, required_failure = _evaluate_check_results(results, results.keys())
+    all_passed, required_failure = evaluate_check_results(results, results.keys())
     assert all_passed is False  # a warning still means "not all passed"
     assert required_failure is False  # but sysmem is warning-only, not blocking
 
 
-def test_warm_up_cuda_inits_context_when_available(monkeypatch):
+def _warm_up_with_gpu_check(monkeypatch, gpu_check_result, *, nvidia=True, major=8) -> tuple[dict, tuple]:
+    from jasna import accelerator, os_utils
+
     calls = {}
     fake_torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(is_available=lambda: True),
         zeros=lambda *a, **k: calls.setdefault("device", k.get("device")),
+        cuda=types.SimpleNamespace(get_device_capability=lambda _index: (major, 0)),
     )
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(os_utils, "check_supported_gpu", lambda: gpu_check_result)
+    monkeypatch.setattr(accelerator, "is_nvidia_device", lambda: nvidia)
     from jasna.gui.app import _warm_up_cuda
 
-    _warm_up_cuda()
+    return calls, _warm_up_cuda()
+
+
+def test_warm_up_cuda_inits_context_when_gpu_supported(monkeypatch):
+    calls, support = _warm_up_with_gpu_check(monkeypatch, (True, "RTX 4090"))
     assert calls["device"] == "cuda"
+    assert support == (True, False)
 
 
-def test_warm_up_cuda_skips_when_no_gpu(monkeypatch):
-    calls = {}
-    fake_torch = types.SimpleNamespace(
-        cuda=types.SimpleNamespace(is_available=lambda: False),
-        zeros=lambda *a, **k: calls.setdefault("called", True),
-    )
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    from jasna.gui.app import _warm_up_cuda
+@pytest.mark.parametrize(("nvidia", "major", "support"), [(True, 12, (True, True)), (False, 12, (False, False))])
+def test_warm_up_cuda_reports_ltx_gpu_support(monkeypatch, nvidia, major, support):
+    assert _warm_up_with_gpu_check(monkeypatch, (True, "GPU"), nvidia=nvidia, major=major)[1] == support
 
-    _warm_up_cuda()
-    assert "called" not in calls
+
+@pytest.mark.parametrize(
+    "gpu_check_result",
+    [(False, "no_cuda"), (False, ("arch_unsupported", "gfx1103"))],
+)
+def test_warm_up_cuda_launches_no_kernel_on_unsupported_gpu(monkeypatch, gpu_check_result):
+    calls, support = _warm_up_with_gpu_check(monkeypatch, gpu_check_result)
+    assert calls == {}
+    assert support == (False, False)
+
+
+@pytest.mark.parametrize("loaded", [True, False])
+def test_startup_warns_only_when_windhawk_is_loaded(monkeypatch, loaded):
+    from tkinter import messagebox
+
+    from jasna import os_utils
+    from jasna.gui import app as app_module
+    from jasna.gui.locales import t
+
+    monkeypatch.setattr(os_utils, "windows_module_loaded", lambda name: loaded and name == "windhawk.dll")
+    shown = []
+    monkeypatch.setattr(messagebox, "showwarning", lambda title, message, parent: shown.append((title, message)))
+    logged = []
+    fake_app = types.SimpleNamespace(_log_panel=types.SimpleNamespace(warning=logged.append))
+
+    app_module.JasnaApp._warn_if_windhawk_loaded(fake_app)
+
+    expected = [(t("windhawk_warning_title"), t("windhawk_warning_body"))] if loaded else []
+    assert shown == expected
+    assert logged == [message for _title, message in expected]
+
+
+@pytest.mark.parametrize("hard_disk", [True, False])
+def test_startup_warns_when_installed_on_a_hard_disk(monkeypatch, hard_disk):
+    from jasna import os_utils
+    from jasna.gui import app as app_module
+    from jasna.gui.locales import t
+
+    monkeypatch.setattr(os_utils, "install_on_hard_disk", lambda: hard_disk)
+    logged = []
+    fake_app = types.SimpleNamespace(_log_panel=types.SimpleNamespace(warning=logged.append))
+
+    app_module.JasnaApp._warn_if_installed_on_hard_disk(fake_app)
+
+    assert logged == ([t("hard_disk_warning")] if hard_disk else [])

@@ -9,13 +9,15 @@ import pytest
 import torch
 
 from jasna.accelerator import AcceleratorVendor
-from jasna.media.splice import KeyframeIndex, SplicePlan, SpliceSpan
+from jasna.media.splice import KeyframeIndex, SmartRenderCompatibilityError, SplicePlan, SpliceSpan
 from jasna.pipeline import Pipeline
-from jasna.segments import SegmentRange
+from jasna.segments import SegmentRange, SegmentRestoration
 
 
 def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_path) -> None:
     pipeline = object.__new__(Pipeline)
+    pipeline.restoration_model_name = "basicvsrpp"
+    pipeline.ltx_seed = 0
     pipeline.input_video = tmp_path / "input.mp4"
     pipeline.output_video = tmp_path / "output.mp4"
     pipeline.codec = "h264"
@@ -64,7 +66,7 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
         patch("jasna.pipeline.probe_keyframes") as probe_keyframes,
         patch("jasna.pipeline.build_splice_plan") as build_splice_plan,
-        patch("jasna.pipeline.NvidiaVideoEncoder") as encoder,
+        patch("jasna.pipeline.VideoEncoder") as encoder,
         patch("jasna.pipeline.create_copy_fragment") as copy_fragment,
         patch("jasna.pipeline.normalize_fragment"),
         patch("jasna.pipeline.concatenate_fragments") as concatenate,
@@ -77,7 +79,6 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
     assert copy_fragment.call_count == 2
     encoder.assert_called_once()
     assert encoder.call_args.kwargs["codec"] == "h264"
-    assert encoder.call_args.kwargs["mux_audio"] is False
     assert encoder.call_args.kwargs["pts_origin"] == 60
     assert encoder.call_args.kwargs["smart_fragment"] is True
     assert encoder.call_args.kwargs["encoder_settings"] == {
@@ -98,6 +99,8 @@ def test_smart_run_processes_only_render_spans_and_assembles_full_output(tmp_pat
 
 def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
     pipeline = object.__new__(Pipeline)
+    pipeline.restoration_model_name = "basicvsrpp"
+    pipeline.ltx_seed = 0
     pipeline.input_video = tmp_path / "input.mp4"
     pipeline.output_video = tmp_path / "out" / "output.mp4"
     pipeline.codec = "h264"
@@ -128,7 +131,7 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
 
     with (
         patch("jasna.pipeline.validate_smart_render", return_value="h264"),
-        patch("jasna.pipeline.NvidiaVideoEncoder"),
+        patch("jasna.pipeline.VideoEncoder"),
         patch("jasna.pipeline.create_copy_fragment"),
         patch("jasna.pipeline.normalize_fragment"),
         patch("jasna.pipeline.concatenate_fragments"),
@@ -142,8 +145,100 @@ def test_smart_run_uses_working_dir_for_temp_files(tmp_path) -> None:
     assert pipeline.output_video.parent.is_dir()
 
 
+def test_amf_h264_full_reencode_preserves_selected_ranges(tmp_path) -> None:
+    pipeline = object.__new__(Pipeline)
+    pipeline.restoration_model_name = "basicvsrpp"
+    pipeline.ltx_seed = 0
+    pipeline.input_video = tmp_path / "input.mp4"
+    pipeline.output_video = tmp_path / "output.mp4"
+    pipeline.codec = "h264"
+    pipeline.encoder_settings = {"cq": 22}
+    pipeline.device = torch.device("cuda:0")
+    pipeline.disable_progress = True
+    pipeline.progress_callback = None
+    pipeline.lut_path = None
+    pipeline.sharpen_strength = 0.0
+    pipeline.retarget_high_fps = False
+    pipeline.fmp4 = False
+    pipeline.segments = (SegmentRange(2.5, 3.0),)
+    pipeline._run_pass = MagicMock()
+
+    metadata = MagicMock(
+        video_fps=30.0,
+        video_fps_exact=Fraction(30, 1),
+        average_fps=30.0,
+        num_frames=180,
+        duration=6.0,
+    )
+    index = KeyframeIndex(
+        (0, 60, 120), Fraction(1, 30), 0, 180, max_b_frames=4
+    )
+    pipeline.splice_plan = SplicePlan(
+        index=index,
+        spans=(
+            SpliceSpan("copy", 0, 60),
+            SpliceSpan("render", 60, 120, ((75, 90),)),
+            SpliceSpan("copy", 120, 180),
+        ),
+        segments=pipeline.segments,
+    )
+
+    with (
+        patch("jasna.pipeline.vendor_for_device", return_value=AcceleratorVendor.AMD),
+        patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.VideoEncoder"),
+    ):
+        pipeline._run_smart(metadata)
+
+    assert pipeline._run_pass.call_args.kwargs["effect_ranges"] == ((75, 90),)
+
+
+class _SmartRenderReached(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("vendor", "max_b_frames"),
+    [(AcceleratorVendor.AMD, 3), (AcceleratorVendor.NVIDIA, 4)],
+)
+def test_smart_run_keeps_smart_render_unless_amd_exceeds_b_frame_cap(
+    vendor, max_b_frames
+) -> None:
+    pipeline = object.__new__(Pipeline)
+    pipeline.restoration_model_name = "basicvsrpp"
+    pipeline.ltx_seed = 0
+    pipeline.input_video = Path("input.mp4")
+    pipeline.output_video = Path("output.mp4")
+    pipeline.codec = "h264"
+    pipeline.encoder_settings = {}
+    pipeline.device = torch.device("cuda:0")
+    pipeline.retarget_high_fps = False
+    pipeline.segments = (SegmentRange(2.5, 3.0),)
+    pipeline.splice_plan = SplicePlan(
+        index=KeyframeIndex((0, 60), Fraction(1, 30), 0, 120, max_b_frames=max_b_frames),
+        spans=(SpliceSpan("render", 0, 60, ((15, 30),)), SpliceSpan("copy", 60, 120)),
+        segments=pipeline.segments,
+    )
+    pipeline._run_full = MagicMock()
+
+    with (
+        patch("jasna.pipeline.vendor_for_device", return_value=vendor),
+        patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch(
+            "jasna.pipeline.resolve_smart_encoder_settings",
+            side_effect=_SmartRenderReached,
+        ),
+        pytest.raises(_SmartRenderReached),
+    ):
+        pipeline._run_smart(MagicMock(duration=4.0, video_fps=30.0))
+
+    pipeline._run_full.assert_not_called()
+
+
 def test_smart_run_rejects_precomputed_plan_for_different_segments() -> None:
     pipeline = object.__new__(Pipeline)
+    pipeline.restoration_model_name = "basicvsrpp"
+    pipeline.ltx_seed = 0
     pipeline.input_video = Path("input.mp4")
     pipeline.output_video = Path("output.mp4")
     pipeline.codec = "h264"
@@ -160,3 +255,166 @@ def test_smart_run_rejects_precomputed_plan_for_different_segments() -> None:
         pytest.raises(ValueError, match="does not match"),
     ):
         pipeline._run_smart(MagicMock(duration=4.0, video_fps=30.0))
+
+
+def _mixed_pipeline(tmp_path, default_model: str, segments: tuple[SegmentRange, ...], spans) -> Pipeline:
+    pipeline = object.__new__(Pipeline)
+    pipeline.restoration_model_name = default_model
+    pipeline.ltx_seed = 5
+    pipeline.ltx_window_hop = 104
+    pipeline.input_video = tmp_path / "input.mp4"
+    pipeline.output_video = tmp_path / "output.mp4"
+    pipeline.codec = "h264"
+    pipeline.encoder_settings = {}
+    pipeline.device = torch.device("cuda:0")
+    pipeline.disable_progress = True
+    pipeline.progress_callback = None
+    pipeline.lut_path = None
+    pipeline.sharpen_strength = 0.0
+    pipeline.retarget_high_fps = False
+    pipeline.working_dir = None
+    pipeline.segments = segments
+    pipeline.splice_plan = SplicePlan(
+        index=KeyframeIndex((0, 60, 120, 180), Fraction(1, 30), 0, 240), spans=spans, segments=segments
+    )
+    pipeline._cancel_event = threading.Event()
+    pipeline._run_pass = MagicMock()
+    pipeline._run_ltx_spans = MagicMock()
+    return pipeline
+
+
+def _run_smart_mocked(pipeline):
+    with (
+        patch("jasna.pipeline.vendor_for_device", return_value=AcceleratorVendor.NVIDIA),
+        patch("jasna.pipeline.validate_smart_render", return_value="h264"),
+        patch("jasna.pipeline.resolve_smart_encoder_settings", return_value={}),
+        patch("jasna.pipeline.VideoEncoder"),
+        patch("jasna.pipeline.create_copy_fragment"),
+        patch("jasna.pipeline.normalize_fragment"),
+        patch("jasna.pipeline.concatenate_fragments") as concatenate,
+        patch("jasna.pipeline.mux_final_output"),
+    ):
+        pipeline._run_smart(MagicMock(duration=8.0, video_fps=30.0, video_fps_exact=Fraction(30, 1)))
+    return concatenate
+
+
+def test_mixed_job_batches_ltx_spans_and_keeps_fragments_in_span_order(tmp_path) -> None:
+    ltx = SegmentRestoration("ltx", 42)
+    segments = (SegmentRange(2.5, 3.0), SegmentRange(6.5, 7.0, ltx))
+    spans = (
+        SpliceSpan("copy", 0, 60),
+        SpliceSpan("render", 60, 120, ((75, 90),)),
+        SpliceSpan("copy", 120, 180),
+        SpliceSpan("render", 180, 240, ((195, 210),)),
+    )
+    pipeline = _mixed_pipeline(tmp_path, "basicvsrpp", segments, spans)
+
+    concatenate = _run_smart_mocked(pipeline)
+
+    pipeline._run_pass.assert_called_once()
+    assert pipeline._run_pass.call_args.kwargs["effect_ranges"] == ((75, 90),)
+    (_, _, ltx_spans, _, _), _ = pipeline._run_ltx_spans.call_args
+    assert [(span, segs) for span, segs, _ in ltx_spans] == [(spans[3], (SegmentRange(6.5, 7.0, ltx),))]
+    fragments = concatenate.call_args.args[0]
+    assert [path.name for path, _ in fragments] == ["0000.ts", "0001.ts", "0002.ts", "0003.ts"]
+
+
+
+def test_mixed_job_restores_basicvsrpp_spans_before_the_ltx_spans(tmp_path) -> None:
+    ltx = SegmentRestoration("ltx", 42)
+    segments = (SegmentRange(2.5, 3.0, ltx), SegmentRange(6.5, 7.0))
+    spans = (
+        SpliceSpan("copy", 0, 60),
+        SpliceSpan("render", 60, 120, ((75, 90),)),
+        SpliceSpan("copy", 120, 180),
+        SpliceSpan("render", 180, 240, ((195, 210),)),
+    )
+    pipeline = _mixed_pipeline(tmp_path, "basicvsrpp", segments, spans)
+    order = MagicMock()
+    order.attach_mock(pipeline._run_pass, "basicvsrpp")
+    order.attach_mock(pipeline._run_ltx_spans, "ltx")
+
+    concatenate = _run_smart_mocked(pipeline)
+
+    assert [call[0] for call in order.mock_calls] == ["basicvsrpp", "ltx"]
+    fragments = concatenate.call_args.args[0]
+    assert [path.name for path, _ in fragments] == ["0000.ts", "0001.ts", "0002.ts", "0003.ts"]
+
+
+def test_mixed_job_reports_time_left_from_the_ltx_estimate_until_ltx_reports_its_own(tmp_path) -> None:
+    ltx = SegmentRestoration("ltx", 42)
+    segments = (SegmentRange(2.5, 3.0), SegmentRange(6.5, 7.0, ltx))
+    spans = (
+        SpliceSpan("copy", 0, 60),
+        SpliceSpan("render", 60, 120, ((75, 90),)),
+        SpliceSpan("copy", 120, 180),
+        SpliceSpan("render", 180, 240, ((195, 210),)),
+    )
+    pipeline = _mixed_pipeline(tmp_path, "basicvsrpp", segments, spans)
+    pipeline.progress_callback = MagicMock()
+    pipeline.ltx_files = MagicMock(transformer_name="t")
+
+    with (
+        patch("jasna.ltx.speed.segment_estimate_seconds", return_value=900.0) as estimate,
+        patch("torch.cuda.get_device_name", return_value="Test GPU"),
+    ):
+        _run_smart_mocked(pipeline)
+
+    assert estimate.call_args.kwargs["frames"] == 60
+    assert estimate.call_args.kwargs["window_hop"] == 104
+    standard_callback = pipeline._run_pass.call_args.kwargs["progress"].callback
+    standard_callback(50.0, 30.0, 10.0, 30, 60, None)
+    assert pipeline.progress_callback.call_args.args[2] == pytest.approx(910.0)
+    (*_, ltx_callback), _ = pipeline._run_ltx_spans.call_args
+    ltx_callback(0.0, 0.0, 0.0, 0, 0, "scan")
+    assert pipeline.progress_callback.call_args.args[2] == pytest.approx(900.0)
+    ltx_callback(50.0, 0.0, 120.0, 0, 0, "compose")
+    assert pipeline.progress_callback.call_args.args[2] == pytest.approx(120.0)
+
+
+def test_segments_on_the_job_model_follow_an_ltx_job(tmp_path) -> None:
+    segments = (SegmentRange(2.5, 3.0),)
+    spans = (SpliceSpan("copy", 0, 60), SpliceSpan("render", 60, 120, ((75, 90),)), SpliceSpan("copy", 120, 240))
+    pipeline = _mixed_pipeline(tmp_path, "ltx", segments, spans)
+
+    _run_smart_mocked(pipeline)
+
+    pipeline._run_pass.assert_not_called()
+    (_, _, ltx_spans, _, _), _ = pipeline._run_ltx_spans.call_args
+    assert ltx_spans[0][1] == (SegmentRange(2.5, 3.0, SegmentRestoration("ltx", 5)),)
+
+
+def test_a_render_span_resolving_to_two_models_is_rejected(tmp_path) -> None:
+    segments = (SegmentRange(2.2, 2.4), SegmentRange(3.0, 3.2, SegmentRestoration("basicvsrpp", None)))
+    spans = (SpliceSpan("copy", 0, 60), SpliceSpan("render", 60, 120, ((66, 72), (90, 96))), SpliceSpan("copy", 120, 240))
+    pipeline = _mixed_pipeline(tmp_path, "ltx", segments, spans)
+
+    with pytest.raises(SmartRenderCompatibilityError):
+        _run_smart_mocked(pipeline)
+
+
+@pytest.mark.parametrize(
+    ("model", "segments", "expected"),
+    [
+        ("basicvsrpp", None, "_run_full"),
+        ("ltx", None, "_run_ltx"),
+        ("ltx", (SegmentRange(1, 2),), "_run_smart"),
+    ],
+)
+def test_run_routes_by_the_job_model_and_segments(model, segments, expected) -> None:
+    pipeline = object.__new__(Pipeline)
+    pipeline.restoration_model_name = model
+    pipeline.segments = segments
+    pipeline.input_video = Path("input.mp4")
+    pipeline.fmp4 = False
+    pipeline.ltx_files = MagicMock()
+    pipeline._cancel_event = threading.Event()
+    pipeline.validate_metadata = MagicMock()
+    pipeline.configure_vr = MagicMock()
+    for name in ("_run_full", "_run_ltx", "_run_smart"):
+        setattr(pipeline, name, MagicMock())
+
+    with patch("jasna.pipeline.get_video_meta_data"):
+        pipeline.run()
+
+    assert [name for name in ("_run_full", "_run_ltx", "_run_smart") if getattr(pipeline, name).called] == [expected]

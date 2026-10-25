@@ -6,7 +6,7 @@ from tkinter import filedialog
 from jasna.gui.components import CollapsibleSection, Tooltip
 from jasna.gui.icons import create_icon
 from jasna.gui.locales import t
-from jasna.gui.settings_sections.widgets import create_slider_value_label, get_tooltip
+from jasna.gui.settings_sections.widgets import add_setting_label, create_slider_value_label, get_tooltip
 from jasna.gui.theme import Colors, Fonts, Sizing
 
 
@@ -14,8 +14,10 @@ class SecondarySection:
     def __init__(self, parent, widgets: dict):
         self._widgets = widgets
 
+        self._previous_section = parent.pack_slaves()[-1]
         section = CollapsibleSection(parent, t("section_secondary"), expanded=False)
         section.pack(fill="x", pady=(0, Sizing.PADDING_SMALL))
+        self._section = section
         content = section.content
         content.configure(corner_radius=Sizing.BORDER_RADIUS)
 
@@ -40,17 +42,16 @@ class SecondarySection:
         none_rb.pack(side="left", padx=(0, 16))
 
         from jasna.engine_paths import UNET4X_ONNX_ENC_PATH, UNET4X_ONNX_PATH
-        unet4x_available = UNET4X_ONNX_PATH.exists() or UNET4X_ONNX_ENC_PATH.exists()
+        self._unet4x_available = UNET4X_ONNX_PATH.exists() or UNET4X_ONNX_ENC_PATH.exists()
         unet4x_rb = ctk.CTkRadioButton(
             engines_frame, text=f"{t('secondary_unet_4x')} ({t('secondary_unet_4x_hint')})",
             variable=self._widgets["secondary_var"], value="unet-4x",
             fg_color=Colors.PRIMARY, hover_color=Colors.PRIMARY_HOVER, text_color=Colors.TEXT_PRIMARY,
             command=self._on_secondary_changed,
-            state="normal" if unet4x_available else "disabled",
+            state="normal" if self._unet4x_available else "disabled",
         )
         unet4x_rb.pack(side="left", padx=(0, 16))
         Tooltip(unet4x_rb, get_tooltip("secondary_unet_4x"))
-        self._unet4x_rb = unet4x_rb
 
         tvai_rb = ctk.CTkRadioButton(
             engines_frame, text=f"{t('secondary_tvai')} ({t('secondary_tvai_hint')})", variable=self._widgets["secondary_var"], value="tvai",
@@ -66,6 +67,7 @@ class SecondarySection:
             command=self._on_secondary_changed
         )
         rtx_rb.pack(side="left")
+        self._engine_radios = {"none": none_rb, "unet-4x": unet4x_rb, "tvai": tvai_rb, "rtx-super-res": rtx_rb}
         Tooltip(rtx_rb, get_tooltip("secondary_rtx"))
 
         # TVAI options (hidden by default)
@@ -77,11 +79,7 @@ class SecondarySection:
         # TVAI ffmpeg path
         tvai_path_row = ctk.CTkFrame(tvai_inner, fg_color="transparent")
         tvai_path_row.pack(fill="x", pady=(0, 8))
-        tvai_path_label = ctk.CTkLabel(tvai_path_row, text=t("ffmpeg_path"), text_color=Colors.TEXT_PRIMARY)
-        tvai_path_label.pack(side="left")
-        tvai_path_tip = ctk.CTkLabel(tvai_path_row, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
-        tvai_path_tip.pack(side="left", padx=4)
-        Tooltip(tvai_path_tip, get_tooltip("tvai_ffmpeg_path"))
+        add_setting_label(tvai_path_row, "ffmpeg_path", "tvai_ffmpeg_path")
 
         tvai_path_input_row = ctk.CTkFrame(tvai_inner, fg_color="transparent")
         tvai_path_input_row.pack(fill="x", pady=(0, 8))
@@ -102,11 +100,7 @@ class SecondarySection:
         # TVAI model
         tvai_model_row = ctk.CTkFrame(tvai_inner, fg_color="transparent")
         tvai_model_row.pack(fill="x", pady=(0, 8))
-        tvai_model_label = ctk.CTkLabel(tvai_model_row, text=t("model"), text_color=Colors.TEXT_PRIMARY)
-        tvai_model_label.pack(side="left")
-        tvai_model_tip = ctk.CTkLabel(tvai_model_row, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
-        tvai_model_tip.pack(side="left", padx=4)
-        Tooltip(tvai_model_tip, get_tooltip("tvai_model"))
+        add_setting_label(tvai_model_row, "model", "tvai_model")
         self._widgets["tvai_model"] = ctk.CTkOptionMenu(
             tvai_model_row, values=["iris-2", "iris-3", "prob-4", "nyx-1"],
             fg_color=Colors.BG_PANEL, button_color=Colors.BG_PANEL,
@@ -119,11 +113,7 @@ class SecondarySection:
         # TVAI scale
         tvai_scale_row = ctk.CTkFrame(tvai_inner, fg_color="transparent")
         tvai_scale_row.pack(fill="x", pady=(0, 8))
-        tvai_scale_label = ctk.CTkLabel(tvai_scale_row, text=t("scale"), text_color=Colors.TEXT_PRIMARY)
-        tvai_scale_label.pack(side="left")
-        tvai_scale_tip = ctk.CTkLabel(tvai_scale_row, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
-        tvai_scale_tip.pack(side="left", padx=4)
-        Tooltip(tvai_scale_tip, get_tooltip("tvai_scale"))
+        add_setting_label(tvai_scale_row, "scale", "tvai_scale")
         self._widgets["tvai_scale"] = ctk.CTkOptionMenu(
             tvai_scale_row, values=["1x", "2x", "4x"],
             fg_color=Colors.BG_PANEL, button_color=Colors.BG_PANEL,
@@ -152,7 +142,7 @@ class SecondarySection:
         tvai_denoise_tip.pack(side="left", padx=4)
         Tooltip(tvai_denoise_tip, get_tooltip("tvai_denoise"))
         self._widgets["tvai_denoise"] = ctk.BooleanVar(value=False)
-        ctk.CTkSwitch(
+        self._tvai_denoise_switch = ctk.CTkSwitch(
             tvai_denoise_row,
             text="",
             variable=self._widgets["tvai_denoise"],
@@ -160,16 +150,13 @@ class SecondarySection:
             progress_color=Colors.PRIMARY,
             button_color=Colors.TEXT_PRIMARY,
             width=42,
-        ).pack(side="right")
+        )
+        self._tvai_denoise_switch.pack(side="right")
 
         # TVAI workers
         tvai_workers_row = ctk.CTkFrame(tvai_inner, fg_color="transparent")
         tvai_workers_row.pack(fill="x")
-        tvai_workers_label = ctk.CTkLabel(tvai_workers_row, text=t("workers"), text_color=Colors.TEXT_PRIMARY)
-        tvai_workers_label.pack(side="left")
-        tvai_workers_tip = ctk.CTkLabel(tvai_workers_row, text="ⓘ", text_color=Colors.TEXT_PRIMARY, font=(Fonts.FAMILY, Fonts.SIZE_TINY), cursor="hand2")
-        tvai_workers_tip.pack(side="left", padx=4)
-        Tooltip(tvai_workers_tip, get_tooltip("tvai_workers"))
+        add_setting_label(tvai_workers_row, "workers", "tvai_workers")
         self._widgets["tvai_workers_val"] = create_slider_value_label(
             tvai_workers_row, "2", 2, Colors.BG_CARD
         )
@@ -271,6 +258,19 @@ class SecondarySection:
             self._tvai_frame.pack(fill="x", pady=(Sizing.PADDING_SMALL, 0))
         elif secondary == "rtx-super-res":
             self._rtx_frame.pack(fill="x", pady=(Sizing.PADDING_SMALL, 0))
+
+    def set_model(self, model: str) -> None:
+        if model == "ltx":
+            self._section.pack_forget()
+        else:
+            self._section.pack(fill="x", pady=(0, Sizing.PADDING_SMALL), after=self._previous_section)
+
+    def set_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        for value, radio in self._engine_radios.items():
+            unavailable = value == "unet-4x" and not self._unet4x_available
+            radio.configure(state="disabled" if unavailable else state)
+        self._tvai_denoise_switch.configure(state=state)
 
     def apply(self, preset):
         self._widgets["secondary_var"].set(preset.secondary_restoration)

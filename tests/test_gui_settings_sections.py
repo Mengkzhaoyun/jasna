@@ -10,14 +10,17 @@ import pytest
 
 from jasna import os_utils
 from jasna.accelerator import AcceleratorVendor
-from jasna.gui.models import AppSettings
+from jasna.gui.models import AppSettings, PresetManager
 from jasna.gui.settings_sections.advanced import AdvancedSection
 from jasna.gui.settings_sections.basic import BasicSection
 from jasna.gui.settings_sections.encoding import EncodingSection
 from jasna.gui.settings_sections.image_restoration import ImageRestorationSection
 from jasna.gui.settings_sections.post_export import PostExportSection
+from jasna.gui.settings_sections.restoration_model import RestorationModelSection
 from jasna.gui.settings_sections.secondary import SecondarySection
 from jasna.gui.settings_sections.widgets import ValueOptionMenu
+from jasna.gui import ltx_models as ltx_models_module
+from factories import ltx_models
 
 
 class _FakeValueMenu:
@@ -63,6 +66,15 @@ def test_value_option_menu_falls_back_to_first_option_for_unknown_value() -> Non
 
 def _fake_section_widgets() -> dict:
     return {
+        "restoration_model": _FakeWidget("ltx"),
+        "ltx_model": _FakeValueMenu({"distilled": "Distilled", "undistilled": "Undistilled"}, "undistilled"),
+        "ltx_seed": _FakeWidget(" 123 "),
+        "ltx_fast": _FakeWidget(1),
+        "ltx_large_canvas": _FakeWidget(0),
+        "ltx_less_overlap": _FakeWidget(1),
+        "ltx_trial": _FakeWidget(1),
+        "ltx_auto_split": _FakeWidget(1),
+        "ltx_auto_split_percent": _FakeWidget(17.6),
         "max_clip_size": _FakeWidget(90),
         "fp16_mode": _FakeWidget(1),
         "detection_model": _FakeWidget("rfdetr-v6"),
@@ -110,6 +122,7 @@ def _collect_all(widgets: dict) -> dict:
     fake = SimpleNamespace(_widgets=widgets)
     values: dict = {}
     for section in (
+        RestorationModelSection,
         BasicSection,
         AdvancedSection,
         SecondarySection,
@@ -143,6 +156,15 @@ def test_sections_collect_internal_values_without_translation_lookups() -> None:
     assert values["retarget_high_fps"] is True
     assert values["fmp4"] is True
     assert values["sharpen_strength"] == 0.35
+    assert values["restoration_model"] == "ltx"
+    assert values["ltx_model"] == "undistilled"
+    assert values["ltx_seed"] == 123
+    assert values["ltx_fast"] is True
+    assert values["ltx_large_canvas"] is False
+    assert values["ltx_less_overlap"] is True
+    assert values["ltx_trial"] is True
+    assert values["ltx_auto_split"] is True
+    assert values["ltx_auto_split_percent"] == 18
 
 
 def test_sections_collect_covers_all_widget_backed_appsettings_fields() -> None:
@@ -152,7 +174,6 @@ def test_sections_collect_covers_all_widget_backed_appsettings_fields() -> None:
         "batch_size",
         "tvai_args",
         "vr_projection",
-        "output_same_as_input",
         "output_folder",
         "output_pattern",
     }
@@ -183,9 +204,9 @@ def _basic_section_panel(monkeypatch, tmp_path):
 
     from jasna.gui.settings_panel import SettingsPanel
 
-    panel = SettingsPanel(root)
+    panel = SettingsPanel(root, PresetManager(), ltx_models=ltx_models(root, tmp_path / "ltx", installed=True))
     try:
-        yield panel, panel._sections[0]
+        yield panel, next(section for section in panel._sections if isinstance(section, BasicSection))
     finally:
         root.destroy()
 
@@ -297,40 +318,37 @@ def test_cq_slider_updates_only_active_codec() -> None:
 
 def test_processor_passes_literal_cq_for_forced_codec(monkeypatch) -> None:
     import jasna.accelerator as accelerator
-    from jasna.gui.processor import Processor
+    from jasna.gui.processor import build_job_encoder_settings
 
-    processor = Processor.__new__(Processor)
-    processor._settings = AppSettings(codec="hevc", encoder_cq=28)
+    settings = AppSettings(codec="hevc", encoder_cq=28)
     monkeypatch.setattr(
         accelerator,
         "vendor_for_device",
         lambda: AcceleratorVendor.NVIDIA,
     )
 
-    assert processor._build_encoder_settings("h264") == {"cq": 28}
+    assert build_job_encoder_settings(settings, "h264") == {"cq": 28}
 
 
 def test_processor_resolves_native_default_for_codec(monkeypatch) -> None:
     import jasna.accelerator as accelerator
-    from jasna.gui.processor import Processor
+    from jasna.gui.processor import build_job_encoder_settings
 
-    processor = Processor.__new__(Processor)
-    processor._settings = AppSettings(codec="h264")
+    settings = AppSettings(codec="h264")
     monkeypatch.setattr(
         accelerator,
         "vendor_for_device",
         lambda: AcceleratorVendor.NVIDIA,
     )
 
-    assert processor._build_encoder_settings("h264") == {"cq": 25}
+    assert build_job_encoder_settings(settings, "h264") == {"cq": 25}
 
 
 def test_processor_rejects_cq_in_custom_args(monkeypatch) -> None:
     import jasna.accelerator as accelerator
-    from jasna.gui.processor import Processor
+    from jasna.gui.processor import build_job_encoder_settings
 
-    processor = Processor.__new__(Processor)
-    processor._settings = AppSettings(encoder_cq=28, encoder_custom_args="cq=22")
+    settings = AppSettings(encoder_cq=28, encoder_custom_args="cq=22")
     monkeypatch.setattr(
         accelerator,
         "vendor_for_device",
@@ -338,7 +356,7 @@ def test_processor_rejects_cq_in_custom_args(monkeypatch) -> None:
     )
 
     with pytest.raises(ValueError, match="CQ.*custom encoder settings"):
-        processor._build_encoder_settings("hevc")
+        build_job_encoder_settings(settings, "hevc")
 
 
 def test_settings_panel_get_settings_is_locale_independent(monkeypatch, tmp_path) -> None:
@@ -357,7 +375,7 @@ def test_settings_panel_get_settings_is_locale_independent(monkeypatch, tmp_path
     try:
         from jasna.gui.settings_panel import SettingsPanel
 
-        panel = SettingsPanel(root)
+        panel = SettingsPanel(root, PresetManager(), ltx_models=ltx_models(root, tmp_path / "ltx", installed=True))
         assert panel.get_settings() == replace(AppSettings(), encoder_cq=28)
         assert panel._saved_preset_settings == panel.get_settings()
     finally:
@@ -387,3 +405,147 @@ def test_max_clip_size_slider_spans_ten_to_seven_hundred_twenty() -> None:
     assert captured["to"] == 720
     assert (captured["to"] - captured["from_"]) % captured["number_of_steps"] == 0
     assert (captured["to"] - captured["from_"]) // captured["number_of_steps"] == 10
+
+
+def test_only_queue_wide_post_export_action_stays_editable_while_processing(_basic_section_panel) -> None:
+    panel, _basic = _basic_section_panel
+
+    panel.set_enabled(False)
+
+    assert panel._widgets["post_export_action"].cget("state") == "normal"
+    assert panel._widgets["post_export_command"].cget("state") == "normal"
+    assert panel._widgets["post_export_video_command"].cget("state") == "disabled"
+    assert panel._widgets["max_clip_size"].cget("state") == "disabled"
+
+
+def test_parse_seed_falls_back_to_default() -> None:
+    from jasna.gui.settings_sections.restoration_model import parse_seed
+    from jasna.session_config import LTX_DEFAULT_SEED
+
+    assert parse_seed(" 42 ") == 42
+    assert parse_seed("abc") == LTX_DEFAULT_SEED
+
+
+@pytest.fixture
+def _panel_factory(monkeypatch, tmp_path):
+    monkeypatch.setattr(os_utils.sys, "platform", "linux", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    try:
+        root = ctk.CTk()
+    except TclError as exc:
+        pytest.skip(f"Tk display unavailable: {exc}")
+
+    from jasna.gui.settings_panel import SettingsPanel
+
+    try:
+        yield lambda installed: SettingsPanel(
+            root, PresetManager(), ltx_models=ltx_models(root, tmp_path / "ltx", installed=installed)
+        )
+    finally:
+        root.destroy()
+
+
+def _select_ltx(panel) -> None:
+    panel._model_section._cards["ltx"].radio.invoke()
+
+
+def test_ltx_hides_standard_only_settings_and_restores_them(_panel_factory) -> None:
+    panel = _panel_factory(True)
+    secondary = panel._model_aware_sections[2]
+    panel.update_idletasks()
+    clip_row = panel._widgets["max_clip_size"].master
+    overlap_row = panel._widgets["temporal_overlap"].master
+
+    _select_ltx(panel)
+
+    assert panel.get_settings().restoration_model == "ltx"
+    assert not clip_row.winfo_manager()
+    assert not panel._widgets["compile_basicvsrpp"].master.winfo_manager()
+    assert not overlap_row.winfo_manager()
+    assert panel._widgets["vr_mode"].master.winfo_manager()
+    assert not secondary._section.winfo_manager()
+    assert panel._model_section._ltx_options.winfo_manager()
+
+    panel._model_section._cards["basicvsrpp"].radio.invoke()
+
+    assert clip_row.winfo_manager() and overlap_row.winfo_manager()
+    assert secondary._section.winfo_manager()
+    assert not panel._model_section._ltx_options.winfo_manager()
+    order = panel._scroll.pack_slaves()
+    assert order.index(secondary._section) == order.index(secondary._previous_section) + 1
+
+
+def test_ltx_without_model_files_runs_as_a_trial(_panel_factory, monkeypatch) -> None:
+    monkeypatch.setattr(ltx_models_module, "protection_available", lambda: False)
+    panel = _panel_factory(False)
+
+    assert panel._model_section._cards["ltx"].radio.cget("state") == "normal"
+    panel._model_section.apply(AppSettings(restoration_model="ltx"))
+    settings = panel.get_settings()
+    assert (settings.restoration_model, settings.ltx_trial) == ("ltx", True)
+
+
+def test_gpu_support_disables_ltx_and_shows_fast_mode_on_blackwell(_panel_factory) -> None:
+    panel = _panel_factory(True)
+    section = panel._model_section
+    section.apply(AppSettings(restoration_model="ltx", ltx_fast=True))
+
+    section.set_gpu_support(nvidia=True, blackwell=True)
+    assert section._fast_row.winfo_manager()
+    assert panel.get_settings().ltx_fast is True
+
+    section.set_gpu_support(nvidia=True, blackwell=False)
+    assert not section._fast_row.winfo_manager()
+    assert panel.get_settings().ltx_fast is False
+
+    section.set_gpu_support(nvidia=False, blackwell=False)
+    assert panel.get_settings().restoration_model == "basicvsrpp"
+    assert section._cards["ltx"].radio.cget("state") == "disabled"
+
+
+def test_ltx_settings_round_trip_through_panel(_panel_factory) -> None:
+    panel = _panel_factory(True)
+    ltx = replace(AppSettings(), restoration_model="ltx", ltx_seed=99, ltx_large_canvas=True, ltx_less_overlap=True, encoder_cq=28)
+
+    for section in panel._sections:
+        section.apply(ltx)
+
+    assert panel.get_settings() == ltx
+
+
+def test_processing_locks_secondary_controls_and_keeps_missing_unet4x_disabled(
+    _panel_factory, monkeypatch, tmp_path, caplog
+) -> None:
+    from jasna import engine_paths
+
+    monkeypatch.setattr(engine_paths, "UNET4X_ONNX_PATH", tmp_path / "missing.onnx")
+    monkeypatch.setattr(engine_paths, "UNET4X_ONNX_ENC_PATH", tmp_path / "missing.onnx.enc")
+    panel = _panel_factory(True)
+    secondary = next(section for section in panel._sections if isinstance(section, SecondarySection))
+    controls = [*secondary._engine_radios.values(), secondary._tvai_denoise_switch]
+
+    with caplog.at_level("DEBUG", logger="jasna.gui.settings_panel"):
+        panel.set_enabled(False)
+        locked = [control.cget("state") for control in controls]
+        panel.set_enabled(True)
+
+    assert locked == ["disabled"] * len(controls)
+    assert {value: radio.cget("state") for value, radio in secondary._engine_radios.items()} == {
+        "none": "normal",
+        "unet-4x": "disabled",
+        "tvai": "normal",
+        "rtx-super-res": "normal",
+    }
+    assert secondary._tvai_denoise_switch.cget("state") == "normal"
+    assert "does not support" not in caplog.text
+
+
+def test_disabling_settings_keeps_unavailable_ltx_disabled(_panel_factory) -> None:
+    panel = _panel_factory(True)
+    panel._model_section.set_gpu_support(nvidia=False, blackwell=False)
+
+    panel.set_enabled(False)
+    panel.set_enabled(True)
+
+    assert panel._model_section._cards["ltx"].radio.cget("state") == "disabled"
+    assert panel._model_section._cards["basicvsrpp"].radio.cget("state") == "normal"

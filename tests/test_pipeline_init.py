@@ -3,39 +3,26 @@ from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
-from jasna.pipeline import Pipeline
+from factories import make_pipeline
+from jasna.progressbar import StageProgress
 from jasna.vr180 import SbsDetectionAdapter
 from jasna.vr_projection import FisheyeProjector, GnomonicProjector
 
 
 def _make_pipeline(**overrides):
     defaults = dict(
-        input_video=Path("in.mp4"),
-        output_video=Path("out.mkv"),
-        detection_model_name="rfdetr-v5",
-        detection_model_path=Path("model.onnx"),
-        detection_score_threshold=0.25,
-        restoration_pipeline=MagicMock(),
-        codec="hevc",
-        encoder_settings={},
         batch_size=4,
-        device=torch.device("cpu"),
         max_clip_size=60,
         temporal_overlap=8,
         max_detection_gap=0,
         min_detection_duration=0,
-        enable_crossfade=True,
-        fp16=True,
+        vr_mode="off",
     )
     defaults.update(overrides)
-
-    with (
-        patch("jasna.mosaic.rfdetr.RfDetrMosaicDetectionModel"),
-        patch("jasna.mosaic.yolo.YoloMosaicDetectionModel"),
-    ):
-        return Pipeline(**defaults)
+    return make_pipeline(**defaults)
 
 
 class TestPipelineInit:
@@ -46,56 +33,6 @@ class TestPipelineInit:
         assert p.temporal_overlap == 4
         assert p.codec == "hevc"
         assert p.enable_crossfade is True
-
-    def test_rfdetr_model_created(self):
-        with (
-            patch("jasna.mosaic.rfdetr.RfDetrMosaicDetectionModel") as mock_rf,
-            patch("jasna.mosaic.yolo.YoloMosaicDetectionModel") as mock_yolo,
-        ):
-            Pipeline(
-                input_video=Path("in.mp4"),
-                output_video=Path("out.mkv"),
-                detection_model_name="rfdetr-v5",
-                detection_model_path=Path("model.onnx"),
-                detection_score_threshold=0.25,
-                restoration_pipeline=MagicMock(),
-                codec="hevc",
-                encoder_settings={},
-                batch_size=4,
-                device=torch.device("cpu"),
-                max_clip_size=60,
-                temporal_overlap=8,
-                max_detection_gap=0,
-                min_detection_duration=0,
-                fp16=True,
-            )
-            mock_rf.assert_called_once()
-            mock_yolo.assert_not_called()
-
-    def test_yolo_model_created(self):
-        with (
-            patch("jasna.mosaic.rfdetr.RfDetrMosaicDetectionModel") as mock_rf,
-            patch("jasna.mosaic.yolo.YoloMosaicDetectionModel") as mock_yolo,
-        ):
-            Pipeline(
-                input_video=Path("in.mp4"),
-                output_video=Path("out.mkv"),
-                detection_model_name="lada-yolo-v4",
-                detection_model_path=Path("model.pt"),
-                detection_score_threshold=0.25,
-                restoration_pipeline=MagicMock(),
-                codec="hevc",
-                encoder_settings={},
-                batch_size=4,
-                device=torch.device("cpu"),
-                max_clip_size=60,
-                temporal_overlap=8,
-                max_detection_gap=0,
-                min_detection_duration=0,
-                fp16=True,
-            )
-            mock_yolo.assert_called_once()
-            mock_rf.assert_not_called()
 
     def test_crossfade_disabled(self):
         p = _make_pipeline(enable_crossfade=False)
@@ -109,6 +46,13 @@ class TestPipelineInit:
         cb = MagicMock()
         p = _make_pipeline(progress_callback=cb)
         assert p.progress_callback is cb
+
+    def test_ltx_progress_reaches_the_progress_callback_with_its_stage(self):
+        cb = MagicMock()
+        p = _make_pipeline(progress_callback=cb, disable_progress=True)
+        with p._ltx_progress(10, cb).bar("scan", 10) as bar:
+            bar.update(10)
+        assert cb.call_args[0] == (pytest.approx(2.0), 0.0, 0.0, 0, 0, StageProgress("scan", 1, 4, 1.0, 0.0))
 
     def test_retarget_high_fps_defaults_off_and_can_be_enabled(self):
         assert _make_pipeline().retarget_high_fps is False
@@ -137,9 +81,9 @@ class TestPipelineInit:
 
         pipeline.configure_vr(metadata)
 
-        assert pipeline._vr_resolution.resolved == "sbs"
-        assert isinstance(pipeline._job_detection_model, SbsDetectionAdapter)
-        assert pipeline._vr_projector is None
+        assert pipeline.vr_resolution.resolved == "sbs"
+        assert isinstance(pipeline.job_detection_model, SbsDetectionAdapter)
+        assert pipeline.vr_projector is None
 
     def test_configure_vr_builds_fisheye_projector(self):
         pipeline = _make_pipeline(
@@ -156,11 +100,11 @@ class TestPipelineInit:
 
         pipeline.configure_vr(metadata)
 
-        assert pipeline._vr_resolution.resolved == "sbs"
-        assert pipeline._vr_resolution.projection == "fisheye"
-        assert isinstance(pipeline._job_detection_model, SbsDetectionAdapter)
-        assert isinstance(pipeline._vr_projector, FisheyeProjector)
-        assert pipeline._vr_projector.eye_width == 100
+        assert pipeline.vr_resolution.resolved == "sbs"
+        assert pipeline.vr_resolution.projection == "fisheye"
+        assert isinstance(pipeline.job_detection_model, SbsDetectionAdapter)
+        assert isinstance(pipeline.vr_projector, FisheyeProjector)
+        assert pipeline.vr_projector.eye_width == 100
 
     def test_configure_vr_builds_gnomonic_projector_for_routed_studio(self):
         pipeline = _make_pipeline(
@@ -177,8 +121,8 @@ class TestPipelineInit:
 
         pipeline.configure_vr(metadata)
 
-        assert pipeline._vr_resolution.projection == "gnomonic"
-        assert isinstance(pipeline._vr_projector, GnomonicProjector)
+        assert pipeline.vr_resolution.projection == "gnomonic"
+        assert isinstance(pipeline.vr_projector, GnomonicProjector)
 
     def test_configure_vr_honors_per_job_projection_override(self):
         pipeline = _make_pipeline(
@@ -196,5 +140,25 @@ class TestPipelineInit:
 
         pipeline.configure_vr(metadata)
 
-        assert pipeline._vr_resolution.projection == "fisheye"
-        assert isinstance(pipeline._vr_projector, FisheyeProjector)
+        assert pipeline.vr_resolution.projection == "fisheye"
+        assert isinstance(pipeline.vr_projector, FisheyeProjector)
+
+
+def test_ltx_span_gives_each_effect_range_its_segment_seed() -> None:
+    from jasna.ltx.restore import LtxSegment
+    from jasna.media.splice import KeyframeIndex, SpliceSpan
+    from jasna.segments import SegmentRange, SegmentRestoration
+
+    p = _make_pipeline()
+    index = KeyframeIndex(pts=(0, 2000), time_base=Fraction(1, 1000), start_pts=0, end_pts=6000)
+    span = SpliceSpan("render", 2000, 6000, ((2500, 3000), (4000, 5000)))
+    segments = (
+        SegmentRange(2.5, 3.0, SegmentRestoration("ltx", 7)),
+        SegmentRange(4.0, 5.0, SegmentRestoration("ltx", 9)),
+    )
+    opener = MagicMock()
+
+    ltx = p.ltx_span(SimpleNamespace(), index, span, segments, opener)
+
+    assert ltx.segments == (LtxSegment(2500, 3000, 7), LtxSegment(4000, 5000, 9))
+    assert ltx.open_writer is opener

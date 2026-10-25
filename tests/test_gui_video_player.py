@@ -145,6 +145,7 @@ def test_destroying_player_restores_timer_resolution() -> None:
         _probe_generation=2,
         _native_renderer=MagicMock(),
         _timer_resolution=MagicMock(),
+        _main_thread=MagicMock(),
         grab_release=MagicMock(),
         destroy=MagicMock(),
         _on_closed=MagicMock(),
@@ -155,6 +156,7 @@ def test_destroying_player_restores_timer_resolution() -> None:
 
     dialog._native_renderer.close.assert_called_once_with()
     dialog._timer_resolution.close.assert_called_once_with()
+    dialog._main_thread.close.assert_called_once_with()
     dialog.destroy.assert_called_once_with()
     dialog._on_closed.assert_called_once_with()
 
@@ -623,7 +625,7 @@ def test_initial_path_uses_shared_probe_flow_without_autoplay(monkeypatch) -> No
         _native_renderer=None,
         _play_btn=MagicMock(),
         _set_status=MagicMock(),
-        _ui_after=lambda callback: callback(),
+        _main_thread=SimpleNamespace(post=lambda callback: callback()),
         _video_probed=probed,
     )
 
@@ -778,3 +780,14 @@ def test_player_setting_change_reloads_at_current_position() -> None:
     assert not dialog._playing
     assert dialog._buffering
     assert not dialog._eof
+
+
+def test_player_always_plays_with_the_standard_model() -> None:
+    dialog = SimpleNamespace(
+        _base_settings=AppSettings(restoration_model="ltx"),
+        _model=SimpleNamespace(get=lambda: "rfdetr-v6"),
+        _threshold=SimpleNamespace(get=lambda: 0.4),
+        _secondary=SimpleNamespace(get_value=lambda: "none"),
+    )
+
+    assert VideoPlayerDialog._playback_settings(dialog).restoration_model == "basicvsrpp"

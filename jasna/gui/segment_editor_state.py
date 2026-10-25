@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from jasna.segments import SegmentRange, normalize_segments
+from jasna.media.splice import KeyframeIndex, SmartRenderCompatibilityError, build_splice_plan
+from jasna.segments import SegmentRange, SegmentRestoration, normalize_segments, resolve_restorations
 
 
 @dataclass(frozen=True)
@@ -20,14 +21,16 @@ class _Snapshot:
 
 
 class SegmentEditorState:
-    """UI-independent state and history for the segment editor."""
+    """UI-independent state and history for the segment editor. Every range carries its
+    own restoration; new ranges get ``default_restoration``."""
 
     def __init__(
         self,
         *,
         duration: float,
         fps: float,
-        segments: tuple[SegmentRange, ...] = (),
+        segments: tuple[SegmentRange, ...],
+        default_restoration: SegmentRestoration,
     ) -> None:
         duration = float(duration)
         fps = float(fps)
@@ -36,7 +39,8 @@ class SegmentEditorState:
         if fps <= 0:
             raise ValueError("video frame rate must be greater than zero")
 
-        normalized = normalize_segments(segments, duration=duration)
+        normalized = normalize_segments(resolve_restorations(segments, default_restoration), duration=duration)
+        self.default_restoration = default_restoration
         self.duration = duration
         self.fps = fps
         self.segments = normalized
@@ -75,6 +79,10 @@ class SegmentEditorState:
     def selected_duration(self) -> float:
         return sum(segment.duration for segment in self.output_segments)
 
+    @property
+    def ltx_duration(self) -> float:
+        return sum(segment.duration for segment in self.output_segments if segment.restoration.model == "ltx")
+
     def snap(self, seconds: float) -> float:
         """Clamp a timestamp to the video and snap it to the nearest frame."""
 
@@ -104,7 +112,7 @@ class SegmentEditorState:
 
     def add(self, start: float, end: float) -> SegmentEditResult:
         start, end = self._validated_bounds(start, end)
-        segment = SegmentRange(start, end)
+        segment = SegmentRange(start, end, self.default_restoration)
         overlaps = sum(
             existing.start <= segment.end and segment.start <= existing.end
             for existing in self.segments
@@ -119,8 +127,8 @@ class SegmentEditorState:
         if self.selected_index is None:
             return self.add(start, end)
         start, end = self._validated_bounds(start, end)
-        replacement = SegmentRange(start, end)
         original_index = self.selected_index
+        replacement = replace(self.segments[original_index], start=start, end=end)
         remaining = [
             segment for index, segment in enumerate(self.segments)
             if index != original_index
@@ -141,10 +149,11 @@ class SegmentEditorState:
         return self.replace_selected(start, end)
 
     def add_many(self, ranges: tuple[SegmentRange, ...]) -> int:
-        """Add several ranges as one undoable step; returns how many were new."""
+        """Add several ranges as one undoable step; returns how many were new. A range
+        without its own restoration gets the default one."""
 
         fresh = [
-            candidate
+            replace(candidate, restoration=candidate.restoration or self.default_restoration)
             for candidate in ranges
             if not any(
                 existing.start <= candidate.start and existing.end >= candidate.end
@@ -160,6 +169,43 @@ class SegmentEditorState:
         self.selected_index = None
         self.clear_marks()
         return len(fresh)
+
+    def set_selected_restoration(self, restoration: SegmentRestoration) -> bool:
+        """Give the selected range ``restoration``; returns whether anything changed."""
+        selected = self.selected_segment
+        if selected is None or selected.restoration == restoration:
+            return False
+        changed = replace(selected, restoration=restoration)
+        self._record_change()
+        others = tuple(segment for index, segment in enumerate(self.segments) if index != self.selected_index)
+        self.segments = normalize_segments((*others, changed), duration=self.duration)
+        self.selected_index = self._index_containing(changed)
+        return True
+
+    def set_all_restoration(self, restoration: SegmentRestoration) -> bool:
+        """Give every range ``restoration``; returns whether anything changed."""
+        if all(segment.restoration == restoration for segment in self.segments):
+            return False
+        selected = self.selected_segment
+        self._record_change()
+        self.segments = normalize_segments(
+            tuple(replace(segment, restoration=restoration) for segment in self.segments),
+            duration=self.duration,
+        )
+        self.selected_index = None if selected is None else self._index_containing(selected)
+        return True
+
+    def segment_at(self, seconds: float) -> SegmentRange | None:
+        """The range holding ``seconds``, if any."""
+        for segment in self.segments:
+            if segment.start <= seconds < segment.end:
+                return segment
+        return None
+
+    def restoration_at(self, seconds: float) -> SegmentRestoration:
+        """The restoration of the range holding ``seconds``, else the default."""
+        segment = self.segment_at(seconds)
+        return self.default_restoration if segment is None else segment.restoration
 
     def delete_selected(self) -> bool:
         if self.selected_index is None:
@@ -222,3 +268,97 @@ class SegmentEditorState:
         self.segments = snapshot.segments
         self.selected_index = snapshot.selected_index
         self.clear_marks()
+
+
+PREVIEW_ZOOM_MIN = 1.0
+PREVIEW_ZOOM_MAX = 8.0
+PREVIEW_ZOOM_STEP = 0.25
+
+
+def _clamp_center(center: tuple[float, float], zoom: float) -> tuple[float, float]:
+    half_visible = 0.5 / zoom
+    return (
+        min(1.0 - half_visible, max(half_visible, float(center[0]))),
+        min(1.0 - half_visible, max(half_visible, float(center[1]))),
+    )
+
+
+@dataclass
+class PreviewView:
+    """Zoom and pan of the editor preview; ``center`` is the visible middle as source fractions."""
+
+    zoom: float = PREVIEW_ZOOM_MIN
+    center: tuple[float, float] = (0.5, 0.5)
+
+    @property
+    def zoomed(self) -> bool:
+        return self.zoom > PREVIEW_ZOOM_MIN
+
+    @property
+    def is_reset(self) -> bool:
+        return not self.zoomed and self.center == (0.5, 0.5)
+
+    def reset(self) -> None:
+        self.zoom = PREVIEW_ZOOM_MIN
+        self.center = (0.5, 0.5)
+
+    def zoom_to(self, zoom: float, anchor: tuple[float, float] | None) -> bool:
+        """Change the zoom, keeping the source point under ``anchor`` (fractions of the shown image) still.
+
+        Returns whether the zoom changed.
+        """
+        new_zoom = min(PREVIEW_ZOOM_MAX, max(PREVIEW_ZOOM_MIN, float(zoom)))
+        if new_zoom == self.zoom:
+            return False
+        center = _clamp_center(self.center, self.zoom)
+        if anchor is not None:
+            fx, fy = anchor
+            center = (
+                center[0] + (fx - 0.5) / self.zoom - (fx - 0.5) / new_zoom,
+                center[1] + (fy - 0.5) / self.zoom - (fy - 0.5) / new_zoom,
+            )
+        self.zoom = new_zoom
+        self.center = _clamp_center(center, new_zoom)
+        return True
+
+    def pan(self, dx: float, dy: float) -> None:
+        """Follow a drag of ``dx``/``dy`` fractions of the shown image."""
+        self.center = _clamp_center(
+            (self.center[0] - dx / self.zoom, self.center[1] - dy / self.zoom),
+            self.zoom,
+        )
+
+    def crop_box(self, width: int, height: int) -> tuple[int, int, int, int] | None:
+        """Source box to show for a ``width`` x ``height`` image, or None when not zoomed."""
+        if not self.zoomed:
+            self.center = (0.5, 0.5)
+            return None
+        self.center = _clamp_center(self.center, self.zoom)
+        crop_width = max(1, min(width, round(width / self.zoom)))
+        crop_height = max(1, min(height, round(height / self.zoom)))
+        left = round(self.center[0] * width - crop_width / 2)
+        top = round(self.center[1] * height - crop_height / 2)
+        left = min(width - crop_width, max(0, left))
+        top = min(height - crop_height, max(0, top))
+        return left, top, left + crop_width, top + crop_height
+
+
+_SMART_RENDER_ERROR_KEYS = {
+    "range_too_short": "segments_smart_render_range_too_short",
+    "before_first_keyframe": "segments_smart_render_before_first_keyframe",
+    "whole_video_reencode": "segments_smart_render_whole_video",
+    "mixed_models": "segments_mixed_models_too_close",
+}
+
+
+def smart_render_error_key(
+    segments: tuple[SegmentRange, ...],
+    keyframe_index: KeyframeIndex,
+    duration: float,
+) -> str | None:
+    """Locale key explaining why ``segments`` cannot be smart-rendered, or None when they can."""
+    try:
+        build_splice_plan(segments, keyframe_index, duration=duration)
+    except SmartRenderCompatibilityError as exc:
+        return _SMART_RENDER_ERROR_KEYS.get(exc.reason, "segments_smart_render_unavailable")
+    return None

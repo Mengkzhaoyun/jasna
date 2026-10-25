@@ -3,8 +3,12 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from jasna.gui.processor import Processor, ProgressUpdate
 from jasna.gui.models import JobStatus, JobItem, AppSettings
+
+pytestmark = pytest.mark.usefixtures("tk_garbage_collected")
 
 
 def test_processor_join_waits_for_thread():
@@ -74,7 +78,6 @@ def test_processor_error_logs_full_traceback():
             settings,
             output_folder="",
             output_pattern="{original}_restored.mp4",
-            disable_basicvsrpp_tensorrt=False,
         )
         p.join(timeout=5.0)
 

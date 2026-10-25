@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from collections.abc import Callable
+from dataclasses import replace
 
 import customtkinter as ctk
 
@@ -15,6 +16,13 @@ _MAIN_BOTTOM = 58
 _OVERVIEW_TOP = 78
 _OVERVIEW_BOTTOM = 90
 _HANDLE_HIT_PX = 8
+
+
+def segment_fill(segment: SegmentRange) -> str:
+    """Timeline colour of a range: its restoration model."""
+    if segment.restoration is not None and segment.restoration.model == "ltx":
+        return Colors.MODEL_LTX
+    return Colors.PRIMARY
 
 
 def timeline_seconds_to_x(
@@ -97,10 +105,6 @@ class SegmentTimeline(ctk.CTkFrame):
         self._canvas.bind("<Button-4>", lambda event: self._on_wheel(event, delta=120))
         self._canvas.bind("<Button-5>", lambda event: self._on_wheel(event, delta=-120))
 
-    @property
-    def view_range(self) -> tuple[float, float]:
-        return self._view_start, self._view_end
-
     def set_data(
         self,
         *,
@@ -166,7 +170,7 @@ class SegmentTimeline(ctk.CTkFrame):
                 width,
                 top=_MAIN_BOTTOM - 6,
                 bottom=_MAIN_BOTTOM - 1,
-                fill=Colors.STATUS_PAUSED,
+                fill=Colors.STATUS_WARNING,
             )
 
         for index, segment in enumerate(self._segments):
@@ -175,7 +179,7 @@ class SegmentTimeline(ctk.CTkFrame):
                 width,
                 top=_MAIN_TOP + 7,
                 bottom=_MAIN_BOTTOM - 7,
-                fill=Colors.PRIMARY,
+                fill=segment_fill(segment),
                 outline="#a5b4fc" if index == self._selected_index else "",
                 outline_width=2 if index == self._selected_index else 0,
             )
@@ -188,7 +192,7 @@ class SegmentTimeline(ctk.CTkFrame):
                 width,
                 top=_MAIN_TOP + 5,
                 bottom=_MAIN_BOTTOM - 5,
-                fill=Colors.STATUS_PAUSED,
+                fill=Colors.STATUS_WARNING,
                 stipple="gray50",
             )
 
@@ -261,7 +265,7 @@ class SegmentTimeline(ctk.CTkFrame):
                 _OVERVIEW_TOP + 2,
                 max(x1 + 1, x2),
                 _OVERVIEW_BOTTOM - 2,
-                fill=Colors.PRIMARY,
+                fill=segment_fill(segment),
                 outline="",
             )
         for run in self._detections:
@@ -272,7 +276,7 @@ class SegmentTimeline(ctk.CTkFrame):
                 _OVERVIEW_BOTTOM - 4,
                 max(x1 + 1, x2),
                 _OVERVIEW_BOTTOM - 1,
-                fill=Colors.STATUS_PAUSED,
+                fill=Colors.STATUS_WARNING,
                 outline="",
             )
         x1 = _PAD_X + self._view_start / self.duration * usable
@@ -363,13 +367,10 @@ class SegmentTimeline(ctk.CTkFrame):
         elif self._drag_segment is not None:
             if self._drag_kind == "start":
                 start = min(seconds, self._drag_segment.end - 1 / self.fps)
-                self._drag_segment = SegmentRange(max(0.0, start), self._drag_segment.end)
+                self._drag_segment = replace(self._drag_segment, start=max(0.0, start))
             else:
                 end = max(seconds, self._drag_segment.start + 1 / self.fps)
-                self._drag_segment = SegmentRange(
-                    self._drag_segment.start,
-                    min(self.duration, end),
-                )
+                self._drag_segment = replace(self._drag_segment, end=min(self.duration, end))
         self._redraw_timeline()
 
     def _on_release(self, event) -> None:

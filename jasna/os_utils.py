@@ -13,6 +13,32 @@ logger = logging.getLogger(__name__)
 MIN_GPU_COMPUTE = (7, 5)
 MIN_DRIVER_VERSION = 580 if sys.platform == "linux" else 610
 
+
+def get_application_executable() -> str:
+    """Return the running application for subprocess launches."""
+    if sys.platform == "linux" and is_frozen():
+        # Without Nuitka's multiprocessing plugin, sys.executable names a
+        # CPython placeholder in the distribution rather than the compiled app.
+        return os.readlink("/proc/self/exe")
+    if sys.platform == "win32" and is_frozen():
+        import ctypes
+        from ctypes import wintypes
+
+        module_path = ctypes.WinDLL("kernel32", use_last_error=True).GetModuleFileNameW
+        module_path.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        module_path.restype = wintypes.DWORD
+        size = 260
+        while True:
+            buffer = ctypes.create_unicode_buffer(size)
+            length = module_path(None, buffer, size)
+            if not length:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if length < size:
+                return buffer.value
+            size *= 2
+    return sys.executable
+
+
 def check_supported_gpu(
     device: str = "cuda:0",
 ) -> tuple[bool, str] | tuple[bool, tuple[str, int, int]]:
@@ -27,11 +53,27 @@ def check_supported_gpu(
     if not torch.cuda.is_available():
         return False, "no_cuda"
     if vendor_for_device(device) is AcceleratorVendor.AMD:
+        # A ROCm build has no kernels for a GPU arch it was not compiled for, and on
+        # Windows the first kernel launch then crashes the process (issue #408).
+        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+        built_archs = {a.split(":")[0] for a in torch.cuda.get_arch_list()}
+        if built_archs and arch not in built_archs:
+            return False, ("arch_unsupported", arch)
         return True, torch.cuda.get_device_name(device)
     capability = torch.cuda.get_device_capability(device)
     if capability < MIN_GPU_COMPUTE:
         return False, ("compute_too_low", capability[0], capability[1])
     return True, torch.cuda.get_device_name(device)
+
+
+def gpu_check_error(result: str | tuple) -> str:
+    """English CLI message for a failed check_supported_gpu result."""
+    if result == "no_cuda":
+        return "No compatible GPU was found for this Jasna build."
+    if result[0] == "arch_unsupported":
+        return f"This AMD GPU ({result[1]}) is not supported by this Jasna build."
+    _, major, minor = result
+    return f"Compute capability 7.5+ required (GPU: {major}.{minor})."
 def _bundled_exe_filename(name: str) -> str:
     if os.name == "nt" and not name.lower().endswith(".exe"):
         return f"{name}.exe"
@@ -303,17 +345,25 @@ def check_windows_nvidia_sysmem_fallback_policy() -> tuple[bool, str]:
     return False, "Driver Default (recommended: Prefer No Sysmem Fallback)"
 
 
-def check_gpu_driver_version() -> tuple[bool, str]:
-    try:
-        import torch
+def windows_module_loaded(name: str) -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
 
-        hip_version = getattr(torch.version, "hip", None)
-        if hip_version:
-            if not torch.cuda.is_available():
-                return False, f"ROCm {hip_version} is installed but no AMD GPU is available"
-            return True, f"ROCm {hip_version}"
-    except ImportError:
-        pass
+    get_module_handle = ctypes.WinDLL("kernel32", use_last_error=True).GetModuleHandleW
+    get_module_handle.argtypes = [ctypes.c_wchar_p]
+    get_module_handle.restype = ctypes.c_void_p
+    return bool(get_module_handle(name))
+
+
+def check_gpu_driver_version() -> tuple[bool, str]:
+    import torch
+
+    hip_version = torch.version.hip
+    if hip_version:
+        if not torch.cuda.is_available():
+            return False, f"ROCm {hip_version} is installed but no AMD GPU is available"
+        return True, f"ROCm {hip_version}"
 
     nvidia_smi = find_executable("nvidia-smi")
     if not nvidia_smi:
@@ -340,17 +390,98 @@ def check_gpu_driver_version() -> tuple[bool, str]:
     return True, version_str
 
 
+def _install_dir() -> Path:
+    return Path(sys.executable).parent if is_frozen() else Path(__file__).resolve().parent
+
+
 def check_ascii_install_path() -> tuple[bool, str]:
-    if is_frozen():
-        install_path = Path(sys.executable).parent
-    else:
-        install_path = Path(__file__).resolve().parent
-    path_str = str(install_path)
+    path_str = str(_install_dir())
     try:
         path_str.encode("ascii")
     except UnicodeEncodeError:
         return False, path_str
     return True, path_str
+
+
+def install_on_hard_disk() -> bool:
+    """True when Jasna's folder is on a spinning hard disk (HDD); False on SSDs and when the
+    drive type cannot be told (network shares, RAID, virtual disks)."""
+    if sys.platform == "win32":
+        return _windows_drive_has_seek_penalty(_install_dir())
+    device = _linux_block_device(_install_dir())
+    return sysfs_block_is_rotational(Path(f"/sys/dev/block/{os.major(device)}:{os.minor(device)}"))
+
+
+def _linux_block_device(path: Path) -> int:
+    """The block device holding ``path``. Btrfs reports an anonymous device (major 0), so then
+    the source device of the mount holding ``path`` is used."""
+    device = os.stat(path).st_dev
+    if os.major(device):
+        return device
+    source = mount_source(Path("/proc/self/mountinfo").read_text(), path.resolve())
+    return os.stat(source).st_rdev if source.startswith("/dev/") else device
+
+
+def mount_source(mountinfo: str, path: Path) -> str:
+    """Source of the innermost mount holding ``path``, from ``/proc/self/mountinfo`` text."""
+    best, source = "", ""
+    for line in mountinfo.splitlines():
+        fields, _, tail = line.partition(" - ")
+        mount_point = fields.split()[4].replace("\\040", " ")
+        if path.is_relative_to(mount_point) and len(mount_point) >= len(best):
+            best, source = mount_point, tail.split()[1]
+    return source
+
+
+def sysfs_block_is_rotational(block: Path) -> bool:
+    """``block`` is a ``/sys/dev/block/MAJOR:MINOR`` link; a partition reports its disk's queue."""
+    if not block.exists():
+        return False
+    block = block.resolve()
+    if (block / "partition").exists():
+        block = block.parent
+    rotational = block / "queue" / "rotational"
+    return rotational.exists() and rotational.read_text().strip() == "1"
+
+
+def _windows_drive_has_seek_penalty(path: Path) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    class StoragePropertyQuery(ctypes.Structure):
+        _fields_ = [("PropertyId", ctypes.c_int), ("QueryType", ctypes.c_int),
+                    ("AdditionalParameters", ctypes.c_ubyte * 1)]
+
+    class DeviceSeekPenaltyDescriptor(ctypes.Structure):
+        _fields_ = [("Version", wintypes.DWORD), ("Size", wintypes.DWORD), ("IncursSeekPenalty", wintypes.BOOLEAN)]
+
+    drive = os.path.splitdrive(str(path))[0]
+    if len(drive) != 2:
+        return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                         ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                         ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    share_read_write, open_existing = 0x1 | 0x2, 3
+    volume = kernel32.CreateFileW(f"\\\\.\\{drive}", 0, share_read_write, None, open_existing, 0, None)
+    if volume in (None, wintypes.HANDLE(-1).value):
+        return False
+    storage_device_seek_penalty_property, property_standard_query = 7, 0
+    ioctl_storage_query_property = 0x2D1400
+    query = StoragePropertyQuery(storage_device_seek_penalty_property, property_standard_query)
+    descriptor = DeviceSeekPenaltyDescriptor()
+    returned = wintypes.DWORD()
+    try:
+        ok = kernel32.DeviceIoControl(volume, ioctl_storage_query_property, ctypes.byref(query),
+                                      ctypes.sizeof(query), ctypes.byref(descriptor), ctypes.sizeof(descriptor),
+                                      ctypes.byref(returned), None)
+        return bool(ok) and bool(descriptor.IncursSeekPenalty)
+    finally:
+        kernel32.CloseHandle(volume)
 
 
 def get_user_config_dir(app_name: str) -> Path:

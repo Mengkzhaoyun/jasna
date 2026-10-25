@@ -37,7 +37,7 @@ WORKDIR /app/jasna
 
 # PyTorch + TorchVision (cu130) + 显式安装 nvidia-nccl (PyTorch index 专有包)
 RUN pip install --no-cache-dir \
-    torch==2.12.0+cu130 torchvision==0.27.0+cu130 \
+    torch==2.12.1+cu130 torchvision==0.27.1+cu130 \
     nvidia-nccl-cu13==2.29.7 \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
@@ -45,13 +45,13 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     tensorrt==10.16.1.11 \
     torch-tensorrt==2.12.0 \
-    torch==2.12.0+cu130 \
+    torch==2.12.1+cu130 \
     --extra-index-url https://download.pytorch.org/whl/cu130
 
 # 自定义依赖: vali (GPU 视频解码) + PyNvVideoCodec (锁定特定 commit 以保证构建稳定性)
 RUN cd /tmp && \
     git clone --recursive https://codeberg.org/Kruk2/vali.git && \
-    cd vali && git checkout 7e094ef584200b40da97b97b3c2175593a9c987a && cd .. && \
+    cd vali && git checkout 0e5c01ee57222a8ef4f9c7591284c4324bb3fba5 && cd .. && \
     git clone https://codeberg.org/Kruk2/PyNvVideoCodec.git && \
     cd PyNvVideoCodec && git checkout 395a6aa67e3c1db4c84cbd5294ae5d309b22c7c9 && cd .. && \
     pip install --no-cache-dir --no-build-isolation ./vali ./PyNvVideoCodec && \
@@ -67,9 +67,10 @@ RUN pip install --no-cache-dir mmengine==0.10.7 && \
 
 # 安装构建相关的辅助依赖与应用运行依赖 (缓存到镜像，避免每次 build.sh 重新下载几百兆文件)
 RUN pip install --no-cache-dir \
-    cffi "cryptography>=42" \
-    "av>=18,<19" numpy psutil diffusers accelerate huggingface-hub \
-    "opencv-python<5" Pillow tqdm ultralytics nvidia-vfx onnx \
+    cffi "cryptography>=42" certifi \
+    "av==18.1.0" numpy psutil diffusers safetensors requests huggingface-hub \
+    "opencv-python<5" Pillow tqdm "ultralytics>=8.4.96,<8.5" nvidia-vfx onnx \
+    comfy-kitchen==0.2.38 scipy \
     --extra-index-url https://pypi.nvidia.com && \
     echo "/usr/local/lib/python3.13/site-packages/nvidia/nccl/lib" > /etc/ld.so.conf.d/nccl-pip.conf && \
     echo "/usr/local/lib/python3.13/site-packages/torch/lib" > /etc/ld.so.conf.d/torch.conf && \

@@ -1,12 +1,14 @@
 """Control bar - bottom playback controls and progress display."""
 
 import logging
+from tkinter import messagebox
 
 import customtkinter as ctk
 from jasna.gui.theme import Colors, Fonts, Sizing
-from jasna.gui.components import Tooltip
+from jasna.gui.components import Tooltip, format_duration
 from jasna.gui.locales import t
 from jasna.gui.system_stats import SystemStats
+from jasna.progressbar import StageProgress
 
 logger = logging.getLogger(__name__)
 
@@ -19,16 +21,6 @@ _COLOR_STOPS = (
     (0.5, (251, 191, 36)),   # amber-400
     (1.0, (251, 113, 133)),  # rose-400
 )
-
-
-def _format_duration(seconds: float) -> str:
-    mins, secs = divmod(int(seconds), 60)
-    hours, mins = divmod(mins, 60)
-    if hours:
-        return f"{hours}h {mins}m"
-    if mins:
-        return f"{mins}m {secs}s"
-    return f"{secs}s"
 
 
 def _color_for_percent(pct: int) -> str:
@@ -44,6 +36,20 @@ def _color_for_percent(pct: int) -> str:
             return f"#{r:02x}{g:02x}{b:02x}"
     _, c = _COLOR_STOPS[-1]
     return f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}"
+
+
+def status_text(fps: float, stage: StageProgress | None, trial: bool) -> str:
+    """The FPS, or for LTX which step runs, how far it is and its time left."""
+    if stage is None:
+        return f"FPS: {fps:.1f}" if fps > 0 else "FPS: --"
+    values = dict(number=stage.number, count=stage.count, stage=t(f"ltx_stage_{stage.name}"))
+    if stage.fraction <= 0:
+        text = t("ltx_step_starting", **values)
+    elif stage.seconds_left > 0:
+        text = t("ltx_step_eta", percent=int(stage.fraction * 100), time=format_duration(stage.seconds_left), **values)
+    else:
+        text = t("ltx_step_percent", percent=int(stage.fraction * 100), **values)
+    return t("ltx_trial_stage", stage=text) if trial else text
 
 
 class _SystemMetric(ctk.CTkFrame):
@@ -207,8 +213,8 @@ class ControlBar(ctk.CTkFrame):
         self._on_stop: callable = None
         self._on_toggle_logs: callable = None
         self._start_disabled_tooltip = None
+        self._trial = False
         
-        self._is_running = False
         
         self._build_controls()
         self._build_progress()
@@ -254,17 +260,28 @@ class ControlBar(ctk.CTkFrame):
         progress_area = ctk.CTkFrame(self, fg_color="transparent")
         progress_area.pack(side="left", fill="both", expand=True, padx=Sizing.PADDING_MEDIUM, pady=Sizing.PADDING_MEDIUM)
         
-        # Filename
+        top_row = ctk.CTkFrame(progress_area, fg_color="transparent")
+        top_row.pack(fill="x")
+
+        self._fps_label = ctk.CTkLabel(
+            top_row,
+            text="FPS: --",
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
+            text_color=Colors.TEXT_PRIMARY,
+            height=24,
+        )
+        self._fps_label.pack(side="right")
+
         self._filename_label = ctk.CTkLabel(
-            progress_area,
+            top_row,
             text=t("no_file_processing"),
             font=(Fonts.FAMILY, Fonts.SIZE_NORMAL),
             text_color=Colors.TEXT_PRIMARY,
             anchor="w",
+            height=24,
         )
-        self._filename_label.pack(fill="x")
-        
-        # Progress bar row
+        self._filename_label.pack(side="left", fill="x", expand=True, padx=(0, 12))
+
         bar_row = ctk.CTkFrame(progress_area, fg_color="transparent")
         bar_row.pack(fill="x", pady=(4, 0))
         
@@ -278,34 +295,26 @@ class ControlBar(ctk.CTkFrame):
         self._progress_bar.pack(side="left", fill="x", expand=True, padx=(0, 12))
         self._progress_bar.set(0)
         
+        self._eta_label = ctk.CTkLabel(
+            bar_row,
+            text="ETA: --",
+            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
+            text_color=Colors.TEXT_PRIMARY,
+            width=110,
+            height=24,
+            anchor="e",
+        )
+        self._eta_label.pack(side="right")
+
         self._percent_label = ctk.CTkLabel(
             bar_row,
             text="0%",
             font=(Fonts.FAMILY, Fonts.SIZE_NORMAL, "bold"),
             text_color=Colors.TEXT_PRIMARY,
             width=50,
+            height=24,
         )
         self._percent_label.pack(side="right")
-        
-        # Stats row
-        stats_row = ctk.CTkFrame(progress_area, fg_color="transparent")
-        stats_row.pack(fill="x", pady=(4, 0))
-        
-        self._fps_label = ctk.CTkLabel(
-            stats_row,
-            text="FPS: --",
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
-            text_color=Colors.TEXT_PRIMARY,
-        )
-        self._fps_label.pack(side="left")
-        
-        self._eta_label = ctk.CTkLabel(
-            stats_row,
-            text="ETA: --",
-            font=(Fonts.FAMILY, Fonts.SIZE_SMALL),
-            text_color=Colors.TEXT_PRIMARY,
-        )
-        self._eta_label.pack(side="right")
         
     def _build_stats(self):
         stats = ctk.CTkFrame(self, fg_color="transparent")
@@ -354,6 +363,8 @@ class ControlBar(ctk.CTkFrame):
             self._on_start()
             
     def _handle_stop(self):
+        if not messagebox.askyesno(t("stop_confirm_title"), t("stop_confirm"), parent=self):
+            return
         if self._on_stop:
             self._on_stop()
             
@@ -383,8 +394,11 @@ class ControlBar(ctk.CTkFrame):
             if disabled_tooltip:
                 self._start_disabled_tooltip = Tooltip(self._start_btn, disabled_tooltip)
         
-    def set_running(self, running: bool, paused: bool = False):
-        self._is_running = running
+    def set_trial(self, trial: bool) -> None:
+        """Mark the LTX stages of this run as a trial."""
+        self._trial = trial
+
+    def set_running(self, running: bool):
         
         if running:
             self._start_btn.pack_forget()
@@ -401,22 +415,15 @@ class ControlBar(ctk.CTkFrame):
         eta_seconds: float = 0.0,
         queue_current: int = 0,
         queue_total: int = 0,
+        stage: StageProgress | None = None,
     ):
         self._filename_label.configure(text=filename or t("no_file_processing"))
         self._progress_bar.set(percent / 100.0)
         self._percent_label.configure(text=f"{int(percent)}%")
-        self._fps_label.configure(text=f"FPS: {fps:.1f}" if fps > 0 else "FPS: --")
-        
+        self._fps_label.configure(text=status_text(fps, stage, self._trial))
+
         if eta_seconds > 0:
-            mins, secs = divmod(int(eta_seconds), 60)
-            hours, mins = divmod(mins, 60)
-            if hours:
-                eta_str = f"{hours}h {mins}m"
-            elif mins:
-                eta_str = f"{mins}m {secs}s"
-            else:
-                eta_str = f"{secs}s"
-            self._eta_label.configure(text=f"ETA: {eta_str}")
+            self._eta_label.configure(text=f"ETA: {format_duration(eta_seconds)}")
         else:
             self._eta_label.configure(text="ETA: --")
             
@@ -426,7 +433,7 @@ class ControlBar(ctk.CTkFrame):
         self.set_running(False)
         self._progress_bar.set(1.0)
         self._percent_label.configure(text="100%")
-        text = f"{t('completed_in')} {_format_duration(elapsed_seconds)}"
+        text = f"{t('completed_in')} {format_duration(elapsed_seconds)}"
         self._fps_label.configure(text=text)
         self._eta_label.configure(text="")
 

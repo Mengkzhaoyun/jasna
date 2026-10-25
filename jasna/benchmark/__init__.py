@@ -6,10 +6,10 @@ from argparse import Namespace
 
 import torch
 
+from jasna.engine_paths import default_restoration_model_path
 from jasna.benchmark.basicvsrpp_restoration import benchmark_basicvsrpp_restoration
-from jasna.benchmark.lada_yolo_detection_speed import benchmark_lada_yolo_detection_speed
-from jasna.benchmark.rfdetr_detection_speed import benchmark_rfdetr_detection_speed
-from jasna.os_utils import check_required_executables, check_supported_gpu
+from jasna.benchmark.detection_speed import benchmark_lada_yolo_detection_speed, benchmark_rfdetr_detection_speed
+from jasna.os_utils import check_required_executables, check_supported_gpu, gpu_check_error
 
 BENCHMARK_VIDEO_DEFAULTS: list[Path] = [
     Path("assets/test_clip1_1080p.mp4"),
@@ -100,11 +100,7 @@ def run_benchmark_cli(args: Namespace) -> None:
     check_required_executables(disable_ffmpeg_check=bool(getattr(args, "disable_ffmpeg_check", False)))
     gpu_ok, gpu_result = check_supported_gpu(str(args.device))
     if not gpu_ok:
-        if gpu_result == "no_cuda":
-            print("Error: No compatible GPU was found for this Jasna build.")
-        else:
-            _, major, minor = gpu_result
-            print(f"Error: Compute capability 7.5+ required (GPU: {major}.{minor}).")
+        print(f"Error: {gpu_check_error(gpu_result)}")
         sys.exit(1)
     benchmark_videos = (
         [Path(p) for p in args.benchmark_video] if args.benchmark_video else BENCHMARK_VIDEO_DEFAULTS
@@ -119,7 +115,7 @@ def run_benchmark_cli(args: Namespace) -> None:
             if args.detection_score_threshold is None
             else float(args.detection_score_threshold)
         ),
-        restoration_model_path=Path(args.restoration_model_path),
+        restoration_model_path=Path(args.restoration_model_path or default_restoration_model_path("basicvsrpp")),
         compile_basicvsrpp=bool(args.compile_basicvsrpp),
         benchmark_filter=getattr(args, "benchmark_filter", None),
     )

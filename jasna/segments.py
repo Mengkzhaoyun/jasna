@@ -1,14 +1,38 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import heapq
+from dataclasses import dataclass, replace
+
+from jasna.session_config import RestorationModelName
 
 
-@dataclass(frozen=True, order=True)
+@dataclass(frozen=True)
+class SegmentRestoration:
+    """The model that restores a segment; ``ltx_seed`` is set exactly for ``ltx``."""
+
+    model: RestorationModelName
+    ltx_seed: int | None
+
+    def __post_init__(self) -> None:
+        if (self.model == "ltx") != (self.ltx_seed is not None):
+            raise ValueError("an LTX segment needs a seed and only an LTX segment has one")
+
+
+def job_restoration(model: RestorationModelName, ltx_seed: int) -> SegmentRestoration:
+    return SegmentRestoration(model, ltx_seed if model == "ltx" else None)
+
+
+@dataclass(frozen=True)
 class SegmentRange:
-    """A user-visible half-open time range, in seconds."""
+    """A user-visible half-open time range, in seconds. ``restoration`` None means the
+    job's model; ``resolve_restorations`` fills it in before processing."""
 
     start: float
     end: float
+    restoration: SegmentRestoration | None = None
+
+    def __lt__(self, other: SegmentRange) -> bool:
+        return (self.start, self.end) < (other.start, other.end)
 
     def __post_init__(self) -> None:
         start = float(self.start)
@@ -76,13 +100,44 @@ def normalize_segments(
                 )
 
     merged: list[SegmentRange] = []
-    for segment in ordered:
-        if merged and segment.start <= merged[-1].end + 1e-9:
-            previous = merged[-1]
-            merged[-1] = SegmentRange(previous.start, max(previous.end, segment.end))
+    for segment in _painted(segments):
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and segment.restoration == previous.restoration
+            and segment.start <= previous.end + 1e-9
+        ):
+            merged[-1] = replace(previous, end=max(previous.end, segment.end))
         else:
             merged.append(segment)
     return tuple(merged)
+
+
+def _painted(segments: list[SegmentRange] | tuple[SegmentRange, ...]) -> list[SegmentRange]:
+    """Every stretch the ranges cover, in time order, taken by the last range covering it."""
+    points = sorted({point for segment in segments for point in (segment.start, segment.end)})
+    by_start = sorted(range(len(segments)), key=lambda index: segments[index].start)
+    covering: list[int] = []
+    pieces: list[SegmentRange] = []
+    next_start = 0
+    for left, right in zip(points, points[1:]):
+        while next_start < len(by_start) and segments[by_start[next_start]].start <= left:
+            heapq.heappush(covering, -by_start[next_start])
+            next_start += 1
+        while covering and segments[-covering[0]].end <= left:
+            heapq.heappop(covering)
+        if covering and right - left > 1e-9:
+            pieces.append(replace(segments[-covering[0]], start=left, end=right))
+    return pieces
+
+
+def resolve_restorations(
+    segments: tuple[SegmentRange, ...], default: SegmentRestoration
+) -> tuple[SegmentRange, ...]:
+    return tuple(
+        segment if segment.restoration is not None else replace(segment, restoration=default)
+        for segment in segments
+    )
 
 
 def parse_segments(spec: str, *, duration: float | None = None) -> tuple[SegmentRange, ...]:

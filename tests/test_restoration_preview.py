@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+from pathlib import Path
 from fractions import Fraction
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -24,7 +25,7 @@ from jasna.gui.restoration_preview import (
     preview_window,
 )
 from jasna.gui.segment_editor import SegmentEditor
-from jasna.media import VideoMetadata
+from jasna.media.probe import VideoMetadata
 
 
 def _metadata(*, fps=30.0, duration=10.0, time_base=Fraction(1, 90000), start_pts=0) -> VideoMetadata:
@@ -239,7 +240,6 @@ def test_restoration_worker_marks_playback_requests() -> None:
 
 def test_preview_pass_forwards_scene_detection(monkeypatch) -> None:
     from jasna import pipeline_threads
-    from jasna import vram_offloader
 
     class ImmediateThread:
         def __init__(self, *, target, **_kwargs):
@@ -260,19 +260,32 @@ def test_preview_pass_forwards_scene_detection(monkeypatch) -> None:
     monkeypatch.setattr(pipeline_threads, "secondary_restore_loop", MagicMock())
     monkeypatch.setattr(pipeline_threads, "blend_encode_loop", MagicMock())
     monkeypatch.setattr(restoration_preview.threading, "Thread", ImmediateThread)
-    monkeypatch.setattr(vram_offloader, "VramOffloader", MagicMock())
-    monkeypatch.setattr(torch.cuda, "empty_cache", MagicMock())
+    monkeypatch.setattr(pipeline_threads, "VramOffloader", MagicMock())
     worker = RestorationPreviewWorker("video.mp4", _metadata())
     settings = AppSettings(scene_detection=False)
     worker.request(2.0, settings, projection="raw")
     command = worker._commands.get_nowait()
-    session = SimpleNamespace(
+    pipeline = SimpleNamespace(
+        input_video=Path("video.mp4"),
         device=torch.device("cpu"),
         restoration_pipeline=SimpleNamespace(secondary_num_workers=1),
+        max_clip_size=settings.max_clip_size,
+        batch_size=settings.batch_size,
+        temporal_overlap=settings.temporal_overlap,
+        max_detection_gap=settings.max_detection_gap,
+        min_detection_duration=settings.min_detection_duration,
+        enable_crossfade=settings.enable_crossfade,
+        scene_detection=settings.scene_detection,
+        vr_projection="auto",
+        vr_projector=None,
+        job_detection_model=MagicMock(),
+        vr_resolution=SimpleNamespace(resolved="off", is_sbs=False),
+        configure_vr=lambda metadata: None,
     )
 
-    worker._run_preview_pass(command, session, MagicMock())
+    worker._run_preview_pass(command, pipeline)
 
+    assert pipeline.vr_projection == "raw"
     assert decode_detect.call_args.kwargs["scene_detection"] is False
     worker.close()
 
@@ -335,8 +348,13 @@ def test_restoration_worker_reports_completed_teardown() -> None:
 
 
 def test_segment_editor_requests_restored_playback_when_no_buffer_exists() -> None:
+    from jasna.gui.segment_editor_state import SegmentEditorState
+    from jasna.segments import SegmentRestoration
+
     editor = SegmentEditor.__new__(SegmentEditor)
-    editor._state = SimpleNamespace(duration=10.0, fps=30.0)
+    editor._state = SegmentEditorState(
+        duration=10.0, fps=30.0, segments=(), default_restoration=SegmentRestoration("basicvsrpp", None)
+    )
     editor._current = 2.0
     editor._restore_active = True
     editor._restore_play_pending = False
@@ -403,6 +421,7 @@ def test_app_disables_queue_start_while_preview_gpu_is_tearing_down() -> None:
     app._queue_panel = MagicMock()
     app._queue_panel.get_jobs.return_value = [object()]
     app._control_bar = MagicMock()
+    app._ltx_models = SimpleNamespace(downloading=False)
 
     app._update_start_button_state()
 

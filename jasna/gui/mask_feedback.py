@@ -24,6 +24,7 @@ import tkinter as tk
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
+from jasna.gui.components import grab_modal
 from jasna.gui import scaling
 from jasna.gui.locales import t
 from jasna.gui.theme import Colors, Fonts
@@ -321,7 +322,7 @@ class MaskSuggestDialog(ctk.CTkToplevel):
         self._interactive_widgets.append(self._submit_btn)
         cancel_btn = ctk.CTkButton(
             footer,
-            text=t("segments_cancel"),
+            text=t("btn_cancel"),
             fg_color=Colors.BG_CARD,
             hover_color=Colors.BORDER_LIGHT,
             command=self._cancel,
@@ -400,10 +401,7 @@ class MaskSuggestDialog(ctk.CTkToplevel):
         self.bind("<Escape>", lambda _e: self._cancel())
 
         self.update_idletasks()
-        self.wait_visibility()
-        self.grab_set()
-        self.lift()
-        self.focus_force()
+        grab_modal(self)
         self._redraw()
 
     def _canvas_size(self) -> tuple[int, int]:
@@ -411,10 +409,7 @@ class MaskSuggestDialog(ctk.CTkToplevel):
 
     def _on_resize(self, _event=None) -> None:
         if self._resize_after is not None:
-            try:
-                self.after_cancel(self._resize_after)
-            except tk.TclError:
-                pass
+            self.after_cancel(self._resize_after)
         self._resize_after = self.after(60, self._redraw)
 
     def _view(self) -> tuple[float, float, float]:
@@ -517,10 +512,7 @@ class MaskSuggestDialog(ctk.CTkToplevel):
     def _on_alpha(self, value: float) -> None:
         self._mask_alpha = float(value)
         if self._alpha_after is not None:
-            try:
-                self.after_cancel(self._alpha_after)
-            except tk.TclError:
-                pass
+            self.after_cancel(self._alpha_after)
         self._alpha_after = self.after(40, self._redraw)
 
     def _toggle_shapes(self) -> None:
@@ -623,7 +615,7 @@ class MaskSuggestDialog(ctk.CTkToplevel):
             if len(points) > 1:
                 canvas.create_line(
                     [coord for point in points for coord in point],
-                    fill=Colors.STATUS_PAUSED,
+                    fill=Colors.STATUS_WARNING,
                     width=2,
                 )
             for index, (cx, cy) in enumerate(points):
@@ -633,7 +625,7 @@ class MaskSuggestDialog(ctk.CTkToplevel):
                     cy - radius,
                     cx + radius,
                     cy + radius,
-                    fill=Colors.STATUS_PAUSED if index == 0 else "#e0e7ff",
+                    fill=Colors.STATUS_WARNING if index == 0 else "#e0e7ff",
                     outline="",
                 )
 
@@ -661,10 +653,7 @@ class MaskSuggestDialog(ctk.CTkToplevel):
         if self._done:
             return
         self._done = True
-        try:
-            self.grab_release()
-        except tk.TclError:
-            pass
+        self.grab_release()
         if self._on_closed is not None:
             self._on_closed()
         self.destroy()
