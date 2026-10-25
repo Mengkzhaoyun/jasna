@@ -24,6 +24,7 @@ set -e
 #   LTX_LARGE_CANVAS           (默认: false)
 #   LTX_FAST                   (默认: false, 仅 RTX 50 系支持 NVFP4)
 #   LTX_TRIAL                  (默认: false, LTX 免费测速/算子验证模式)
+#   JASNA_LICENSE              (默认: 空, 激活码 JL1-...，提供后自动完成激活)
 #   LOG_LEVEL                  (默认: info)
 #   TARGET_BITRATE             (默认: 5M) 直接传给 Jasna NVENC，一阶段输出目标码率
 #   PRESERVE_LOW_BITRATE       (默认: true) 输入视频码率 <= TARGET_BITRATE 时仍处理，但不压缩
@@ -158,8 +159,25 @@ EOF
 fi
 
 # ---- 带参数时直接透传给 sglang ----
+JASNA_BIN="/app/sglang/sglang"
+FFMPEG_CHECK_ARG="--disable-ffmpeg-check"
+if [ -x "/app/jasna-release/jasna" ]; then
+	if [[ "${RESTORATION_MODEL_NAME:-}" == ltx* ]] || [[ " $* " == *" ltx"* ]] || [[ " $* " == *"--license-code"* ]] || [[ " $* " == *"--machine-key"* ]] || [ -n "${JASNA_LICENSE:-}" ]; then
+		JASNA_BIN="/app/jasna-release/jasna"
+		FFMPEG_CHECK_ARG=""
+	fi
+fi
+
+if [ -n "${JASNA_LICENSE:-}" ] && [ ! -f "/root/.config/jasna/license.json" ] && [ ! -f "/root/.local/share/jasna/license.json" ]; then
+	echo "检测到 JASNA_LICENSE，正在执行激活..."
+	$JASNA_BIN --license-code "${JASNA_LICENSE}" || true
+fi
+
 if [ $# -gt 0 ]; then
-	exec /app/sglang/sglang --disable-ffmpeg-check --detection-model "${DETECTION_MODEL:-rfdetr-v6-large}" --encoder-settings "$(build_encoder_settings)" "$@"
+	if [[ " $* " == *"--machine-key"* ]] || [[ " $* " == *"--license-code"* ]] || [[ " $* " == *"--activation-key"* ]] || [[ " $* " == *"--help"* ]] || [[ " $* " == *"--version"* ]]; then
+		exec $JASNA_BIN "$@"
+	fi
+	exec $JASNA_BIN $FFMPEG_CHECK_ARG --detection-model "${DETECTION_MODEL:-rfdetr-v6-large}" --encoder-settings "$(build_encoder_settings)" "$@"
 fi
 
 # ---- 无参数: 批量扫描模式 ----
@@ -203,7 +221,9 @@ JASNA_OPTS=""
 [ -n "$DENOISE" ] && JASNA_OPTS="$JASNA_OPTS --denoise $DENOISE"
 [ -n "$DETECTION_SCORE_THRESHOLD" ] && JASNA_OPTS="$JASNA_OPTS --detection-score-threshold $DETECTION_SCORE_THRESHOLD"
 [ "$FP16" = "true" ] && JASNA_OPTS="$JASNA_OPTS --fp16"
-[ "$COMPILE_BASICVSRPP" = "true" ] && JASNA_OPTS="$JASNA_OPTS --compile-basicvsrpp"
+if [[ "${RESTORATION_MODEL_NAME:-basicvsrpp}" == "basicvsrpp" ]] || [ -z "${RESTORATION_MODEL_NAME:-}" ]; then
+	[ "$COMPILE_BASICVSRPP" = "true" ] && JASNA_OPTS="$JASNA_OPTS --compile-basicvsrpp"
+fi
 [ -n "$LOG_LEVEL" ] && JASNA_OPTS="$JASNA_OPTS --log-level $LOG_LEVEL"
 
 echo "============================================"
@@ -323,8 +343,8 @@ for i in "${!TASKS[@]}"; do
 	fi
 	echo "============================================"
 
-	if /app/sglang/sglang \
-		--disable-ffmpeg-check \
+	if $JASNA_BIN \
+		$FFMPEG_CHECK_ARG \
 		--codec "$CODEC" \
 		--encoder-settings "$task_encoder_settings" \
 		--input "$input" \

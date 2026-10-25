@@ -95,13 +95,13 @@
    - `Activation key` 中包含 `wraps["ltx-2.5-v2"]`，即用构建主密钥（`master_key`）通过 HKDF-SHA256 + AES-GCM 封装后的模型 `content_key`，由 `protection/_core.so` 在原生层解封并解密分块。
 3. **自建容器与源码环境落地路径**：
    - **路径 A（明文 `.safetensors` 直跑，无需任何 `jasna.protection` 组件）**：只要将解密后或自训练的明文 `.safetensors` 放入 `model_weights/`（或指定 `--restoration-model-path`），`jasna/ltx/model_files.py` 会自动走 `_PlaintextHandle` 原生加载，并通过开源 `BlockStore` + `jasna_ltx_native` 全速运行。
-   - **路径 B（官方发行版组件 + 授权激活）**：已将官方 `v0.11.3` 的 `jasna` 主程序、`comfy_kitchen` 及 `protection/`（`_core.so`、`_opaque_ltx.so` 等）提取缓存在 4090 服务器 `/data/jasna/.release-cache/v0.11.3/`。
+   - **路径 B（官方发行版组件 + 授权激活）**：已将官方 `v0.11.3` 完整 Linux 发行版解压于 4090 服务器 `/data/jasna/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/`，并通过 `JASNA_LICENSE` 完成在线激活（离线凭证持久化于 `/root/.config/jasna/license.json` 与 `/data/jasna/license.json`）。同时已将完整 LTX 权重包（`ltx-restore-alpha1-distill2-int8.safetensors.enc`、`vae.safetensors.enc`、`vae-decoder.safetensors.enc` 及 `.manifest.json`）下载校验至 `/data/jasna/model_weights/`。
 
 ### 4. RTX 4090 真机热更新与算子实测结果（`36.170.21.98:36226`）
 
-已在 8× RTX 4090 服务器（Driver `595.84`，CUDA `13.2`）完成热更新与算子预编译验证：
+已在 8× RTX 4090 服务器（Driver `595.84`，CUDA `13.2`）完成热更新、授权激活与真实模型算子验证：
 
-- **热更新镜像**：`registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3`（位于 `/data/jasna/src`）。
+- **热更新镜像**：`registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3`（位于 `/data/jasna/src`，已集成 `python_vali==4.8.8` 容错分支，彻底解决 `DecodeSingleSurfaceAsyncDetailed` 缺失告警）。
 - **预编译算子缓存（`jasna/ltx/native/prebuilt/`）**：
   - `jasna_ltx_native.so`（3.42 MB，含 C++/CUDA `block.cpp`、`glue.cu` 及 SageAttention INT8 内核）。
   - `kernels/`：已完成全架构 Triton AOT 内核预编译，涵盖 `sm75-int8`、`sm86-int8`、`sm89-int8`（RTX 4090）、`sm120-int8`、`sm120-nvfp4`（RTX 5090）、`sm121-int8`、`sm121-nvfp4`。
@@ -109,6 +109,7 @@
   - `T.require_kernels(cuda:0)`：**通过**（`triton` + `comfy_kitchen` INT8 Attention 就绪）。
   - `LtxTransformer`（`distilled2` INT8，48 层 Transformer Blocks）加载耗时：**4.22 秒**（预编译后免 JIT 编译）。
   - 后端与显存驻留：`backend = native`，**`resident blocks = 48 / 48`（100% 显存常驻，0 PCIe 流式回退）**。
+  - 真实授权激活与全链路推理验证：`Jasna: installation verified.`，容器内通过 `/usr/local/bin/entrypoint.sh --restoration-model-name ltx` 端到端视频修复输出通过。
 
 ### 5. RTX 4090 vs RTX 5090 算子与显存行为对比
 
