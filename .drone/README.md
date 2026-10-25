@@ -46,30 +46,32 @@ docker build -f .drone/dockerfile -t registry.cn-qingdao.aliyuncs.com/wod/cuda:1
 .\.tmp\hot-update.ps1
 ```
 
-## Production Deployment (RTX 4090 / RTX 5090 Recommended)
+## Production Deployment (RTX 4090 / RTX 5090 统一镜像)
 
-自 `v0.11.3` 起，容器已默认内置 `RESTORATION_MODEL_NAME=ltx`（LTX-2.5 22B 2-step 视频去马赛克修复）并自动探测 `RESTORATION_MODEL_PATH`，无需额外传递模型环境变量即可直接启动：
+自 `v0.11.3` 起，容器已默认内置 `RESTORATION_MODEL_NAME=ltx`（LTX-2.5 22B 2-step 视频去马赛克修复），并具备全自动发现与硬件架构自适应能力：
+- **模型路径自动探测**：自动发现 `/data/jasna/model_weights` 或 `/app/sglang/model_weights`。
+- **离线授权自动恢复**：自动从 `/data/jasna/license.json` 恢复离线证书，无需每次激活或传递 `JASNA_LICENSE`。
+- **4090 / 5090 单镜像自适应**：启动时自动探测 GPU Compute Capability，在 **RTX 4090 (`SM 8.9`)** 上自动使用 `INT8` 算子，在 **RTX 5090 (`SM 12.0`)** 且存在 `nvfp4` 权重时自动开启 `LTX_FAST=true`（`NVFP4` 硬件加速，全流程提速约 **2.3x**）。
 
-### 1. LTX 模式生产部署（默认推荐，画质与细节最佳）
+### 1. LTX 模式生产部署（默认推荐，4090 / 5090 通用）
 
 ```bash
 docker rm -f sglang || true && \
 docker run --name sglang \
   -it --rm \
-  --gpus '"device=0"' \
+  --gpus all \
+  -e CUDA_VISIBLE_DEVICES=0 \
   -e TARGET_BITRATE=5M \
   -v /etc/machine-id:/etc/machine-id:ro \
-  -v /root/.config/jasna:/root/.config/jasna \
-  -v /data/jasna/model_weights:/app/sglang/model_weights \
-  -v /data/jasna/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3:/app/jasna-release \
+  -v /data/jasna:/data/jasna \
   -v /nas/sglang/ai:/data \
   registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3
 ```
 
 > **提示**：
 >
-> - 若首次在新机器上激活，只需额外传入 `-e JASNA_LICENSE="JL1-..."`，`entrypoint.sh` 会自动完成激活并将离线凭证写入 `/root/.config/jasna/license.json`。
-> - 在 **RTX 5090 (Blackwell SM 12.0)** 上，可额外传入 `-e LTX_FAST=true` 启用硬件原生 **NVFP4** 权重与算子（提速约 1.4x，显存占用减半）。
+> - 4090 与 5090 节点的离线激活凭证已持久化于 `/data/jasna/license.json`，挂载 `-v /data/jasna:/data/jasna` 即可免激活离线直跑。
+> - 在双卡/多卡节点（如 5090 双卡或 4090 八卡）上，建议使用 `--gpus all -e CUDA_VISIBLE_DEVICES=<卡号>` 指定目标显卡，以保证 `libnvidia-encode` (NVENC) 正常识别设备节点。
 > - 如需切换回传统极速模式（BasicVSR++），传入 `-e RESTORATION_MODEL_NAME=basicvsrpp` 即可。
 
 ### 2. BasicVSR++ 极速模式部署（无需官方 release 挂载与授权）

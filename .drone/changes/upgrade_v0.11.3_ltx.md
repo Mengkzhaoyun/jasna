@@ -111,11 +111,20 @@
   - 后端与显存驻留：`backend = native`，**`resident blocks = 48 / 48`（100% 显存常驻，0 PCIe 流式回退）**。
   - 真实授权激活与全链路推理验证：`Jasna: installation verified.`，容器内通过 `/usr/local/bin/entrypoint.sh --restoration-model-name ltx` 端到端视频修复输出通过。
 
-### 5. RTX 4090 vs RTX 5090 算子与显存行为对比
+### 5. RTX 4090 vs RTX 5090 统一镜像真机实测对比
 
-- **RTX 4090 (24GB VRAM, Ada Lovelace SM 8.9)**：
-  - 使用 **INT8** 权重（约 13.3 GB），自动启用 `cuBLAS INT8 MM` + `SageAttention INT8` + `Triton Epilogue` 原生算子（`sm89-int8`）。
-  - 空载 24GB 显存下可将全部 **48 / 48** 个 Transformer Blocks 100% 常驻显存。
-- **RTX 5090 (32GB VRAM, Blackwell SM 12.0)**：
-  - 支持 `--ltx-fast` 启用硬件原生 **NVFP4** 权重（仅 7.7 GB，体积减半）与 `cuBLAS BlockWise1x16 NVFP4 GEMM` + `Triton FP4 Quantize` 算子（`sm120-nvfp4`，已在 `prebuilt/kernels/` 中预编译就绪）。
-  - 32GB 显存不仅可 100% 常驻全部 Blocks，还支持更大的窗口并发组（`group_size`）与 `--ltx-large-canvas`。
+已在 **8× RTX 4090 (`36.170.21.98:36226`, SM 8.9)** 与 **2× RTX 5090 (`rtx5090-200.5090.gpu.beagle`, SM 12.0)** 两台服务器上部署同一个统一镜像 `registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3`，并完成热缓存（`torch-compile-cache`）全 4 阶段实测对比：
+
+| 阶段 / 指标 | RTX 4090 (24GB, Ada SM 8.9) | RTX 5090 (32GB, Blackwell SM 12.0) | 5090 加速比 |
+| :--- | :--- | :--- | :--- |
+| **自动匹配模型与算子** | `distill2-int8` (13.37 GB, `sm89-int8`) | `distill2-nvfp4` (7.73 GB, `sm120-nvfp4`) | 权重体积 **-42%** |
+| **`LTX 1/4 scan` (RF-DETR v6 Large + NVDEC)** | `0.58 s` (`41.24 frame/s`) | **`0.30 s` (`80.09 frame/s`)** | **1.94x** |
+| **`LTX 2/4 encode` (3D Causal VAE Encode)** | `21.0 s` (`1.12 frame/s`) | **`8.9 s` (`2.69 frame/s`)** | **2.36x** |
+| **`LTX 3/4 denoise` (22B DiT 2-Step)** | `1.68 s` (`1.19 step/s`) | **`0.80 s` (`2.48 step/s`)** | **2.10x** |
+| **`LTX 4/4 compose` (VAE Decode + NVENC)** | `6.0 s` (`3.76 frame/s`) | **`2.6 s` (`9.08 frame/s`)** | **2.31x** |
+| **4 阶段端到端总耗时（热缓存）** | `~29.3 s` | **`~12.6 s`** | **2.33x** |
+
+- **单镜像跨代兼容要点**：
+  1. `entrypoint.sh` 启动时通过 `nvidia-smi --query-gpu=compute_cap` 自动识别架构：`12.*` 且存在 `*nvfp4*.safetensors*` 时自动开启 `--ltx-fast`，`8.9` 自动使用 `INT8`。
+  2. 多卡环境下通过 `--gpus all -e CUDA_VISIBLE_DEVICES=<id>` 挂载完整 `/dev/nvidia0` 控制节点，确保 `595.104.02` 驱动下 `hevc_nvenc` (`OpenEncodeSessionEx`) 正常初始化。
+  3. 自动从 `/data/jasna/license.json` 恢复离线授权凭证并自动排除 `.release-cache` / `model_weights` 系统目录，实现零环境变量、免重复激活的一键启动。

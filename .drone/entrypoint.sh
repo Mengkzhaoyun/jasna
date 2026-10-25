@@ -167,7 +167,7 @@ fi
 # ---- 默认修复模型与路径自动探测 ----
 RESTORATION_MODEL_NAME="${RESTORATION_MODEL_NAME:-ltx}"
 if [ -z "${RESTORATION_MODEL_PATH:-}" ] && [[ "${RESTORATION_MODEL_NAME}" == ltx* ]]; then
-	for cand in "/data/jasna/model_weights" "/app/sglang/model_weights" "model_weights"; do
+	for cand in "/data/jasna/model_weights" "/data/model_weights" "/app/sglang/model_weights" "model_weights"; do
 		if [ -f "${cand}/vae.safetensors.enc" ] || [ -f "${cand}/vae.safetensors" ]; then
 			RESTORATION_MODEL_PATH="${cand}"
 			break
@@ -189,15 +189,28 @@ if [ -z "${LTX_FAST:-}" ] && [[ "${RESTORATION_MODEL_NAME}" == ltx* ]]; then
 fi
 LTX_FAST="${LTX_FAST:-false}"
 
-# ---- 带参数时直接透传给 sglang ----
+# ---- 自动恢复持久化离线证书与探测 Release 运行时 ----
+if [ ! -f "/root/.config/jasna/license.json" ]; then
+	for lic_cand in "/data/jasna/license.json" "/data/license.json" "/app/sglang/model_weights/license.json"; do
+		if [ -f "${lic_cand}" ]; then
+			mkdir -p /root/.config/jasna
+			cp "${lic_cand}" /root/.config/jasna/license.json
+			break
+		fi
+	done
+fi
+
 JASNA_BIN="/app/sglang/sglang"
 FFMPEG_CHECK_ARG="--disable-ffmpeg-check"
-if [ -x "/app/jasna-release/jasna" ]; then
-	if [[ "${RESTORATION_MODEL_NAME:-}" == ltx* ]] || [[ " $* " == *" ltx"* ]] || [[ " $* " == *"--license-code"* ]] || [[ " $* " == *"--machine-key"* ]] || [ -n "${JASNA_LICENSE:-}" ]; then
-		JASNA_BIN="/app/jasna-release/jasna"
-		FFMPEG_CHECK_ARG=""
+for rel_cand in "/app/jasna-release/jasna" "/data/jasna/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna" "/data/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna"; do
+	if [ -x "${rel_cand}" ]; then
+		if [[ "${RESTORATION_MODEL_NAME:-}" == ltx* ]] || [[ " $* " == *" ltx"* ]] || [[ " $* " == *"--license-code"* ]] || [[ " $* " == *"--machine-key"* ]] || [ -n "${JASNA_LICENSE:-}" ]; then
+			JASNA_BIN="${rel_cand}"
+			FFMPEG_CHECK_ARG=""
+		fi
+		break
 	fi
-fi
+done
 
 if [ -n "${JASNA_LICENSE:-}" ] && [ ! -f "/root/.config/jasna/license.json" ] && [ ! -f "/root/.local/share/jasna/license.json" ]; then
 	echo "检测到 JASNA_LICENSE，正在执行激活..."
@@ -332,7 +345,7 @@ while IFS= read -r -d '' filepath; do
 	fi
 
 	TASKS+=("${filepath}|${output}|${task_encoder_settings}|${task_note}")
-done < <(find "$SCAN_DIR" -type f \( "${FIND_ARGS[@]}" \) -print0 | sort -z)
+done < <(find "$SCAN_DIR" -not -path "*/.release-cache/*" -not -path "*/jasna-release/*" -not -path "*/model_weights/*" -not -path "*/models/*" -not -path "*/src/*" -type f \( "${FIND_ARGS[@]}" \) -print0 | sort -z)
 
 if [ ${#TASKS[@]} -eq 0 ]; then
 	echo "未找到需要处理的视频文件。"
