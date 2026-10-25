@@ -19,8 +19,8 @@ set -e
 #   DETECTION_SCORE_THRESHOLD  (默认: 0.25)
 #   FP16                       (默认: true)
 #   COMPILE_BASICVSRPP         (默认: true)
-#   RESTORATION_MODEL_NAME     (默认: 空, 即 basicvsrpp; 可选: ltx, ltx-4step, ltx-8step, ltx-undistilled)
-#   RESTORATION_MODEL_PATH     (默认: 空, 自动按模型类型解析路径)
+#   RESTORATION_MODEL_NAME     (默认: ltx; 可选: basicvsrpp, ltx, ltx-4step, ltx-8step, ltx-undistilled)
+#   RESTORATION_MODEL_PATH     (默认: 自动探测 model_weights 或 /data/jasna/model_weights)
 #   LTX_LARGE_CANVAS           (默认: false)
 #   LTX_FAST                   (默认: false, 仅 RTX 50 系支持 NVFP4)
 #   LTX_TRIAL                  (默认: false, LTX 免费测速/算子验证模式)
@@ -43,6 +43,12 @@ export DISABLE_FFMPEG_CHECK=1
 
 if [ -d "/app/sglang" ]; then
 	cd /app/sglang
+fi
+
+# 兼容容器内外 model_weights 软链接路径 (/app/jasna-release/model_weights -> /data/jasna/model_weights)
+if [ -d "/app/sglang/model_weights" ] && [ ! -e "/data/jasna/model_weights" ]; then
+	mkdir -p /data/jasna
+	ln -sfn /app/sglang/model_weights /data/jasna/model_weights
 fi
 
 bitrate_to_kbps() {
@@ -158,6 +164,20 @@ EOF
 	exit 0
 fi
 
+# ---- 默认修复模型与路径自动探测 ----
+RESTORATION_MODEL_NAME="${RESTORATION_MODEL_NAME:-ltx}"
+if [ -z "${RESTORATION_MODEL_PATH:-}" ] && [[ "${RESTORATION_MODEL_NAME}" == ltx* ]]; then
+	for cand in "/data/jasna/model_weights" "/app/sglang/model_weights" "model_weights"; do
+		if [ -f "${cand}/vae.safetensors.enc" ] || [ -f "${cand}/vae.safetensors" ]; then
+			RESTORATION_MODEL_PATH="${cand}"
+			break
+		elif [ -f "${cand}/ltx-restore/vae.safetensors.enc" ] || [ -f "${cand}/ltx-restore/vae.safetensors" ]; then
+			RESTORATION_MODEL_PATH="${cand}/ltx-restore"
+			break
+		fi
+	done
+fi
+
 # ---- 带参数时直接透传给 sglang ----
 JASNA_BIN="/app/sglang/sglang"
 FFMPEG_CHECK_ARG="--disable-ffmpeg-check"
@@ -177,7 +197,14 @@ if [ $# -gt 0 ]; then
 	if [[ " $* " == *"--machine-key"* ]] || [[ " $* " == *"--license-code"* ]] || [[ " $* " == *"--activation-key"* ]] || [[ " $* " == *"--help"* ]] || [[ " $* " == *"--version"* ]]; then
 		exec $JASNA_BIN "$@"
 	fi
-	exec $JASNA_BIN $FFMPEG_CHECK_ARG --detection-model "${DETECTION_MODEL:-rfdetr-v6-large}" --encoder-settings "$(build_encoder_settings)" "$@"
+	PASSTHROUGH_MODEL_ARGS=()
+	if [[ " $* " != *"--restoration-model-name"* ]] && [ -n "${RESTORATION_MODEL_NAME:-}" ]; then
+		PASSTHROUGH_MODEL_ARGS+=(--restoration-model-name "${RESTORATION_MODEL_NAME}")
+	fi
+	if [[ " $* " != *"--restoration-model-path"* ]] && [ -n "${RESTORATION_MODEL_PATH:-}" ]; then
+		PASSTHROUGH_MODEL_ARGS+=(--restoration-model-path "${RESTORATION_MODEL_PATH}")
+	fi
+	exec $JASNA_BIN $FFMPEG_CHECK_ARG --detection-model "${DETECTION_MODEL:-rfdetr-v6-large}" "${PASSTHROUGH_MODEL_ARGS[@]}" --encoder-settings "$(build_encoder_settings)" "$@"
 fi
 
 # ---- 无参数: 批量扫描模式 ----
@@ -194,8 +221,6 @@ DENOISE="${DENOISE:-low}"
 DETECTION_SCORE_THRESHOLD="${DETECTION_SCORE_THRESHOLD:-}"
 FP16="${FP16:-true}"
 COMPILE_BASICVSRPP="${COMPILE_BASICVSRPP:-true}"
-RESTORATION_MODEL_NAME="${RESTORATION_MODEL_NAME:-}"
-RESTORATION_MODEL_PATH="${RESTORATION_MODEL_PATH:-}"
 LTX_LARGE_CANVAS="${LTX_LARGE_CANVAS:-false}"
 LTX_FAST="${LTX_FAST:-false}"
 LTX_TRIAL="${LTX_TRIAL:-false}"
