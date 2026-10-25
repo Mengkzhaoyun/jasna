@@ -159,7 +159,7 @@ fi
 
 # ---- 带参数时直接透传给 sglang ----
 if [ $# -gt 0 ]; then
-	exec /app/sglang/sglang --disable-ffmpeg-check --encoder-settings "$(build_encoder_settings)" "$@"
+	exec /app/sglang/sglang --disable-ffmpeg-check --detection-model "${DETECTION_MODEL:-rfdetr-v6-large}" --encoder-settings "$(build_encoder_settings)" "$@"
 fi
 
 # ---- 无参数: 批量扫描模式 ----
