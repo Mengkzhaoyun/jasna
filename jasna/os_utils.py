@@ -47,7 +47,7 @@ def check_supported_gpu(
         from jasna._suppress_noise import install as _install_noise_filters
         _install_noise_filters()
         import torch
-        from jasna.accelerator import AcceleratorVendor, vendor_for_device
+        from jasna.accelerator import AcceleratorVendor, amd_gpu_architecture, vendor_for_device
     except ImportError:
         return False, "no_cuda"
     if not torch.cuda.is_available():
@@ -55,7 +55,7 @@ def check_supported_gpu(
     if vendor_for_device(device) is AcceleratorVendor.AMD:
         # A ROCm build has no kernels for a GPU arch it was not compiled for, and on
         # Windows the first kernel launch then crashes the process (issue #408).
-        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+        arch = amd_gpu_architecture(device)
         built_archs = {a.split(":")[0] for a in torch.cuda.get_arch_list()}
         if built_archs and arch not in built_archs:
             return False, ("arch_unsupported", arch)
@@ -332,6 +332,10 @@ def _read_drs_setting(setting_id: int) -> int | None:
 def check_windows_nvidia_sysmem_fallback_policy() -> tuple[bool, str]:
     if sys.platform != "win32":
         return True, "N/A"
+    from jasna.accelerator import is_amd_device
+
+    if is_amd_device():
+        return True, "N/A (AMD)"
 
     try:
         value = _read_drs_setting(_CUDA_SYSMEM_FALLBACK_POLICY_ID)
@@ -388,6 +392,22 @@ def check_gpu_driver_version() -> tuple[bool, str]:
     if major < MIN_DRIVER_VERSION:
         return False, f"{version_str} (requires {MIN_DRIVER_VERSION}+)"
     return True, version_str
+
+
+AMF_LINUX_INSTALL_URL = "https://repo.radeon.com/amf/"
+AMD_DRIVER_URL = "https://www.amd.com/en/support/download/drivers.html"
+
+
+def check_amd_amf_runtime() -> tuple[bool, str]:
+    """AMD decode/encode needs AMD's AMF runtime: the Windows driver ships it, Linux needs AMD's AMF installer."""
+    import ctypes
+
+    library = "amfrt64.dll" if sys.platform == "win32" else "libamfrt64.so.1"
+    try:
+        ctypes.CDLL(library)
+    except (OSError, ImportError) as e:
+        return False, str(e)
+    return True, library
 
 
 def _install_dir() -> Path:

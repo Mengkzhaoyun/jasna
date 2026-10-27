@@ -2,7 +2,6 @@ import argparse
 import logging
 import sys
 from contextlib import contextmanager
-from dataclasses import replace
 from pathlib import Path
 
 from jasna import __version__
@@ -10,7 +9,10 @@ from jasna.cli_help import CLI_HELP
 from jasna.engine_paths import default_restoration_model_path
 from jasna.media.probe import UnsupportedVideoError
 from jasna.os_utils import (
+    AMD_DRIVER_URL,
+    AMF_LINUX_INSTALL_URL,
     MIN_DRIVER_VERSION,
+    check_amd_amf_runtime,
     check_ascii_install_path,
     check_gpu_driver_version,
     check_required_executables,
@@ -32,6 +34,12 @@ CLI_RESTORATION_MODELS: dict[str, tuple[RestorationModelName, LtxModelName]] = {
 
 
 
+def batch_size_from_args(args: argparse.Namespace) -> int:
+    from jasna.mosaic.detection_registry import default_detection_batch_size
+
+    return int(args.batch_size) if args.batch_size is not None else default_detection_batch_size(args.device)
+
+
 def _session_config_from_args(
     args: argparse.Namespace,
     *,
@@ -48,7 +56,7 @@ def _session_config_from_args(
     return SessionConfig(
         device=str(args.device),
         fp16=bool(args.fp16),
-        batch_size=int(args.batch_size),
+        batch_size=batch_size_from_args(args),
         detection_model_name=detection_model_name,
         detection_model_path=detection_model_path,
         detection_score_threshold=detection_score_threshold,
@@ -200,7 +208,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory for temporary files created while assembling segment output (default: the output video's directory)",
     )
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
         "--fp16",
@@ -654,7 +662,18 @@ def _check_system(args: argparse.Namespace) -> None:
             print(f"Please update your NVIDIA driver to version {MIN_DRIVER_VERSION} or newer.")
         sys.exit(1)
 
-    from jasna.accelerator import is_nvidia_device
+    from jasna.accelerator import is_amd_device, is_nvidia_device
+
+    if is_amd_device():
+        amf_ok, amf_info = check_amd_amf_runtime()
+        if not amf_ok:
+            print(f"Error: AMD's AMF video runtime is missing, so Jasna can't decode or encode video ({amf_info}).")
+            if sys.platform == "win32":
+                print(f"Update or reinstall your AMD graphics driver: {AMD_DRIVER_URL}")
+            else:
+                print(f"Install it with AMD's AMF installer: open the newest version folder at {AMF_LINUX_INSTALL_URL}, "
+                      "download amf_installer_<version>.zip, unpack it and run sudo ./amf_installer_<version>.sh")
+            sys.exit(1)
 
     if sys.platform == "win32" and is_nvidia_device():
         sysmem_ok, sysmem_info = check_windows_nvidia_sysmem_fallback_policy()
@@ -806,6 +825,7 @@ def _run_videos(
     total: int,
 ) -> bool:
     """Process videos one by one; returns False when a per-video command failed in a folder batch."""
+    from jasna.job_resume import ResumeMismatchError
     from jasna.post_export_action import PostExportVideoCommandError, run_post_export_video_command
 
     post_export_video_command = str(args.post_export_video_command).strip()
@@ -815,8 +835,10 @@ def _run_videos(
         if in_folder:
             print(f"[{i}/{total}] Processing {vid.name} -> {out_path.name}")
         try:
-            make_pipeline(vid, out_path).run()
-        except UnsupportedVideoError as e:
+            _run_resumable_video(make_pipeline, vid, out_path)
+        except (UnsupportedVideoError, ResumeMismatchError) as e:
+            if isinstance(e, ResumeMismatchError):
+                all_commands_ok = False
             print(f"Error processing {vid.name}: {e}")
             if not in_folder:
                 sys.exit(1)
@@ -834,6 +856,22 @@ def _run_videos(
     return all_commands_ok
 
 
+def _run_resumable_video(make_pipeline, source: Path, output: Path) -> None:
+    from jasna.job_resume import ResumeMismatchError
+
+    while True:
+        try:
+            make_pipeline(source, output).run()
+            return
+        except ResumeMismatchError as error:
+            if not sys.stdin.isatty():
+                raise ResumeMismatchError(error.directory) from None
+            answer = input(f"{error}\nReplace saved progress and start over? [y/N]: ")
+            if answer.strip().lower() not in ("y", "yes"):
+                raise
+            error.discard()
+
+
 def _ensure_ltx_model(config: SessionConfig, segments) -> None:
     """Offer to download the selected LTX model when the job needs it and it is missing.
     Without a terminal to ask in, fail with what to download instead of waiting."""
@@ -844,9 +882,16 @@ def _ensure_ltx_model(config: SessionConfig, segments) -> None:
     )
     if not uses_ltx:
         return
+    from jasna.accelerator import supports_nvfp4
+    from jasna.session_factory import LICENSED_LTX_AMD_UNAVAILABLE, LTX_FAST_NEEDS_BLACKWELL, unsupported_licensed_ltx_on_amd
+
+    if config.ltx_fast and not supports_nvfp4(config.device):
+        sys.exit(f"Error: {LTX_FAST_NEEDS_BLACKWELL}")
     if config.ltx_trial:
         print(LTX_TRIAL_NOTICE)
         return
+    if unsupported_licensed_ltx_on_amd(config):
+        sys.exit(f"Error: {LICENSED_LTX_AMD_UNAVAILABLE}")
     directory = config.restoration_model_path if config.restoration_model_name == "ltx" else default_restoration_model_path("ltx")
     missing = missing_downloads(directory, config.ltx_model, fast=config.ltx_fast)
     if not missing:
@@ -856,11 +901,16 @@ def _ensure_ltx_model(config: SessionConfig, segments) -> None:
     require_protection()
     names = ", ".join(file.name for file in missing)
     size = download_size_text(missing)
+    updating = any((directory / file.name).is_file() for file in missing)
+    status = "need updating" if updating else "missing"
+    message = f"LTX model files {status} in {directory}: {names}."
+    if updating:
+        message += " Models copied from older Jasna versions cannot be used. Your existing License code still works."
     if not sys.stdin.isatty():
-        raise FileNotFoundError(f"LTX model files missing in {directory}: {names}. Run jasna in a terminal to download them ({size}).")
-    answer = input(f"LTX {config.ltx_model} model not found in {directory}:\n  {names}\nDownload it ({size})? [y/N]: ")
+        raise FileNotFoundError(f"{message} Run jasna in a terminal to download them ({size}).")
+    answer = input(f"{message}\nDownload ({size})? [y/N]: ")
     if answer.strip().lower() not in ("y", "yes"):
-        raise FileNotFoundError(f"LTX model files missing in {directory}: {names}")
+        raise FileNotFoundError(message)
     from tqdm import tqdm
 
     from jasna.gui.locales import get_locale
@@ -1091,15 +1141,8 @@ def main() -> None:
             split = None if segments else ltx_auto_split(config, session, vid_input, out_path, progress_callback=None)
             if split is None:
                 return build_pipeline(config, session, vid_input, out_path, segments=segments, splice_plan=splice_plan)
-            split_config = replace(
-                config,
-                codec=split.codec,
-                encoder_settings=_resolve_cli_encoder_settings(
-                    str(args.encoder_settings), cq=args.cq, codec=split.codec, vendor=vendor_for_device(str(args.device))
-                ),
-            )
             return build_pipeline(
-                split_config, session, vid_input, out_path, segments=split.segments, splice_plan=split.splice_plan
+                split.config, session, vid_input, out_path, segments=split.segments, splice_plan=split.splice_plan
             )
 
         def output_path_for(vid: Path) -> Path:

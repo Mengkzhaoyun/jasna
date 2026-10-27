@@ -11,7 +11,7 @@ All heavy imports (torch, restorers, pipeline) stay inside the functions.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
@@ -186,7 +186,7 @@ def provide_restoration_models(
         session.ltx_files = _ltx_model_files(config, session.device, log_callback=log_callback)
 
 
-def _restoration_model_path(config: SessionConfig, name: RestorationModelName) -> Path:
+def restoration_model_path_for(config: SessionConfig, name: RestorationModelName) -> Path:
     from jasna.engine_paths import default_restoration_model_path
 
     if name == config.restoration_model_name:
@@ -203,7 +203,7 @@ def _build_basicvsrpp_pipeline(
     from jasna.restorer.denoise import DenoiseStep, DenoiseStrength
     from jasna.restorer.restoration_pipeline import RestorationPipeline
 
-    model_path = _restoration_model_path(config, "basicvsrpp")
+    model_path = restoration_model_path_for(config, "basicvsrpp")
     compile_result = ensure_engines_compiled(
         EngineCompilationRequest(
             device=str(device),
@@ -232,26 +232,46 @@ def _build_basicvsrpp_pipeline(
     )
 
 
+LICENSED_LTX_AMD_UNAVAILABLE = (
+    "LTX quality models are unavailable for this AMD setup. You can try the free LTX trial (--ltx-trial)."
+)
+LTX_FAST_NEEDS_BLACKWELL = "The fast LTX model needs an RTX 50-series (Blackwell) GPU"
+
+
+def unsupported_licensed_ltx_on_amd(config: SessionConfig) -> bool:
+    """Whether this job needs the protected AMD worker on an unsupported OS."""
+    from jasna.accelerator import is_amd_device, supports_licensed_ltx_on_amd
+    from jasna.ltx.model_files import needs_license
+
+    return (
+        not config.ltx_trial
+        and is_amd_device(config.device)
+        and not supports_licensed_ltx_on_amd()
+        and needs_license(restoration_model_path_for(config, "ltx"), config.ltx_model, fast=config.ltx_fast)
+    )
+
+
 def _ltx_model_files(
     config: SessionConfig, device: "torch.device", *, log_callback: Callable[[str], None] | None
 ) -> "LtxModelFiles":
-    import torch
-
     from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
     from jasna.ltx.model_files import LtxModelFiles
 
+    from jasna.accelerator import supports_nvfp4
     from jasna.ltx.transformer import require_kernels
 
+    if unsupported_licensed_ltx_on_amd(config):
+        raise ValueError(LICENSED_LTX_AMD_UNAVAILABLE)
+    if config.ltx_fast and not supports_nvfp4(device):
+        raise ValueError(LTX_FAST_NEEDS_BLACKWELL)
     require_kernels(device)
-    if config.ltx_fast and torch.cuda.get_device_capability(device)[0] < 10:
-        raise ValueError("The fast LTX model needs an RTX 50-series (Blackwell) GPU")
     if config.ltx_trial:
         from jasna.ltx.model_files import LTX_TRIAL_NOTICE
 
         logger.warning(LTX_TRIAL_NOTICE)
         files = LtxModelFiles.placeholder(config.ltx_model, fast=config.ltx_fast)
     else:
-        files = LtxModelFiles.from_dir(_restoration_model_path(config, "ltx"), config.ltx_model, fast=config.ltx_fast)
+        files = LtxModelFiles.from_dir(restoration_model_path_for(config, "ltx"), config.ltx_model, fast=config.ltx_fast)
     ensure_engines_compiled(
         EngineCompilationRequest(
             device=str(device),
@@ -266,11 +286,33 @@ def _ltx_model_files(
     return files
 
 
+def segment_job_config(config: SessionConfig, source_codec: str, input_video: Path) -> SessionConfig:
+    """A segment job copies the parts it leaves alone, so its output keeps the source codec.
+    The CQ and custom encoder settings were chosen for ``config.codec`` (``tune=uhq`` of
+    av1_nvenc fails on h264_nvenc), so another codec gets only its own default CQ."""
+    if source_codec == config.codec:
+        return config
+    from jasna.accelerator import vendor_for_device
+    from jasna.media.encoder_settings import encoder_cq_spec
+
+    cq = encoder_cq_spec(source_codec, vendor_for_device(config.device)).default
+    logger.warning(
+        "%s: the output keeps the source codec %s so the parts without changes can be copied; "
+        "the CQ and custom encoder settings are for %s and are not used (%s CQ %d)",
+        input_video.name,
+        source_codec.upper(),
+        config.codec.upper(),
+        source_codec.upper(),
+        cq,
+    )
+    return replace(config, codec=source_codec, encoder_settings={"cq": cq})
+
+
 @dataclass(frozen=True)
 class AutoSplit:
-    """A job's LTX auto split: the source codec it keeps, its ranges and their smart-render plan."""
+    """A job's LTX auto split: its config in the source codec, its ranges and their smart-render plan."""
 
-    codec: str
+    config: SessionConfig
     segments: "tuple[SegmentRange, ...]"
     splice_plan: "SplicePlan"
 
@@ -317,26 +359,47 @@ def ltx_auto_split(
         if progress_callback is not None:
             progress_callback(0.0, 0.0, 0.0, 0, 0, StageProgress("split", 1, 1, fraction, 0.0))
 
-    samples = scan_mosaic_sizes(
-        session.detection_model_for(config),
-        input_video,
-        metadata,
-        batch_size=config.batch_size,
-        device=session.device,
-        disable_progress=config.disable_progress,
-        on_progress=on_progress,
+    from jasna.job_resume import (
+        ResumeMismatchError,
+        has_saved_work,
+        job_fingerprints,
+        read_json,
+        resume_directory,
+        segments_from_json,
+        write_json,
     )
-    segments = ltx_auto_segments(
-        samples.times,
-        samples.scores,
-        samples.sizes,
-        threshold=config.detection_score_threshold,
-        ltx_min_size=config.ltx_auto_split_percent / 100,
-        stride=samples.stride,
-        duration=metadata.duration,
-        keyframes=tuple(index.seconds_for_pts(pts) for pts in index.pts),
-        ltx_seed=config.ltx_seed,
-    )
+
+    root = resume_directory(config, output_video)
+    key = job_fingerprints(config, input_video, output_video, metadata, ())[1]
+    cached = read_json(root / "split.json")
+    if cached is not None and cached["fingerprint"] == key:
+        segments = segments_from_json(cached["segments"])
+        logger.info("Reusing saved LTX auto split for %s", input_video.name)
+    else:
+        if has_saved_work(root):
+            raise ResumeMismatchError(root)
+        samples = scan_mosaic_sizes(
+            session.detection_model_for(config),
+            input_video,
+            metadata,
+            batch_size=config.batch_size,
+            device=session.device,
+            disable_progress=config.disable_progress,
+            on_progress=on_progress,
+        )
+        segments = ltx_auto_segments(
+            samples.times,
+            samples.scores,
+            samples.sizes,
+            threshold=config.detection_score_threshold,
+            ltx_min_size=config.ltx_auto_split_percent / 100,
+            stride=samples.stride,
+            duration=metadata.duration,
+            keyframes=index.keyframe_seconds(),
+            ltx_seed=config.ltx_seed,
+        )
+        root.mkdir(parents=True, exist_ok=True)
+        write_json(root / "split.json", {"fingerprint": key, "segments": [asdict(segment) for segment in segments]})
     if not segments:
         logger.warning("%s: LTX auto split found no mosaics; restoring the whole video with LTX", input_video.name)
         return None
@@ -354,7 +417,7 @@ def ltx_auto_split(
         ltx_seconds,
         ltx_seconds / mosaic_seconds * 100,
     )
-    return AutoSplit(codec, segments, splice_plan)
+    return AutoSplit(segment_job_config(config, codec, input_video), segments, splice_plan)
 
 
 def build_pipeline(

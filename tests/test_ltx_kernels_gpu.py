@@ -1,5 +1,5 @@
 """The Triton kernels for the LTX quantized linears against the torch path they replace.
-Needs a GPU architecture ``kernels.supports`` and Triton; the NVFP4 tests
+Needs a GPU architecture ``kernel_policy.supports`` (NVIDIA or AMD) and Triton; the NVFP4 tests
 need consumer Blackwell (SM 12.x)."""
 
 from __future__ import annotations
@@ -11,12 +11,11 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from jasna.ltx import transformer as T
-from jasna.ltx.kernels import supports
+from jasna.ltx import kernel_policy
+from jasna.ltx.kernel_policy import supports
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.version.cuda is None
-    or not supports(torch.device("cuda")),
+    not torch.cuda.is_available() or not supports(torch.device("cuda")),
     reason="needs a GPU the INT8 kernels support and Triton",
 )
 needs_bf16_sdpa = pytest.mark.skipif(
@@ -24,7 +23,8 @@ needs_bf16_sdpa = pytest.mark.skipif(
     reason="the bf16 SDPA self-attention these blocks run needs SM 8.0",
 )
 needs_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 12, reason="NVFP4 needs consumer Blackwell"
+    not torch.cuda.is_available() or torch.version.cuda is None or torch.cuda.get_device_capability()[0] != 12,
+    reason="NVFP4 needs consumer Blackwell",
 )
 
 
@@ -54,6 +54,38 @@ def test_rotate_quantize_matches_the_torch_reference(kernels):
         assert torch.allclose(scales, expected_scales[:rows], rtol=1e-6, atol=0)
 
 
+def test_gated_rotate_quantize_matches_quantizing_the_gated_tokens(kernels):
+    generator = torch.Generator().manual_seed(0)
+    heads, rows, head_dim = 32, 300, 128
+    out = _activations(heads * rows, head_dim, generator).view(heads, rows, head_dim)
+    logits = torch.randn(rows, heads, generator=generator).to("cuda", torch.bfloat16)
+    gated = (out.transpose(0, 1) * (2.0 * torch.sigmoid(logits.float()))[..., None]).to(torch.bfloat16)
+
+    codes, scales = kernels.gated_rotate_quantize(out, logits)
+
+    expected_codes, expected_scales = kernels.rotate_quantize(gated.reshape(rows, heads * head_dim))
+    assert (codes != expected_codes).float().mean() < 1e-4
+    assert (codes.int() - expected_codes.int()).abs().max() <= 1
+    assert torch.allclose(scales, expected_scales, rtol=1e-6, atol=0)
+
+
+def test_int8_residual_mm_adds_the_gated_projection_per_half(kernels):
+    generator = torch.Generator().manual_seed(0)
+    rows, k, n = 256, 512, 384
+    codes = torch.randint(-127, 128, (rows, k), generator=generator, dtype=torch.int8).cuda()
+    qdata = torch.randint(-127, 128, (n, k), generator=generator, dtype=torch.int8).cuda()
+    act_scales, scales = torch.rand(rows).cuda() * 1e-2, torch.rand(n).cuda() * 1e-3
+    bias = torch.randn(n, generator=generator).to("cuda", torch.bfloat16)
+    residual = torch.randn(rows, n, generator=generator).to("cuda", torch.bfloat16)
+    gate = torch.randn(2, n, generator=generator).to("cuda", torch.bfloat16)
+
+    out = kernels.int8_residual_mm(codes, act_scales, qdata, scales, bias, residual, gate)
+
+    projected = kernels.int8_scaled_mm(codes, act_scales, qdata, scales, bias, False).float()
+    expected = residual.float() + projected * gate.float().repeat_interleave(rows // 2, 0)
+    torch.testing.assert_close(out.float(), expected, atol=1e-2, rtol=1e-2)
+
+
 def test_int8_scaled_mm_is_bit_exact_with_the_reference_rescale(kernels, monkeypatch):
     monkeypatch.setattr(T, "_quant_kernels", None)
     generator = torch.Generator().manual_seed(0)
@@ -74,7 +106,7 @@ def test_int8_scaled_mm_is_bit_exact_with_the_reference_rescale(kernels, monkeyp
 
 
 def test_cublas_gemm_with_triton_epilogue_is_bit_exact(kernels, monkeypatch):
-    monkeypatch.setattr(kernels, "_cublas_int8_mm", lambda device: True)
+    monkeypatch.setattr(kernels, "_cached_gpu_architecture", lambda device: next(iter(kernel_policy.CUBLAS_INT8_MM)))
     test_int8_scaled_mm_is_bit_exact_with_the_reference_rescale(kernels, monkeypatch)
     test_fused_norm_modulation_and_feed_forward(kernels)
 
@@ -151,8 +183,10 @@ def _quantized_block(dim: int, heads: int, fp4: bool, generator: torch.Generator
 
 
 @needs_bf16_sdpa
+@pytest.mark.parametrize("attention_epilogues", [False, True], ids=["separate", "fused attention epilogues"])
 @pytest.mark.parametrize("fp4", [False, pytest.param(True, marks=needs_blackwell)], ids=["int8", "nvfp4"])
-def test_block_forward_with_kernels_matches_the_torch_path(kernels, monkeypatch, fp4):
+def test_block_forward_with_kernels_matches_the_torch_path(kernels, monkeypatch, fp4, attention_epilogues):
+    monkeypatch.setattr(T._quant_kernels, "attention_epilogues", attention_epilogues)
     generator = torch.Generator().manual_seed(0)
     dim, heads = 512, 16
     weights = _quantized_block(dim, heads, fp4, generator)
@@ -222,6 +256,6 @@ def test_kernels_reject_widths_they_would_compute_wrong(kernels):
         kernels.quantize_fp4(x, torch.ones((), device="cuda"), False)
     codes = torch.zeros(8, 288, dtype=torch.int8, device="cuda")
     weights = torch.zeros(256, 288, dtype=torch.int8, device="cuda")
-    if not kernels._cublas_int8_mm(codes.device):  # the cuBLAS GEMM takes any width divisible by 8
+    if kernel_policy.gpu_architecture(codes.device) not in kernel_policy.CUBLAS_INT8_MM:  # cuBLAS takes any width divisible by 8
         with pytest.raises(ValueError):
             kernels.int8_scaled_mm(codes, torch.ones(8, device="cuda"), weights, torch.ones(256, device="cuda"), None, False)

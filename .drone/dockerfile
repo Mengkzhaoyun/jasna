@@ -2,7 +2,7 @@
 # Runtime — 基于 Builder 基础环境的极速精简运行镜像
 # 彻底移除 Nuitka 编译流程，直接在 Python 容器内高效运行
 # ============================================================
-ARG BASE=ghcr.io/mengkzhaoyun/jasna:v0.11.3-build
+ARG BASE=ghcr.io/mengkzhaoyun/jasna:v0.12.0-build
 FROM ${BASE}
 
 ARG AUTHOR

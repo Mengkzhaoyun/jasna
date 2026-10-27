@@ -18,6 +18,7 @@ from jasna.engine_paths import (
     basicvsrpp_sub_engine_exists,
     get_basicvsrpp_sub_engine_paths,
 )
+from jasna.restorer.basicvsrpp_fused_body import FusedPropagateBody, has_fused_body_kernels
 from jasna.trt.torch_tensorrt_export import (
     compile_and_save_torchtrt_dynamo,
     get_workspace_size_bytes,
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 FEATURE_SIZE = 64
 INPUT_SIZE = 256
 MID_CHANNELS = 64
+EAGER_UPSAMPLE_BATCH = 8
 
 _CUDAGRAPHS_ENV = "JASNA_TRT_CUDAGRAPHS"
 
@@ -427,6 +429,8 @@ class BasicVSRPlusPlusNetSplit(nn.Module):
         loop_body_engines: dict[str, nn.Module],
         preprocess_engine: nn.Module,
         upsample_engine: nn.Module,
+        upsample_batch: int,
+        loop_body_cudagraphs: bool,
     ):
         super().__init__()
         self.mid_channels = generator.mid_channels
@@ -435,7 +439,8 @@ class BasicVSRPlusPlusNetSplit(nn.Module):
         self._loop_body_engines = loop_body_engines
         self._preprocess_engine = preprocess_engine
         self._upsample_engine = upsample_engine
-        self._loop_body_cudagraphs = _loop_body_cudagraphs_enabled()
+        self._upsample_batch = upsample_batch
+        self._loop_body_cudagraphs = loop_body_cudagraphs
 
     def close(self) -> None:
         engines = []
@@ -645,7 +650,7 @@ class BasicVSRPlusPlusNetSplit(nn.Module):
             hr = [feats[k].pop(0) for k in feats if k != "spatial"]
             hr.insert(0, feats["spatial"][mapping_idx[i]])
             hr_list.append(torch.cat(hr, dim=1))
-            if len(hr_list) < UPSAMPLE_BATCH and i < t - 1:
+            if len(hr_list) < self._upsample_batch and i < t - 1:
                 continue
             stop = i + 1
             torch.add(
@@ -752,15 +757,36 @@ def create_split_forward(
         return None
     loop_body_engines, preprocess_engine, upsample_engine = result
     generator = _get_inference_generator(model)
-    if _loop_body_cudagraphs_enabled():
+    cudagraphs = _loop_body_cudagraphs_enabled()
+    if cudagraphs:
         _warmup_capture_loop_body_graphs(
             loop_body_engines, generator.mid_channels, device,
             torch.float16 if fp16 else torch.float32,
         )
-    split = BasicVSRPlusPlusNetSplit(
-        generator, loop_body_engines, preprocess_engine, upsample_engine,
+    return BasicVSRPlusPlusNetSplit(
+        generator, loop_body_engines, preprocess_engine, upsample_engine, UPSAMPLE_BATCH, cudagraphs,
     )
-    return split
+
+
+def _eager_propagate_body(deform_align: nn.Module, backbone: nn.Module) -> nn.Module:
+    if has_fused_body_kernels(deform_align.weight):
+        return FusedPropagateBody(deform_align, backbone)
+    return _PropagateBodyWrapper(deform_align, backbone)
+
+
+def create_eager_split_forward(model: nn.Module) -> BasicVSRPlusPlusNetSplit:
+    generator = _get_inference_generator(model)
+    loop_bodies = {
+        d: _eager_propagate_body(generator.deform_align[d], generator.backbone[d]).eval()
+        for d in DIRECTIONS
+    }
+    logger.info("BasicVSR++ propagation runs %s", type(loop_bodies[DIRECTIONS[0]]).__name__)
+    preprocess = _PreprocessWrapper(generator.feat_extract, generator.spynet).eval()
+    upsample = _UpsampleWrapper(
+        generator.reconstruction, generator.upsample1, generator.upsample2,
+        generator.conv_hr, generator.conv_last,
+    ).eval()
+    return BasicVSRPlusPlusNetSplit(generator, loop_bodies, preprocess, upsample, EAGER_UPSAMPLE_BATCH, False)
 
 
 def _gpu_vram_gb(device: torch.device) -> float:

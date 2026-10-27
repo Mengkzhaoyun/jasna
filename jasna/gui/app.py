@@ -13,6 +13,7 @@ from tkinterdnd2 import TkinterDnD
 
 from jasna import __version__
 from jasna import os_utils, startup_timing
+from jasna.accelerator import AcceleratorVendor
 from jasna.gui.branding import (
     HEADER_LOGO_SIZE,
     create_header_logo,
@@ -51,22 +52,22 @@ _SHUTDOWN_COUNTDOWN_SECONDS = 60
 _WINDHAWK_MODULE = "windhawk.dll"
 
 
-def _warm_up_cuda() -> tuple[bool, bool]:
+def _warm_up_cuda() -> tuple[AcceleratorVendor, bool]:
     """Import torch and create the CUDA context. Run off the UI thread after the window
     paints, so the window shows first and the first job skips cold torch/CUDA init.
     An unsupported GPU gets no kernel launch; the system check reports it instead.
-    Returns (NVIDIA GPU, Blackwell GPU) for the LTX model options."""
+    Returns (GPU vendor, Blackwell GPU) for the LTX model options; CPU without a supported GPU."""
     from jasna.os_utils import check_supported_gpu
 
     gpu_ok, _ = check_supported_gpu()
     if not gpu_ok:
-        return False, False
+        return AcceleratorVendor.CPU, False
     import torch
-    from jasna.accelerator import is_nvidia_device
+    from jasna.accelerator import supports_nvfp4, vendor_for_device
 
     torch.zeros(1, device="cuda")
-    nvidia = is_nvidia_device()
-    return nvidia, nvidia and torch.cuda.get_device_capability(0)[0] >= 10
+    vendor = vendor_for_device()
+    return vendor, supports_nvfp4("cuda:0")
 
 
 class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
@@ -397,7 +398,24 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             on_progress=self._on_processor_progress,
             on_log=self._on_processor_log,
             on_complete=self._on_processor_complete,
+            on_resume_conflict=self._confirm_resume_restart,
         )
+
+    def _confirm_resume_restart(self, directory):
+        from concurrent.futures import Future
+        from tkinter import messagebox
+
+        answer = Future()
+
+        def ask():
+            if not answer.set_running_or_notify_cancel():
+                return
+            answer.set_result(messagebox.askyesno(
+                t("resume_restart_title"), t("resume_restart_confirm"), parent=self,
+            ))
+
+        self._main_thread.post(ask)
+        return answer
 
     def _log_startup_timing(self):
         logger.info(
@@ -423,12 +441,12 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
     def _start_cuda_warmup(self):
         def _run():
             try:
-                nvidia, blackwell = _warm_up_cuda()
+                vendor, blackwell = _warm_up_cuda()
             except Exception:
                 logger.warning("CUDA warm-up failed", exc_info=True)
-                nvidia, blackwell = False, False
+                vendor, blackwell = AcceleratorVendor.CPU, False
             self._main_thread.post(
-                lambda: self._settings_panel.set_gpu_support(nvidia=nvidia, blackwell=blackwell)
+                lambda: self._settings_panel.set_gpu_support(vendor=vendor, blackwell=blackwell)
             )
 
         threading.Thread(target=_run, daemon=True, name="cuda-warmup").start()
@@ -629,6 +647,11 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         ):
             return
         jobs = self._queue_panel.get_jobs()
+        continuing = self._processor is not None and self._processor.was_stopped and any(
+            job.status is JobStatus.PENDING for job in jobs
+        )
+        if continuing:
+            jobs = [job for job in jobs if job.status is JobStatus.PENDING]
         if not jobs:
             self._log_panel.warning(t("toast_no_files"))
             return
@@ -701,9 +724,11 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
             self._show_toast(t("toast_ltx_trial"), "warning")
             self._log_panel.warning(t("toast_ltx_trial"))
         self._control_bar.set_trial(trial)
-        self._queue_panel.reset_jobs_for_run()
+        if not continuing:
+            self._queue_panel.reset_jobs_for_run()
         
         self._status_pill.set_status("PROCESSING", Colors.STATUS_PROCESSING)
+        self._control_bar.set_resumable(any_job_uses_ltx(jobs, settings))
         self._control_bar.set_running(True)
         self._video_player_btn.configure(state="disabled")
         
@@ -759,6 +784,8 @@ class JasnaApp(ctk.CTk, TkinterDnD.DnDWrapper):
         job_id = update.job_id
         
         if update.status == JobStatus.PROCESSING:
+            if update.resumable is not None:
+                self._control_bar.set_resumable(update.resumable)
             self._job_start_times.setdefault(job_id, time.time())
             # Resolve current queue position for control bar display
             filename = ""

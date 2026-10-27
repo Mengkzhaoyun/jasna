@@ -13,6 +13,8 @@ import pytest
 
 from jasna.streaming import HlsStreamingServer, _generate_vod_playlist
 
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
+
 
 def _make_metadata(duration: float = 60.0, fps: float = 30.0, num_frames: int = 1800):
     from av.video.reformatter import Colorspace as AvColorspace, ColorRange as AvColorRange
@@ -108,12 +110,16 @@ class TestHlsStreamingServer:
         assert server.segment_start_frame(2) == 240
         server._cleanup_segments()
 
-    def test_frames_per_segment(self):
-        meta = _make_metadata(duration=20.0, fps=30.0)
-        server = HlsStreamingServer(segment_duration=4.0, port=0)
-        server.load_video(meta)
-        assert server.frames_per_segment() == 120
-        server._cleanup_segments()
+    def test_playlist_being_replaced_reads_as_not_ready(self, tmp_path, monkeypatch):
+        server = HlsStreamingServer(segment_duration=2.0, port=0)
+        server.segments_dir = tmp_path
+        _finalize_segments(tmp_path, 0)
+
+        def _replaced_by_ffmpeg(path, *args, **kwargs):
+            raise PermissionError(13, "Permission denied", str(path))
+
+        monkeypatch.setattr(Path, "read_text", _replaced_by_ffmpeg)
+        assert server.segment_is_ready(tmp_path / "seg_00000.ts") is False
 
     def test_seek_request_and_consume(self):
         server = HlsStreamingServer(segment_duration=4.0, port=0)
@@ -654,6 +660,81 @@ class TestStreamingEncoder:
         cmd = mock_popen.call_args[0][0]
         assert '-output_ts_offset' not in cmd
         enc.stop()
+
+    @pytest.mark.parametrize(
+        ("fps", "duration", "frames"),
+        [
+            (Fraction(30000, 1001), 2.0, 60),
+            (Fraction(30000, 1001), 4.0, 120),
+            (Fraction(24000, 1001), 2.0, 48),
+            (Fraction(25), 2.0, 50),
+            (Fraction(121, 5), 2.0, 49),
+        ],
+    )
+    @patch('jasna.streaming_encoder.subprocess.Popen')
+    def test_every_segment_is_one_gop(self, mock_popen, tmp_path, fps, duration, frames):
+        from jasna.streaming_encoder import StreamingEncoder
+        mock_popen.return_value = _mock_ffmpeg_process()
+        meta = _make_metadata()
+        meta.video_fps_exact = fps
+        enc = StreamingEncoder(segments_dir=tmp_path, segment_duration=duration, metadata=meta, source_video="")
+        enc.start(start_number=0)
+        cmd = mock_popen.call_args[0][0]
+        assert cmd[cmd.index('-g') + 1] == str(frames)
+        assert enc.frames_per_segment == frames
+        enc.stop()
+
+    def test_writer_counts_segments_like_the_muxer(self, tmp_path):
+        from jasna.streaming_encoder import StreamingEncoder
+        from jasna.streaming_pipeline import _StreamingFrameWriter
+        meta = _make_metadata()
+        meta.video_fps_exact = Fraction(30000, 1001)
+        meta.video_fps = 30000 / 1001
+        server = HlsStreamingServer(segment_duration=2.0, port=0)
+        server.load_video(meta)
+        server.reset_demand(20)
+        enc = StreamingEncoder(server.segments_dir, server.segment_duration, meta, source_video="")
+        writer = _StreamingFrameWriter(enc, server, start_segment=20)
+        writer.after_write(590, threading.Event())
+        assert server._produced_segment == 29
+        server._cleanup_segments()
+
+    def test_pass_can_start_after_a_video_switch_unloaded_the_server(self, tmp_path):
+        from jasna.streaming_encoder import StreamingEncoder
+        from jasna.streaming_pipeline import _StreamingFrameWriter
+        meta = _make_metadata()
+        server = HlsStreamingServer(segment_duration=2.0, port=0)
+        server.load_video(meta)
+        enc = StreamingEncoder(server.segments_dir, server.segment_duration, meta, source_video="")
+        server.select_video(Path("next.mp4"), 0.0)
+        _StreamingFrameWriter(enc, server, start_segment=10)
+        server._cleanup_segments()
+
+    def test_reencoded_surround_audio_plays_from_any_segment(self, tmp_path):
+        import subprocess
+
+        import av
+
+        from jasna.os_utils import resolve_executable
+        from jasna.streaming_encoder import _browser_audio_args
+        ffmpeg = resolve_executable("ffmpeg")
+        source = tmp_path / "source.mka"
+        subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-f", "lavfi",
+             "-i", "sine=d=7,aformat=channel_layouts=5.1(side)", "-c:a", "ac3", str(source)],
+            check=True,
+        )
+        subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", str(source), "-map", "0:a:0",
+             *_browser_audio_args(str(source)),
+             "-f", "hls", "-hls_time", "2", "-hls_segment_type", "mpegts",
+             "-hls_segment_filename", str(tmp_path / "seg_%05d.ts"), "-hls_list_size", "0",
+             str(tmp_path / "_hls_internal.m3u8")],
+            check=True,
+        )
+        with av.open(str(tmp_path / "seg_00002.ts")) as segment:
+            frame = next(segment.decode(audio=0))
+        assert frame.layout.name == "5.1"
 
 
 class TestStreamingEncoderGpuIdx:
@@ -1249,6 +1330,33 @@ class TestHttpSegments:
         finally:
             server.stop()
 
+    def test_open_seek_to_a_nearby_segment_serves_it_from_the_new_pass(self, tmp_path):
+        video_file = tmp_path / "test.mp4"
+        video_file.write_bytes(b"fake")
+        server = HlsStreamingServer(segment_duration=2.0)
+        port = _start_server_on_free_port(server)
+        server._current_video_path = video_file
+        server.load_video(_make_metadata(duration=200.0))
+        server.reset_demand(20)
+        server.update_production(22)
+        result = []
+        try:
+            assert _post(port, "/open", {"path": str(video_file), "start": 50.001})[0] == 200
+            thread = threading.Thread(target=lambda: result.append(_get(port, "/seg_00025.ts?epoch=1")))
+            thread.start()
+            deadline = time.monotonic() + 2
+            while server._highest_requested_segment < 25 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert server.consume_seek_for_pass(20) == 25
+            server.reset_demand(25)
+            server.notify_segment_requested(25)
+            time.sleep(0.4)
+            _finalize_segments(server.segments_dir, 25)
+            thread.join(timeout=2)
+            assert result[0][0:2] == (200, "complete")
+        finally:
+            server.stop()
+
 
 class TestHttpPage:
     def test_player_waits_longer_for_first_byte_than_server_long_poll(self):
@@ -1478,6 +1586,18 @@ class TestWaitUntilFirstSegment:
         server._first_segment_ready.set()
         server.select_video(Path("new.mp4"), 0.0)
         assert not server._first_segment_ready.is_set()
+
+    def test_outgoing_pass_does_not_mark_the_next_video_ready(self):
+        server = HlsStreamingServer(segment_duration=4.0, port=0)
+        server.load_video(_make_metadata(duration=20.0))
+        server.update_production(3)
+        server.select_video(Path("next.mp4"), 0.0)
+        server.update_production(4)
+        assert not server.wait_until_first_segment(timeout=0)
+        server.load_video(_make_metadata(duration=20.0))
+        server.update_production(0)
+        assert server.wait_until_first_segment(timeout=0)
+        server._cleanup_segments()
 
 
 class TestCurrentVideoPath:

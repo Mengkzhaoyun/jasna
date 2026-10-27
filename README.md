@@ -35,7 +35,7 @@ and a command line, and runs on your GPU.
 - Finds mosaics in a video and restores them. The rest of the picture is not
   touched.
 - Two restoration models: fast **BasicVSR++** (free) and slow but more
-  detailed **LTX** (for supporters, NVIDIA only).
+  detailed **LTX** (for supporters, NVIDIA or supported AMD GPUs; Windows AMD LTX is in beta).
 - Restores only the parts you choose, with a preview, in the **Segment
   Editor**.
 - Works with VR180 videos and still images (SD 1.5, for supporters).
@@ -57,11 +57,12 @@ and a command line, and runs on your GPU.
   [GPU table](https://developer.nvidia.com/cuda/gpus).
 - AMD: a GPU supported by ROCm (Radeon RX 7000/9000, Radeon 780M/760M/740M,
   Ryzen AI). On Windows, AMD Adrenalin driver 26.8.1 or newer. Secondary
-  restoration and LTX are NVIDIA only.
+  restoration is NVIDIA only. LTX supports Radeon RX 7000/9000 and Radeon AI PRO
+  R9700 on Linux. Windows AMD LTX is in beta and still needs GPU testing.
 - Disk format: NTFS on Windows; ext4, Btrfs, XFS or ZFS on Linux. Network disks
   are not supported. Use an SSD; on a hard disk (HDD) Jasna starts and loads
   models slowly.
-- LTX needs an NVIDIA RTX GPU, at least 8 GB VRAM and 16 GB RAM. See
+- LTX needs an NVIDIA RTX GPU or a supported AMD GPU, at least 8 GB VRAM and 16 GB RAM. See
   [What LTX needs](docs/en/models.md#what-ltx-needs).
 
 </details>
@@ -74,13 +75,29 @@ and a command line, and runs on your GPU.
 3. Start the app:
    - Windows: double-click `jasna.exe`.
    - Linux NVIDIA: run the `jasna` file.
-   - Linux AMD: run `run_jasna_amd.sh`.
+   - Linux AMD: first install AMD's AMF video runtime once. We tested
+     [AMF 26.20](https://repo.radeon.com/amf/26.20/):
+
+     ```bash
+     curl -fLO https://repo.radeon.com/amf/26.20/amf_installer_26.20.zip
+     unzip amf_installer_26.20.zip
+     sudo bash amf_installer_26.20.sh
+     ```
+
+     Accept AMD's license when prompted, then run `run_jasna_amd.sh`.
+     If using Distrobox, install AMF inside the same container as Jasna.
 4. Add a video, choose settings and click the **▶** button at the bottom.
 
 **Your first job is slow.** On NVIDIA, Jasna first prepares the models for
 your exact GPU. This takes about **15–60 minutes**, only once. Close other
 apps and don't use the PC during this time. When you update Jasna, copy the
 `model_weights` folder to the new version, so you don't wait again.
+
+**LTX update in 0.12:** models copied from 0.11.3 need downloading again,
+including on NVIDIA. Press **▶** and accept the model update. Your existing
+License code and shared VAE files still work.
+For [manual model downloads](docs/en/models.md#downloading-ltx-yourself), use
+branch `0.12.0` for Jasna 0.12, or `main` for 0.11.3 and older.
 
 Every setting has a tooltip: move the mouse over the ⓘ icon. Out of GPU
 memory (VRAM)? Lower **Max Clip Size**, for example from `90` to `60`. See
@@ -105,7 +122,7 @@ Supporters get a License code for the supporter models:
 | Support | Models |
 | --- | --- |
 | **$15 USD** or more in total | **UNet 4x**: makes restored areas sharper.<br>**SD 1.5**: experimental model for still images. |
-| **$25 USD** | **UNet 4x** and **SD 1.5**, plus<br>**LTX**: much slower than BasicVSR++, but more detail. NVIDIA only. Includes future updates of this LTX model. |
+| **$25 USD** | **UNet 4x** and **SD 1.5**, plus<br>**LTX**: much slower than BasicVSR++, but more detail. NVIDIA or supported AMD GPUs; Windows AMD LTX is in beta. Includes future updates of this LTX model. |
 
 Supporters who gave **$15 USD or more on or before 14 October 2026** get LTX for free.
 
@@ -146,6 +163,9 @@ GitHub.
 One License code works on **3 PCs or cloud workspaces**. After activation,
 Jasna works offline. Rented GPUs: see [Cloud GPUs](docs/en/cloud.md).
 
+After activation, opening **Activate Jasna** checks online and shows how many
+device slots are used.
+
 What counts as a new PC: on Windows, a new motherboard; on Linux, a fresh
 Linux install. Each uses one of your 3 slots. Reinstalling Windows or
 changing the GPU, disk or RAM does not: just activate again with the same
@@ -185,6 +205,10 @@ prepare, restore with a diffusion model, save. It is slower but can add more
 real detail. Its quality choices: Standard (default, fastest), Good (about 1.5x
 slower), High (about 2.5x slower) and Top (about 5x slower). See
 [Choosing models](docs/en/models.md#restoration-model).
+
+LTX jobs can pause and continue, including range jobs and auto split. See [Pause and continue](docs/en/models.md#pause-and-continue).
+
+After an update, Jasna may ask to download your chosen LTX model again. Your existing License code still works.
 
 ### Command line
 

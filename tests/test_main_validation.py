@@ -7,6 +7,10 @@ import pytest
 
 from jasna.segments import SegmentRange
 
+from factories import session_config
+
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
+
 
 def _run_main_with_args(tmp_path, extra_args, *, create_input=True, create_detection=True, create_restoration=True):
     input_path = tmp_path / "in.mp4"
@@ -86,7 +90,7 @@ class TestMainValidation:
         from jasna.session_factory import AutoSplit
 
         segments = (SegmentRange(1, 2, SegmentRestoration("ltx", 3)),)
-        split = AutoSplit("h264", segments, MagicMock())
+        split = AutoSplit(session_config(codec="h264"), segments, MagicMock())
         with (
             patch("jasna.session_factory.ltx_auto_split", return_value=split) as auto_split,
             patch("jasna.accelerator.is_nvidia_device", return_value=True),
@@ -100,8 +104,7 @@ class TestMainValidation:
 
         assert auto_split.call_args.args[0].ltx_auto_split_percent == 12.0
         kwargs = pipeline_cls.call_args.kwargs
-        assert kwargs["config"].codec == "h264"
-        assert kwargs["config"].encoder_settings == {"cq": 25}
+        assert kwargs["config"] is split.config
         assert kwargs["segments"] == segments
         assert kwargs["splice_plan"] is split.splice_plan
 
@@ -357,3 +360,43 @@ def test_ltx_cli_names_pick_the_two_four_and_eight_step_models():
     assert CLI_RESTORATION_MODELS["ltx-4step"] == ("ltx", "distilled4")
     assert "ltx-2step" not in CLI_RESTORATION_MODELS
     assert CLI_RESTORATION_MODELS["ltx-8step"] == ("ltx", "distilled")
+
+
+@pytest.mark.parametrize(
+    "platform,hint",
+    [("linux", "https://repo.radeon.com/amf/"), ("win32", "https://www.amd.com/en/support/download/drivers.html")],
+)
+def test_cli_stops_on_amd_without_the_amf_runtime(capsys, platform, hint):
+    import argparse
+
+    from jasna import main
+
+    with patch.object(main, "check_ascii_install_path", return_value=(True, "/jasna")), \
+         patch.object(main, "check_required_executables"), \
+         patch.object(main, "check_supported_gpu", return_value=(True, "ok")), \
+         patch.object(main, "check_gpu_driver_version", return_value=(True, "ROCm 10.0")), \
+         patch("jasna.accelerator.is_amd_device", return_value=True), \
+         patch.object(main, "check_amd_amf_runtime", return_value=(False, "cannot open libamfrt64.so.1")), \
+         patch.object(main.sys, "platform", platform), \
+         pytest.raises(SystemExit) as exit_info:
+        main._check_system(argparse.Namespace(device="cuda:0"))
+    out = capsys.readouterr().out
+    assert exit_info.value.code == 1
+    assert "AMF video runtime is missing" in out
+    assert hint in out
+
+
+def test_cli_continues_on_amd_with_the_amf_runtime(capsys):
+    import argparse
+
+    from jasna import main
+
+    with patch.object(main, "check_ascii_install_path", return_value=(True, "/jasna")), \
+         patch.object(main, "check_required_executables"), \
+         patch.object(main, "check_supported_gpu", return_value=(True, "ok")), \
+         patch.object(main, "check_gpu_driver_version", return_value=(True, "ROCm 10.0")), \
+         patch("jasna.accelerator.is_amd_device", return_value=True), \
+         patch.object(main, "check_amd_amf_runtime", return_value=(True, "libamfrt64.so.1")), \
+         patch.object(main, "install_on_hard_disk", return_value=False):
+        main._check_system(argparse.Namespace(device="cuda:0"))
+    assert "AMF" not in capsys.readouterr().out

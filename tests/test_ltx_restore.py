@@ -1,5 +1,6 @@
 import contextlib
 import json
+import tempfile
 import threading
 import time
 import weakref
@@ -15,8 +16,10 @@ import torch
 from jasna.ltx import inference, restore
 from jasna.ltx.camera import CropFrame
 from jasna.ltx.plan import LESS_OVERLAP_WINDOW_HOP, Region, Window
+from jasna.tensor_utils import half_dtype
 
 FILES = restore.LtxModelFiles(Path("t"), Path("v"), Path("d"))
+REAL_BAR = restore.Progress.bar
 MOSAIC = Region(box=(10.0, 10.0, 40.0, 40.0), polygon=np.array([[10, 10], [40, 10], [40, 40], [10, 40]], dtype=np.int32))
 
 
@@ -54,6 +57,9 @@ class _Bar:
 
     def update(self, n):
         self.n += n
+
+    def reuse(self, done, frames, windows):
+        self.n += done
 
     def window(self, canvas):
         return contextlib.nullcontext()
@@ -93,11 +99,14 @@ class _Transformer:
 
 class _Writer:
     def __init__(self):
-        self.frames: list[tuple[int, int, bool]] = []
+        self.frames: list[tuple[int, int]] = []
         self.closed = False
 
-    def write(self, frame, pts, *, apply_lut=True):
-        self.frames.append((pts, int(frame[2, 0, 0]), apply_lut))
+    def write(self, frame, pts):
+        self.frames.append((pts, int(frame[2, 0, 0])))
+
+    def finish(self):
+        self.finished = True
 
     def close(self):
         self.closed = True
@@ -134,7 +143,7 @@ def fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(restore, "_vae_pixels", lambda canvases, device: torch.zeros(1))
     monkeypatch.setattr(inference, "load_video_encoder", lambda path, device: lambda pixels: torch.zeros(1))
     monkeypatch.setattr(inference, "load_video_decoder", lambda vae, tuned, device: object())
-    monkeypatch.setattr(inference, "TransformerSource", lambda path: path)
+    monkeypatch.setattr(inference, "TransformerSource", lambda path: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(inference, "LtxTransformer", _Transformer)
     monkeypatch.setattr(restore, "decode_latent", decode)
     monkeypatch.setattr(restore, "composite_frame", composite)
@@ -165,11 +174,15 @@ def _render(tmp_path):
     )
 
 
+def _new_dir(tmp_path):
+    return Path(tempfile.mkdtemp(dir=tmp_path))
+
+
 def _run_spans(tmp_path, spans):
     restore.restore_spans(
         spans,
         _render(tmp_path),
-        work_dir=tmp_path,
+        work_dir=tmp_path, resume_dir=_new_dir(tmp_path),
         progress=restore.Progress(0, disable=True, report=None),
         cancel=threading.Event(),
     )
@@ -235,9 +248,9 @@ def test_restore_spans_seeds_segments_and_leaves_other_frames_untouched(fakes, t
     assert budgets == [6 << 30] * 2
     assert bars[2].total == bars[2].n == 16
     inside = {pts for pts in range(50, 150, 10)} | {pts for pts in range(200, 260, 10)}
-    assert [pts for pts, _, _ in writer.frames] == list(range(0, 300, 10))
-    for pts, marker, apply_lut in writer.frames:
-        assert (marker, apply_lut) == ((1, True) if pts in inside else (0, False))
+    assert [pts for pts, _ in writer.frames] == list(range(0, 300, 10))
+    for pts, marker in writer.frames:
+        assert marker == (1 if pts in inside else 0)
     assert writer.closed
 
 
@@ -277,7 +290,7 @@ def test_restore_video_decodes_with_the_free_vram(fakes, tmp_path):
         window_hop=restore.WINDOW_HOP,
         seed=5,
         device=torch.device("cpu"),
-        work_dir=tmp_path,
+        work_dir=tmp_path, resume_dir=_new_dir(tmp_path),
         speed_profile=tmp_path / "speed.json",
         progress=restore.Progress(12, disable=True, report=None),
         cancel=threading.Event(),
@@ -285,7 +298,7 @@ def test_restore_video_decodes_with_the_free_vram(fakes, tmp_path):
     assert budgets == [123 << 20]
     assert _Transformer.seeds == [[5]]
     assert bars[2].total == bars[2].n == 8
-    assert [apply_lut for _, _, apply_lut in writer.frames] == [True] * 12
+    assert len(writer.frames) == 12
 
 
 def test_decode_window_converts_a_float32_decode(monkeypatch):
@@ -298,8 +311,8 @@ def test_decode_window_converts_a_float32_decode(monkeypatch):
 
 def _two_window_composer(monkeypatch, decode, composite):
     crop = CropFrame((0, 0, 4, 4), (4, 4), (0, 0, 0, 0))
-    windows = (Window(0, 0, 0, 5, (crop,) * 5), Window(1, 0, 3, 5, (crop,) * 5))
-    plan = restore.TrackPlan(0, 0, ((),) * 8, (1.0,) * 8, windows, 3)
+    windows = (Window(0, 0, 0, 13, (crop,) * 13), Window(1, 0, 3, 13, (crop,) * 13))
+    plan = restore.TrackPlan(0, 0, ((),) * 16, (1.0,) * 16, windows, 3)
     monkeypatch.setattr(restore, "_decode_window", decode)
     monkeypatch.setattr(restore, "composite_frame", composite)
     decodes = ThreadPoolExecutor(max_workers=1)
@@ -317,7 +330,7 @@ def test_composer_decodes_the_next_window_while_earlier_frames_are_composited(mo
     def decode(decoder, latent, seed, canvas, budget, device):
         if latent == 1:
             second_started.set()
-        return torch.full((5, 3, 4, 4), latent, dtype=torch.uint8)
+        return torch.full((13, 3, 4, 4), latent, dtype=torch.uint8)
 
     def composite(source, candidates, *, feather):
         if int(source[0, 0, 0]) == 2:
@@ -326,11 +339,11 @@ def test_composer_decodes_the_next_window_while_earlier_frames_are_composited(mo
 
     composer, decodes = _two_window_composer(monkeypatch, decode, composite)
     try:
-        out = [int(composer.frame(torch.full((3, 4, 4), i, dtype=torch.uint8))[0, 0, 0]) for i in range(8)]
+        out = [int(composer.frame(torch.full((3, 4, 4), i, dtype=torch.uint8))[0, 0, 0]) for i in range(16)]
     finally:
         decodes.shutdown()
     assert started_before_its_start == [True]
-    assert out == [0, 0, 0, 1, 1, 1, 1, 1]
+    assert out == [0, 0, 0] + [1] * 13
 
 
 def test_composer_decodes_nothing_before_its_first_frame(monkeypatch):
@@ -338,7 +351,7 @@ def test_composer_decodes_nothing_before_its_first_frame(monkeypatch):
 
     def decode(decoder, latent, seed, canvas, budget, device):
         decoded.append(latent)
-        return torch.full((5, 3, 4, 4), latent, dtype=torch.uint8)
+        return torch.full((13, 3, 4, 4), latent, dtype=torch.uint8)
 
     composer, decodes = _two_window_composer(monkeypatch, decode, lambda source, candidates, *, feather: source)
     decodes.shutdown()
@@ -360,7 +373,9 @@ def test_composer_raises_a_failed_window_decode(monkeypatch):
 def test_segment_decode_budget_follows_the_gpu_size_not_free_vram(monkeypatch):
     monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (1, 1))
     gib = 1 << 30
-    for total_gib, budget_512, budget_768 in ((11.7, 6, 8), (15.5, 8, 10), (21.9, 8, 10), (23.6, 8, 16), (31.8, 8, 16)):
+    for total_gib, budget_512, budget_768 in (
+        (5.8, 5.5, 8), (7.8, 6, 8), (11.7, 6, 8), (15.5, 8, 10), (21.9, 8, 10), (23.6, 8, 16), (31.8, 8, 16)
+    ):
         budget = restore.segment_decode_budget(int(total_gib * gib))
         assert (budget(512), budget(768)) == (budget_512 * gib, budget_768 * gib)
 
@@ -746,7 +761,7 @@ def test_a_whole_video_keeps_its_speed_profile_apart_from_segment_renders(fakes,
         window_hop=restore.WINDOW_HOP,
         seed=1,
         device=torch.device("cpu"),
-        work_dir=tmp_path,
+        work_dir=tmp_path, resume_dir=_new_dir(tmp_path),
         speed_profile=tmp_path / "speed.json",
         progress=restore.Progress(0, disable=True, report=None),
         cancel=threading.Event(),
@@ -815,7 +830,7 @@ def test_restore_spans_shows_each_pass_before_its_model_loads(fakes, monkeypatch
     restore.restore_spans(
         [restore.LtxSpan(_source(video), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 1),), _Writer)],
         _render(tmp_path),
-        work_dir=tmp_path,
+        work_dir=tmp_path, resume_dir=_new_dir(tmp_path),
         progress=restore.Progress(12, disable=True, report=lambda *args: reports.append(args)),
         cancel=threading.Event(),
     )
@@ -859,7 +874,7 @@ def test_segment_encoder_feeds_each_window_its_crops_padded_with_the_last(device
     def expected(values):
         frames = values + [values[-1]] * (restore.WINDOW_FRAMES - len(values))
         pixels = torch.tensor(frames, dtype=torch.float32).view(1, 1, -1, 1, 1).expand(1, 3, -1, 8, 8)
-        return pixels.div(127.5).sub(1.0).to(torch.bfloat16)
+        return pixels.div(127.5).sub(1.0).to(half_dtype(torch.device(device)))
 
     assert torch.equal(encoded[0], expected([10, 20, 30]))
     assert torch.equal(encoded[1], expected([20, 30]))
@@ -906,7 +921,7 @@ def test_encrypted_span_uses_worker_for_every_model_pass(fakes, monkeypatch, tmp
     writer = _Writer()
     restore.restore_spans(
         [restore.LtxSpan(_source(_video(12, range(2, 10))), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 5),), lambda: writer)],
-        render, work_dir=tmp_path, progress=restore.Progress(12, disable=True, report=None), cancel=threading.Event(),
+        render, work_dir=tmp_path, resume_dir=_new_dir(tmp_path), progress=restore.Progress(12, disable=True, report=None), cancel=threading.Event(),
     )
     assert writer.closed
     assert [op for op, _, _ in requests] == [
@@ -948,7 +963,7 @@ def test_encrypted_worker_starts_on_its_own_thread_while_the_scan_runs(fakes, mo
     files = restore.LtxModelFiles(Path("t.enc"), Path("v.enc"), Path("d.enc"))
     restore.restore_spans(
         [restore.LtxSpan(_source(_video(12, range(2, 10))), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 5),), _Writer)],
-        replace(_render(tmp_path), files=files), work_dir=tmp_path,
+        replace(_render(tmp_path), files=files), work_dir=tmp_path, resume_dir=_new_dir(tmp_path),
         progress=restore.Progress(12, disable=True, report=None), cancel=threading.Event(),
     )
     assert requests[0] == ("prepare_transformer", False)
@@ -985,7 +1000,7 @@ def test_a_run_without_a_speed_profile_runs_a_speed_test_first(fakes, tmp_path):
     restore.restore_spans(
         [restore.LtxSpan(_source(video), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 7),), lambda: writer)],
         _render(tmp_path),
-        work_dir=tmp_path,
+        work_dir=tmp_path, resume_dir=_new_dir(tmp_path),
         progress=restore.Progress(12, disable=True, report=lambda *args: reports.append(args)),
         cancel=threading.Event(),
     )
@@ -999,12 +1014,186 @@ def test_a_run_without_a_speed_profile_runs_a_speed_test_first(fakes, tmp_path):
     )
 
 
+def test_a_fresh_encode_pass_counts_frames_and_warms_up_after_its_first_batch(fakes, monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        restore.Progress, "bar",
+        lambda self, stage, total, unit="frame", marks=None: REAL_BAR(self, stage, total, unit, restore._WallClockMark),
+    )
+    progress = restore.Progress(12, disable=True, report=None)
+    restore.restore_spans(
+        [restore.LtxSpan(_source(_video(12, range(2, 10))), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 7),), _Writer)],
+        _render(tmp_path), work_dir=tmp_path, resume_dir=_new_dir(tmp_path), progress=progress, cancel=threading.Event(),
+    )
+    timing = progress.timings["encode"]
+    assert (timing.units, timing.warm_frames) == (12, 8)
+
+
+def test_skipping_reused_passes_keeps_the_profile_paced_fraction(monkeypatch):
+    estimates = {"encode": (0.0, 100.0), "denoise": (0.0, 1000.0), "compose": (0.0, 100.0)}
+    monkeypatch.setattr(restore.speed, "pass_estimates", lambda _rates, _work: dict(estimates))
+    reports = []
+    progress = restore.Progress(100, disable=True, report=lambda fraction, _left, _step: reports.append(fraction))
+    progress.plan(restore.speed.Work(100, 1.0, {512: 1}, 1.0))
+    progress.skip("scan", "encode")
+    progress.begin("denoise")
+    assert reports[-1] < 0.01
+
+
 def test_a_run_with_a_speed_profile_skips_the_speed_test(fakes, tmp_path):
     _run_spans(
         tmp_path,
         [restore.LtxSpan(_source(_video(12, range(2, 10))), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 7),), _Writer)],
     )
     assert _Transformer.seeds == [[7]]
+
+
+def _resume_spans(tmp_path, spans):
+    restore.restore_spans(
+        spans, _render(tmp_path), work_dir=tmp_path, resume_dir=tmp_path / "saved",
+        progress=restore.Progress(50, disable=True, report=None), cancel=threading.Event(),
+    )
+
+
+def _two_tracks():
+    video = _video(50, range(0))
+    for index in [*range(2, 10), *range(30, 38)]:
+        video[index][0][0, 0, 0] = 1
+    return [restore.LtxSpan(_source(video), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 7),), _Writer)]
+
+
+def test_resume_reuses_plans_and_encoded_windows_after_encode_failure(fakes, monkeypatch, tmp_path):
+    spans = _two_tracks()
+    put = restore.LatentStore.put
+    encoded = []
+
+    def interrupted(store, index, latent):
+        if store._kind.endswith("reference"):
+            encoded.append(index)
+            if len(encoded) == 2:
+                raise RuntimeError("encode interrupted")
+        put(store, index, latent)
+
+    monkeypatch.setattr(restore.LatentStore, "put", interrupted)
+    with pytest.raises(RuntimeError, match="encode interrupted"):
+        _resume_spans(tmp_path, spans)
+    encoded.clear()
+    monkeypatch.setattr(restore, "scan_span", lambda *_a, **_k: pytest.fail("scan repeated"))
+    monkeypatch.setattr(restore.LatentStore, "put", lambda store, index, latent: (
+        encoded.append(index) if store._kind.endswith("reference") else None, put(store, index, latent)
+    )[-1])
+    _resume_spans(tmp_path, spans)
+    assert encoded == [1]
+    assert _Transformer.seeds == [[7], [8]]
+
+
+def test_resume_skips_finished_tracks_and_does_not_load_encoder(fakes, monkeypatch, tmp_path):
+    spans = _two_tracks()
+    denoise = restore.denoise_track
+
+    def interrupted(plan, *args, **kwargs):
+        if plan.track_id == 1:
+            raise RuntimeError("denoise interrupted")
+        return denoise(plan, *args, **kwargs)
+
+    monkeypatch.setattr(restore, "denoise_track", interrupted)
+    with pytest.raises(RuntimeError, match="denoise interrupted"):
+        _resume_spans(tmp_path, spans)
+    assert _Transformer.seeds == [[7]]
+    monkeypatch.setattr(restore, "denoise_track", denoise)
+    monkeypatch.setattr(inference, "load_video_encoder", lambda *_a: pytest.fail("encoder loaded again"))
+    monkeypatch.setattr(restore, "scan_span", lambda *_a, **_k: pytest.fail("scan repeated"))
+    _Transformer.seeds.clear()
+    _resume_spans(tmp_path, spans)
+    assert _Transformer.seeds == [[8]]
+
+
+def test_resume_after_compose_failure_loads_only_decoder(fakes, monkeypatch, tmp_path):
+    spans = _two_tracks()
+    compose = restore.compose_spans
+    monkeypatch.setattr(restore, "compose_spans", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("compose failed")))
+    with pytest.raises(RuntimeError, match="compose failed"):
+        _resume_spans(tmp_path, spans)
+    monkeypatch.setattr(restore, "compose_spans", compose)
+    monkeypatch.setattr(inference, "load_video_encoder", lambda *_a: pytest.fail("encoder loaded again"))
+    monkeypatch.setattr(inference, "LtxTransformer", lambda *_a: pytest.fail("transformer loaded again"))
+    _resume_spans(tmp_path, spans)
+
+
+def test_incomplete_track_keeps_all_references_until_finals_are_committed(fakes, monkeypatch, tmp_path):
+    spans = [restore.LtxSpan(_source(_video(180, range(2, 178))), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 7),), _Writer)]
+    put = restore.LatentStore.put
+    written = []
+
+    def interrupted(store, index, latent):
+        if store._kind.endswith("final"):
+            written.append(index)
+            if len(written) == 2:
+                raise RuntimeError("final write interrupted")
+        put(store, index, latent)
+
+    monkeypatch.setattr(restore.LatentStore, "put", interrupted)
+    with pytest.raises(RuntimeError, match="final write interrupted"):
+        _resume_spans(tmp_path, spans)
+    assert len(list((tmp_path / "saved").glob("*.reference.pt"))) == 2
+    assert not list((tmp_path / "saved").glob("*.done"))
+    monkeypatch.setattr(restore.LatentStore, "put", put)
+    monkeypatch.setattr(inference, "load_video_encoder", lambda *_a: pytest.fail("references were lost"))
+    _Transformer.seeds.clear()
+    _resume_spans(tmp_path, spans)
+    assert _Transformer.seeds == [[7, 8]]
+
+
+def test_resume_replays_whole_video_canvas_decision(fakes, monkeypatch, tmp_path):
+    kwargs = dict(
+        detector=_Detector(), files=FILES, frame_h=64, frame_w=64, batch_size=4,
+        window_hop=88, seed=7, device=torch.device("cpu"), work_dir=tmp_path,
+        speed_profile=tmp_path / "speed.json", resume_dir=tmp_path / "saved",
+    )
+    def run():
+        restore.restore_video(
+            _source(_video(12, range(2, 10))), _Writer(), large_canvas=True,
+            progress=restore.Progress(12, disable=True, report=None), cancel=threading.Event(), **kwargs,
+        )
+
+    run()
+    monkeypatch.setattr(restore, "large_canvas_fits", lambda *_a: pytest.fail("canvas decision repeated"))
+    run()
+
+
+def test_resume_of_saved_768_px_windows_fails_plainly_when_vram_is_short(fakes, tmp_path):
+    from jasna.ltx.plan import TrackPlan, plans_to_arrays
+
+    resume_dir = tmp_path / "saved"
+    resume_dir.mkdir()
+    crop = CropFrame((0, 0, 700, 700), (768, 768), (0, 0, 0, 0))
+    polygon = np.array([[0, 0], [700, 0], [700, 700]], dtype=np.int32)
+    plan = TrackPlan(0, 0, ((polygon,),), (1.0,), (Window(0, 0, 0, 1, (crop,)),), 88)
+    span = restore.LtxSpan(_source(_video(12, range(0))), (restore.LtxSegment(*restore.WHOLE_VIDEO_PTS, 7),), _Writer)
+    np.savez(restore._plan_path(span, resume_dir), frames=np.array(12), **plans_to_arrays([[plan]]))
+    with pytest.raises(RuntimeError, match="768 px"):
+        restore.restore_video(
+            span.frames, _Writer(), detector=_Detector(), files=FILES, frame_h=720, frame_w=1280, batch_size=4,
+            large_canvas=True, window_hop=88, seed=7, device=torch.device("cpu"), work_dir=tmp_path,
+            speed_profile=tmp_path / "speed.json", progress=restore.Progress(12, disable=True, report=None),
+            resume_dir=resume_dir, cancel=threading.Event(),
+        )
+
+
+def test_resuming_only_the_remaining_span_uses_its_original_latents(fakes, monkeypatch, tmp_path):
+    video = _video(50, range(2, 48))
+    first = restore.LtxSpan(_source(video[:20]), (restore.LtxSegment(20, 180, 7),), _Writer)
+
+    class FailedWriter(_Writer):
+        def write(self, frame, pts):
+            raise RuntimeError("second span interrupted")
+
+    second = restore.LtxSpan(_source(video, 20), (restore.LtxSegment(220, 480, 9),), FailedWriter)
+    with pytest.raises(RuntimeError, match="second span interrupted"):
+        _resume_spans(tmp_path, [first, second])
+    monkeypatch.setattr(restore, "scan_span", lambda *_a, **_k: pytest.fail("span rescanned"))
+    monkeypatch.setattr(inference, "load_video_encoder", lambda *_a: pytest.fail("span reencoded"))
+    monkeypatch.setattr(inference, "LtxTransformer", lambda *_a: pytest.fail("span denoised again"))
+    _resume_spans(tmp_path, [replace(second, open_writer=_Writer)])
 
 
 @pytest.mark.parametrize(("frame_h", "frame_w"), [(720, 1280), (1080, 1920), (2160, 3840)])

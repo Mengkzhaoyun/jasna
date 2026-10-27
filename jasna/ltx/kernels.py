@@ -1,7 +1,8 @@
-"""Triton kernels for the LTX quantized linears (NVIDIA GPUs with Triton).
+"""Triton kernels for the LTX quantized linears (NVIDIA and AMD GPUs with Triton).
 
 Same arithmetic as the torch path in ``transformer.py``, which stays the reference:
-- ``rotate_quantize``: ConvRot rotation + per-row int8 in one read of the activations.
+- ``rotate_quantize``: ConvRot rotation + per-row int8 in one read of the activations
+  (``gated_rotate_quantize``: of a gated attention output read straight from its heads layout).
   The rotation runs as radix-4 butterflies in fp32 and is rounded to bf16 like the
   reference's bf16 matmul, so codes differ from it only where the two fp32 summation
   orders round to different bf16 values (a few per million, by one code).
@@ -21,29 +22,30 @@ import triton.language as tl
 from triton.language.extra import libdevice
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-EPS = tl.constexpr(1e-6)
+from jasna.ltx.kernel_policy import (
+    CUBLAS_EPILOGUE_TILE,
+    CUBLAS_EPILOGUE_WARPS,
+    CUBLAS_INT8_MM,
+    FP4_QUANTIZE_COLS,
+    FP4_QUANTIZE_ROWS,
+    FP4_QUANTIZE_WARPS,
+    FP4_SCALE_TILE_COLS,
+    FP4_SCALE_TILE_ROWS,
+    GROUP_M,
+    ROTATE_QUANTIZE_WARPS,
+    SMALL_MM_MAX_N,
+    STREAM_K_MAX_WAVES,
+    gemm_tile,
+    gpu_architecture,
+    has_tma,
+    programs,
+)
 
-# Launch parameters shared with the native block (``jasna/ltx/native``), which launches these
-# kernels ahead-of-time compiled: one definition here, read by both.
-ROTATE_QUANTIZE_WARPS = 8
-GROUP_M = 8
-# Outputs narrower than SMALL_MM_MAX_N (the per-head gate logits) take SMALL_MM_TILE; inputs
-# wider than WIDE_K (the FF down projection) take the second tile of INT8_MM_TILES.
-SMALL_MM_MAX_N = 128
-SMALL_MM_TILE = (32, 32, 256, 3, 2)
-WIDE_K = 4096
-# Stream-K only pays when the grid is a few waves long.
-STREAM_K_MAX_WAVES = 8
-# (BM, BN) of the cuBLAS-path epilogue: wide row strips, from a sweep over the LTX block shapes
-# on an RTX 2080 Ti (8-17 % faster than 64x64 on every large shape).
-CUBLAS_EPILOGUE_TILE = (8, 512)
-CUBLAS_EPILOGUE_WARPS = 8
-FP4_QUANTIZE_ROWS = 32
-FP4_QUANTIZE_COLS = 256
-FP4_QUANTIZE_WARPS = 4
-# cuBLAS block-scale layout: 128 x 4 tiles of float8 scales, zero padded.
-FP4_SCALE_TILE_ROWS = 128
-FP4_SCALE_TILE_COLS = 4
+EPS = tl.constexpr(1e-6)
+# HIP has no add_rn: AMD compiles the GEMM kernels without fp fusion (``GEMM_OPTIONS``), so a
+# plain add stays a separate rounding there.
+HIP = tl.constexpr(torch.version.hip is not None)
+GEMM_OPTIONS = {"enable_fp_fusion": False} if torch.version.hip else {}
 
 
 @triton.jit
@@ -65,6 +67,12 @@ def _rotate_quantize_kernel(
         half = row // half_rows
         x = x * (1 + tl.load(scale_ptr + half * K + cols).to(tl.float32)) + tl.load(shift_ptr + half * K + cols).to(tl.float32)
         x = x.to(tl.bfloat16).to(tl.float32)
+    _rotate_quantize_row(x, row, j, q_ptr, s_ptr, K)
+
+
+@triton.jit
+def _rotate_quantize_row(x, row, j, q_ptr, s_ptr, K: tl.constexpr):
+    """Stores the int8 codes and scale of fp32 row ``x``, loaded with its 256-column blocks reversed."""
     x = tl.reshape(x, (K // 256, 4, 4, 4, 4))
     x = 0.5 * (tl.sum(x, axis=1, keep_dims=True) - 2 * x)
     x = 0.5 * (tl.sum(x, axis=2, keep_dims=True) - 2 * x)
@@ -76,6 +84,20 @@ def _rotate_quantize_kernel(
     tl.store(s_ptr + row, scale)
     codes = libdevice.rint(tl.math.div_rn(x, scale))
     tl.store(q_ptr + row * K + j, tl.minimum(tl.maximum(codes, -127.0), 127.0).to(tl.int8))
+
+
+@triton.jit
+def _gated_rotate_quantize_kernel(o_ptr, g_ptr, q_ptr, s_ptr, rows, K: tl.constexpr, HEAD_DIM: tl.constexpr):
+    # Row t of ``o (heads, rows, HEAD_DIM)`` read as one token row of width K, each head times
+    # 2 * sigmoid of its gate logit ``g[t, head]`` and rounded to bf16 as the torch path stores it.
+    row = tl.program_id(0)
+    j = tl.arange(0, K)
+    cols = (j // 256) * 256 + 255 - j % 256
+    head = cols // HEAD_DIM
+    x = tl.load(o_ptr + head * rows * HEAD_DIM + row * HEAD_DIM + cols % HEAD_DIM).to(tl.float32)
+    gate = tl.load(g_ptr + row * (K // HEAD_DIM) + head).to(tl.float32)
+    x = (x * (2.0 * tl.sigmoid(gate))).to(tl.bfloat16).to(tl.float32)
+    _rotate_quantize_row(x, row, j, q_ptr, s_ptr, K)
 
 
 def _rotate_quantize(x, shift, scale, modulate):
@@ -94,6 +116,21 @@ def _rotate_quantize(x, shift, scale, modulate):
 def rotate_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``(rows, k)`` bf16 -> (int8 codes ``(rows, k)``, fp32 row scales ``(rows,)``)."""
     return _rotate_quantize(x, x, x, False)
+
+
+def gated_rotate_quantize(heads: torch.Tensor, gate_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """``rotate_quantize`` of attention output ``heads`` ``(heads, rows, head_dim)`` bf16 as token rows,
+    each head times ``2 * sigmoid(gate_logits[row, head])``."""
+    count, rows, head_dim = heads.shape
+    k = count * head_dim
+    if k % 256 or k & (k - 1):
+        raise ValueError(f"gated_rotate_quantize needs a power-of-two width of at least 256, got {k}")
+    codes = torch.empty(rows, k, dtype=torch.int8, device=heads.device)
+    scales = torch.empty(rows, dtype=torch.float32, device=heads.device)
+    _gated_rotate_quantize_kernel[(rows,)](
+        heads, gate_logits, codes, scales, rows, K=k, HEAD_DIM=head_dim, num_warps=ROTATE_QUANTIZE_WARPS,
+    )
+    return codes, scales
 
 
 def modulate_rotate_quantize(
@@ -128,7 +165,11 @@ def _mm_epilogue(
     b_scales = tl.load(bs_ptr + offs_n, mask=n_mask, other=0.0)
     out = acc.to(tl.float32) * (a_scales[:, None] * b_scales[None, :])
     if HAS_BIAS:
-        out = libdevice.add_rn(out, tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :])
+        bias = tl.load(bias_ptr + offs_n, mask=n_mask, other=0.0).to(tl.float32)[None, :]
+        if HIP:
+            out = out + bias
+        else:
+            out = libdevice.add_rn(out, bias)
     out = out.to(tl.bfloat16)
     if GELU:
         v = out.to(tl.float32)
@@ -227,12 +268,6 @@ def _int8_epilogue_kernel(
     )
 
 
-@functools.cache
-def programs(device: torch.device) -> int:
-    """Persistent-kernel program count: one per SM."""
-    return torch.cuda.get_device_properties(device).multi_processor_count
-
-
 def stream_k_splits(m: int, n: int, k: int, bm: int, bn: int, bk: int, sms: int) -> int:
     """K splits per tile of the last, partial wave when stream-K pays for this GEMM (0: it doesn't).
     ``tiles % sms`` tiles are left for that wave; each takes ``sms // tail`` idle SMs, at most
@@ -244,41 +279,7 @@ def stream_k_splits(m: int, n: int, k: int, bm: int, bn: int, bk: int, sms: int)
     return min(sms // tail, k // bk)
 
 
-# (BM, BN, BK, stages, warps) per GPU for LTX GEMMs of width up to 4096 and wider, from tile
-# sweeps over the attention, FF-up and FF-down shapes.
-INT8_MM_TILES = {
-    (8, 6): ((128, 128, 64, 3, 4),) * 2,  # RTX 3090
-    (8, 9): ((256, 128, 128, 3, 8),) * 2,  # RTX 4090
-    (12, 0): ((128, 256, 128, 3, 8), (128, 128, 128, 3, 4)),  # RTX 5090
-    (12, 1): ((128, 256, 128, 3, 8), (128, 128, 128, 3, 4)),
-}
-# GPUs on which Triton runs dots as scalar FMA (it has no tensor-core dot below SM 8.0): the
-# int8 GEMM runs on cuBLAS (``torch._int_mm``) and only its epilogue in Triton.
-CUBLAS_INT8_MM = {(7, 5)}  # RTX 20 series
-
-
-def has_tma(capability: tuple[int, int]) -> bool:
-    return capability[0] >= 9
-
-
-def gemm_tile(n: int, k: int, capability: tuple[int, int]) -> tuple[int, int, int, int, int]:
-    """(BM, BN, BK, stages, warps) of the Triton int8 GEMM for ``n`` outputs of width ``k``."""
-    return SMALL_MM_TILE if n < SMALL_MM_MAX_N else INT8_MM_TILES[capability][k > WIDE_K]
-
-
-def supports(device: torch.device) -> bool:
-    capability = torch.cuda.get_device_capability(device)
-    return capability in INT8_MM_TILES or capability in CUBLAS_INT8_MM
-
-
-@functools.cache
-def _cublas_int8_mm(device: torch.device) -> bool:
-    return torch.cuda.get_device_capability(device) in CUBLAS_INT8_MM
-
-
-@functools.cache
-def _capability(device: torch.device) -> tuple[int, int]:
-    return torch.cuda.get_device_capability(device)
+_cached_gpu_architecture = functools.cache(gpu_architecture)
 
 
 def _mm(codes, act_scales, qdata, scales, bias, out, *, gelu, residual, gate, half_rows, row_offset):
@@ -288,25 +289,25 @@ def _mm(codes, act_scales, qdata, scales, bias, out, *, gelu, residual, gate, ha
         act_scales, scales, bias if bias is not None else scales,
         residual if residual is not None else out, gate if gate is not None else scales, out,
     )
-    if _cublas_int8_mm(codes.device):
+    architecture = _cached_gpu_architecture(codes.device)
+    if architecture in CUBLAS_INT8_MM:
         bm, bn = CUBLAS_EPILOGUE_TILE
         # torch._int_mm needs more than 16 rows; on SM 7.5 also a multiple of 16 output features
         acc = torch._int_mm(F.pad(codes, (0, 0, 0, 17 - m)) if m <= 16 else codes, qdata.t())
         _int8_epilogue_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](
             acc, *args, m, n, half_rows, row_offset,
             HAS_BIAS=bias is not None, GELU=gelu, RESIDUAL=residual is not None, BM=bm, BN=bn,
-            num_warps=CUBLAS_EPILOGUE_WARPS,
+            num_warps=CUBLAS_EPILOGUE_WARPS, **GEMM_OPTIONS,
         )
         return out
-    capability = _capability(codes.device)
-    bm, bn, bk, stages, warps = gemm_tile(n, k, capability)
+    bm, bn, bk, stages, warps = gemm_tile(n, k, architecture)
     if k % bk:
         raise ValueError(f"int8_scaled_mm needs a width divisible by {bk}, got {k}")
     flags = dict(HAS_BIAS=bias is not None, GELU=gelu, RESIDUAL=residual is not None, BM=bm, BN=bn, BK=bk, GROUP_M=GROUP_M)
     tiles = triton.cdiv(m, bm) * triton.cdiv(n, bn)
     sms = programs(codes.device)
     # A short grid whose last wave is mostly idle loses most to that wave: split it along K.
-    splits = stream_k_splits(m, n, k, bm, bn, bk, sms) if has_tma(capability) else 0
+    splits = stream_k_splits(m, n, k, bm, bn, bk, sms) if has_tma(architecture) else 0
     if splits:
         tail = tiles % sms
         workspace = torch.zeros(tail * bm * bn + tail, dtype=torch.int32, device=codes.device)
@@ -317,7 +318,8 @@ def _mm(codes, act_scales, qdata, scales, bias, out, *, gelu, residual, gate, ha
         )
     else:
         _int8_mm_kernel[(tiles,)](
-            codes, qdata, *args, m, n, k, half_rows, row_offset, num_stages=stages, num_warps=warps, **flags
+            codes, qdata, *args, m, n, k, half_rows, row_offset, num_stages=stages, num_warps=warps, **flags,
+            **GEMM_OPTIONS,
         )
     return out
 
@@ -334,6 +336,24 @@ def int8_scaled_mm(
     when ``gelu``."""
     out = torch.empty(codes.shape[0], qdata.shape[0], dtype=torch.bfloat16, device=codes.device)
     return _mm(codes, act_scales, qdata, scales, bias, out, gelu=gelu, residual=None, gate=None, half_rows=1, row_offset=0)
+
+
+def int8_residual_mm(
+    codes: torch.Tensor,
+    act_scales: torch.Tensor,
+    qdata: torch.Tensor,
+    scales: torch.Tensor,
+    bias: torch.Tensor | None,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    """``residual + gate[half] * int8_scaled_mm(...)``: the first half of the rows takes gate row 0, the
+    second row 1."""
+    residual, gate = residual.contiguous(), gate.contiguous()
+    out = torch.empty_like(residual)
+    rows = codes.shape[0]
+    return _mm(codes, act_scales, qdata, scales, bias, out, gelu=False, residual=residual, gate=gate,
+               half_rows=rows // 2, row_offset=0)
 
 
 def int8_feed_forward(

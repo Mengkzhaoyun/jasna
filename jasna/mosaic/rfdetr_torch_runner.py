@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import logging
+import threading
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 
 from jasna.accelerator import device_name
+from jasna.mosaic.rfdetr_fused_head import fuse_segmentation_head
+from jasna.mosaic.rfdetr_sync_free import export_without_host_syncs
 
 logger = logging.getLogger(__name__)
 
@@ -35,13 +40,21 @@ class TorchTensorInfo:
         return len(self.shape)
 
 
+def load_first_batch_libraries(device: torch.device, dtype: torch.dtype) -> None:
+    """Load MIOpen and the ``x @ wᵀ`` GEMM library of ``dtype``, which a process's first conv and
+    linear otherwise load on the first detection batch (1.2 s + 0.5 s on an R9700); a thread
+    started before the model is built overlaps them with the import and build."""
+    square = torch.zeros(8, 8, device=device, dtype=dtype)
+    F.conv2d(square[None, None], square[None, None, :3, :3])
+    F.linear(square, square)
+
+
 class RfDetrTorchRunner:
     """AMD/ROCm RF-DETR path: run the trained checkpoint through the rfdetr torch
     model instead of ONNX + MIGraphX. Mirrors the runner contract consumed by
     ``RfDetrMosaicDetectionModel`` (``input_names``/``input_dtypes``/``outputs``/
-    ``output_names``/``infer``/``close``) and emits the same ``dets``/``labels``/
-    ``masks`` tensors the ONNX export produces (LWDETR ``pred_boxes``/
-    ``pred_logits``/``pred_masks``)."""
+    ``output_names``/``infer``/``close``) and runs the export forward the ONNX
+    graph is traced from, so it emits the same ``dets``/``labels``/``masks``."""
 
     def __init__(
         self,
@@ -53,6 +66,12 @@ class RfDetrTorchRunner:
         resolution: int,
         variant: str,
     ) -> None:
+        self.device = torch.device(device)
+        self.fp16 = bool(fp16)
+        self._dtype = torch.float16 if self.fp16 else torch.float32
+        threading.Thread(
+            target=load_first_batch_libraries, args=(self.device, self._dtype), name="RfDetrLibraries", daemon=False
+        ).start()
         try:
             import rfdetr
         except ImportError as exc:
@@ -67,27 +86,34 @@ class RfDetrTorchRunner:
                 f"known: {', '.join(sorted(_VARIANT_CLASSES))}"
             )
 
-        self.device = torch.device(device)
-        self.fp16 = bool(fp16)
-
-        checkpoint = torch.load(weights_path, map_location="cpu", weights_only=False)
-        state = checkpoint["model"]
+        state = torch.load(weights_path, map_location="cpu", weights_only=True)["model"]
         num_classes = int(state["class_embed.weight"].shape[0]) - 1
 
+        # rfdetr's own checkpoint loader unpickles arbitrary objects, so the model
+        # is built empty and gets the weights-only state the way that loader would.
+        from rfdetr.config import PretrainWeightsCompatibilityWarning
+        from rfdetr.models.weights import interpolate_position_embeddings
+
         model_cls = getattr(rfdetr, cls_name)
-        wrapper = model_cls(
-            num_classes=num_classes,
-            resolution=int(resolution),
-            pretrain_weights=str(weights_path),
-            device=str(self.device),
-        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", PretrainWeightsCompatibilityWarning)
+            wrapper = model_cls(
+                num_classes=num_classes,
+                resolution=int(resolution),
+                pretrain_weights=None,
+                device=str(self.device),
+            )
         core = wrapper.model.model
         if core is None:
             raise RuntimeError(
                 "rfdetr model is unavailable after load (inplace-optimized checkpoint)"
             )
+        interpolate_position_embeddings(state, wrapper.model_config.positional_encoding_size)
+        core.load_state_dict(state)
         self._wrapper = wrapper
-        self._core = core.to(self.device).eval()
+        self._core = core.to(device=self.device, dtype=self._dtype).eval()
+        export_without_host_syncs(self._core)
+        fuse_segmentation_head(self._core, int(resolution))
 
         if isinstance(input_shapes, dict):
             input_shapes = list(input_shapes.values())
@@ -99,7 +125,7 @@ class RfDetrTorchRunner:
         self.outputs: dict[str, TorchTensorInfo] = {
             "dets": TorchTensorInfo((batch_size, -1, 4), torch.float32),
             "labels": TorchTensorInfo((batch_size, -1, num_classes + 1), torch.float32),
-            "masks": TorchTensorInfo((batch_size, -1, -1, -1), torch.float32),
+            "masks": TorchTensorInfo((batch_size, -1, -1, -1), self._dtype),
         }
 
         logger.info(
@@ -118,13 +144,7 @@ class RfDetrTorchRunner:
     def infer(self, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         if self._core is None:
             raise RuntimeError("RF-DETR torch runner is closed")
-        x = inputs["input"].to(device=self.device, dtype=torch.float32)
-        with torch.no_grad(), torch.autocast(
-            self.device.type, dtype=torch.float16, enabled=self.fp16
-        ):
-            out = self._core(x)
-        return {
-            "dets": out["pred_boxes"].float(),
-            "labels": out["pred_logits"].float(),
-            "masks": out["pred_masks"].float(),
-        }
+        x = inputs["input"].to(device=self.device, dtype=self._dtype)
+        with torch.no_grad():
+            boxes, logits, masks = self._core(x)
+        return {"dets": boxes.float(), "labels": logits.float(), "masks": masks}

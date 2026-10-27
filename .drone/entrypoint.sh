@@ -202,7 +202,7 @@ fi
 
 JASNA_BIN="/app/sglang/sglang"
 FFMPEG_CHECK_ARG="--disable-ffmpeg-check"
-for rel_cand in "/app/jasna-release/jasna" "/data/jasna/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna" "/data/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna"; do
+for rel_cand in "/app/jasna-release/jasna" "/data/jasna/.release-cache/v0.12.0/jasna-linux-nvidia-0.12.0/jasna" "/data/.release-cache/v0.12.0/jasna-linux-nvidia-0.12.0/jasna" "/data/jasna/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna" "/data/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna"; do
 	if [ -x "${rel_cand}" ]; then
 		if [[ "${RESTORATION_MODEL_NAME:-}" == ltx* ]] || [[ " $* " == *" ltx"* ]] || [[ " $* " == *"--license-code"* ]] || [[ " $* " == *"--machine-key"* ]] || [ -n "${JASNA_LICENSE:-}" ]; then
 			JASNA_BIN="${rel_cand}"

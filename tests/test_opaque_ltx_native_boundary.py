@@ -14,7 +14,7 @@ import pytest
 def native():
     if sys.platform not in ("linux", "win32"):
         pytest.skip("native owner boundary applies to Linux and Windows")
-    from jasna.protection import opaque_ltx
+    opaque_ltx = pytest.importorskip("jasna.protection.opaque_ltx")
 
     if opaque_ltx._opaque_ltx is None:
         pytest.skip("build the native opaque extension first")

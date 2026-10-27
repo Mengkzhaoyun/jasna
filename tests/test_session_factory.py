@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -11,13 +12,24 @@ from factories import session_config
 from jasna.session_config import SessionConfig
 from jasna.session_factory import RestorationSession, build_pipeline, build_restoration_session
 
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
+
+
+_SECONDARY_RESTORER_CLASSES = {
+    "tvai": "jasna.restorer.tvai_secondary_restorer.TvaiSecondaryRestorer",
+    "unet-4x": "jasna.restorer.unet4x_secondary_restorer.Unet4xSecondaryRestorer",
+    "rtx-super-res": "jasna.restorer.rtx_superres_secondary_restorer.RtxSuperresSecondaryRestorer",
+}
+
 
 def _build_session(
     config: SessionConfig,
     *,
     amd: bool = False,
 ):
+    """Mocks the configured secondary restorer only: the TensorRT ones import only on NVIDIA builds."""
     compile_result = MagicMock(use_basicvsrpp_tensorrt=True)
+    secondary_class = _SECONDARY_RESTORER_CLASSES.get(config.secondary_restoration)
     with (
         patch("jasna.accelerator.is_amd_device", return_value=amd),
         patch(
@@ -26,15 +38,13 @@ def _build_session(
         ) as compiled,
         patch("jasna.restorer.basicvsrpp_mosaic_restorer.BasicvsrppMosaicRestorer") as restorer_cls,
         patch("jasna.restorer.restoration_pipeline.RestorationPipeline") as pipeline_cls,
-        patch("jasna.restorer.tvai_secondary_restorer.TvaiSecondaryRestorer") as tvai_cls,
-        patch("jasna.restorer.unet4x_secondary_restorer.Unet4xSecondaryRestorer") as unet_cls,
-        patch("jasna.restorer.rtx_superres_secondary_restorer.RtxSuperresSecondaryRestorer") as rtx_cls,
+        patch(secondary_class) if secondary_class else nullcontext() as secondary_cls,
     ):
         session = build_restoration_session(
             config,
             log_callback=None,
         )
-    return session, compiled, restorer_cls, pipeline_cls, tvai_cls, unet_cls, rtx_cls
+    return session, compiled, restorer_cls, pipeline_cls, secondary_cls
 
 
 def test_session_without_secondary() -> None:
@@ -54,7 +64,7 @@ def test_session_without_secondary() -> None:
 
 
 def test_session_selects_tvai_secondary() -> None:
-    session, _, _, pipeline_cls, tvai_cls, *_ = _build_session(
+    session, _, _, pipeline_cls, tvai_cls = _build_session(
         session_config(secondary_restoration="tvai", tvai_scale=2, tvai_workers=1, tvai_denoise=True)
     )
 
@@ -73,7 +83,8 @@ def test_tvai_denoise_requires_tvai_secondary() -> None:
 
 
 def test_session_selects_unet_secondary() -> None:
-    session, compiled, _, pipeline_cls, _, unet_cls, _ = _build_session(
+    pytest.importorskip("tensorrt")
+    session, compiled, _, pipeline_cls, unet_cls = _build_session(
         session_config(secondary_restoration="unet-4x")
     )
 
@@ -83,7 +94,8 @@ def test_session_selects_unet_secondary() -> None:
 
 
 def test_session_selects_rtx_secondary_and_maps_none_levels() -> None:
-    session, _, _, pipeline_cls, _, _, rtx_cls = _build_session(
+    pytest.importorskip("tensorrt")
+    session, _, _, pipeline_cls, rtx_cls = _build_session(
         session_config(secondary_restoration="rtx-super-res", rtx_denoise="none", rtx_deblur="low")
     )
 
@@ -107,6 +119,7 @@ def test_amd_disables_basicvsrpp_compilation() -> None:
 
 
 def test_session_close_closes_restorers() -> None:
+    pytest.importorskip("tensorrt")
     session, *_ = _build_session(session_config(secondary_restoration="unet-4x"))
 
     session.close()
@@ -195,6 +208,7 @@ def test_build_pipeline_keeps_a_session_that_holds_the_job_model() -> None:
 
 def _auto_split(config, *, samples, validate=None, plan_error=None):
     from fractions import Fraction
+    from tempfile import TemporaryDirectory
 
     from jasna.media.splice import KeyframeIndex
     from jasna.session_factory import ltx_auto_split
@@ -202,15 +216,18 @@ def _auto_split(config, *, samples, validate=None, plan_error=None):
     session = MagicMock()
     progress = MagicMock()
     with (
-        patch("jasna.media.probe.get_video_meta_data", return_value=MagicMock(codec_name="hevc", duration=6.0)),
+        TemporaryDirectory() as temp,
+        patch("jasna.media.probe.get_video_meta_data", return_value=MagicMock(codec_name="hevc", duration=6.0, num_frames=180, time_base=Fraction(1,30))),
         patch("jasna.media.splice.validate_smart_render", side_effect=validate),
         patch("jasna.media.splice.probe_keyframes", return_value=KeyframeIndex((0, 60, 120), Fraction(1, 30), 0, 180)),
         patch("jasna.mosaic_scan.scan_mosaic_sizes", return_value=samples) as scan,
     ):
+        source, output = Path(temp) / "in.mp4", Path(temp) / "out.mp4"
+        source.touch()
         if plan_error is not None:
             with patch("jasna.media.splice.build_splice_plan", side_effect=plan_error):
-                return ltx_auto_split(config, session, Path("in.mp4"), Path("out.mp4"), progress_callback=progress), scan
-        return ltx_auto_split(config, session, Path("in.mp4"), Path("out.mp4"), progress_callback=progress), scan
+                return ltx_auto_split(config, session, source, output, progress_callback=progress), scan
+        return ltx_auto_split(config, session, source, output, progress_callback=progress), scan
 
 
 def _samples(sizes):
@@ -222,13 +239,26 @@ def _samples(sizes):
 def test_ltx_auto_split_sends_big_mosaics_to_ltx_and_keeps_the_source_codec() -> None:
     config = session_config(restoration_model_name="ltx", ltx_seed=3, ltx_auto_split_percent=12.0)
     split, scan = _auto_split(config, samples=_samples((0.05, 0.3)))
-    assert split.codec == "hevc"
+    assert split.config == config
     assert split.segments == (
         SegmentRange(0.5, 2.0, SegmentRestoration("basicvsrpp", None)),
         SegmentRange(2.0, 4.5, SegmentRestoration("ltx", 3)),
     )
     assert len(split.splice_plan.render_spans) == 2
     assert scan.call_args.kwargs["batch_size"] == config.batch_size
+
+
+def test_ltx_auto_split_gives_the_source_codec_its_default_cq_not_settings_meant_for_another(caplog) -> None:
+    from jasna.accelerator import vendor_for_device
+    from jasna.media.encoder_settings import encoder_cq_spec
+
+    config = session_config(
+        restoration_model_name="ltx", ltx_auto_split_percent=12.0, codec="av1", encoder_settings={"cq": 38, "tune": "uhq"}
+    )
+    split, _ = _auto_split(config, samples=_samples((0.05, 0.3)))
+    default_cq = encoder_cq_spec("hevc", vendor_for_device(config.device)).default
+    assert (split.config.codec, split.config.encoder_settings) == ("hevc", {"cq": default_cq})
+    assert "source codec HEVC" in caplog.text and "for AV1" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -278,3 +308,38 @@ def test_ltx_auto_split_falls_back_to_the_whole_video(caplog) -> None:
     split, _ = _auto_split(config, samples=MagicMock(times=(1.0,), scores=(0.0,), sizes=(0.0,), stride=1.0))
     assert split is None
     assert "no mosaics" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("nvidia", "capability", "allowed"),
+    [(True, (12, 0), True), (True, (8, 9), False), (False, (12, 0), False)],
+)
+def test_fast_ltx_needs_a_blackwell_nvidia_gpu(nvidia, capability, allowed) -> None:
+    import torch
+
+    from jasna.session_factory import _ltx_model_files
+
+    config = session_config(restoration_model_name="ltx", ltx_fast=True, ltx_trial=True)
+    with (
+        patch("jasna.ltx.transformer.require_kernels"),
+        patch("jasna.accelerator.is_nvidia_device", return_value=nvidia),
+        patch("torch.cuda.get_device_capability", return_value=capability),
+        patch("jasna.engine_compiler.ensure_engines_compiled") as compiled,
+    ):
+        if allowed:
+            _ltx_model_files(config, torch.device("cuda:0"), log_callback=None)
+            compiled.assert_called_once()
+        else:
+            with pytest.raises(ValueError, match="Blackwell"):
+                _ltx_model_files(config, torch.device("cuda:0"), log_callback=None)
+
+
+def test_fast_ltx_refuses_unsupported_hardware_before_loading_kernels(monkeypatch):
+    import torch
+    from jasna.session_factory import _ltx_model_files
+
+    monkeypatch.setattr("jasna.accelerator.is_nvidia_device", lambda device: False)
+    monkeypatch.setattr("jasna.ltx.transformer.require_kernels", lambda device: pytest.fail("loaded unsupported kernels"))
+    config = session_config(restoration_model_name="ltx", ltx_fast=True, ltx_trial=True)
+    with pytest.raises(ValueError, match="Blackwell"):
+        _ltx_model_files(config, torch.device("cuda:0"), log_callback=None)

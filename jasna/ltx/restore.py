@@ -10,7 +10,8 @@ frame indices from the segment's first frame, so a segment restores the same way
 surrounds it. A whole video is one segment. Spans are the decoded stretches holding the
 segments; every pass decodes each span again (the camera and fusion need a whole track
 before its first window can be denoised). Per-window latents (1-2 MB) are kept in a
-temporary directory between passes, so memory does not grow with length.
+disk directory between passes, so memory does not grow with length. Offline jobs keep
+that directory to resume; previews and speed tests use temporary directories.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import torch
 from tqdm import tqdm
 
 from jasna.accelerator import device_free_bytes
+from jasna.job_resume import atomic_write, write_json
 from jasna.ltx import speed
 from jasna.ltx.camera import PLAN_CANVAS, WINDOW_FRAMES
 from jasna.ltx.compose import Candidate, composite_frame, crop_to_canvas
@@ -46,12 +48,15 @@ from jasna.ltx.plan import (
     crossfade_weights,
     feather_pixels,
     plan_video,
+    plans_from_arrays,
+    plans_to_arrays,
 )
 from jasna.ltx.regions import regions_per_frame
 from jasna.ltx.sampler import LtxTransformer
 from jasna.models.ltx_vae import decode_latent
 from jasna.mosaic.detections import Detections
 from jasna.progressbar import StageProgress
+from jasna.tensor_utils import half_dtype
 from jasna.tracking.scene_detector import SceneCutDetector
 
 logger = logging.getLogger(__name__)
@@ -64,10 +69,12 @@ LARGE_CANVAS_MIN_TOTAL_BYTES = 15 << 30
 SEGMENT_DECODE_BUDGETS = (
     (22 << 30, {PLAN_CANVAS: 8 << 30, LARGE_CANVAS: 16 << 30}),
     (15 << 30, {PLAN_CANVAS: 8 << 30, LARGE_CANVAS: 10 << 30}),
-    (0, {PLAN_CANVAS: 6 << 30, LARGE_CANVAS: 8 << 30}),
+    (7 << 30, {PLAN_CANVAS: 6 << 30, LARGE_CANVAS: 8 << 30}),
+    (0, {PLAN_CANVAS: 11 << 29, LARGE_CANVAS: 8 << 30}),
 )
 """(least total VRAM, decode budget per canvas): 8 GiB decodes a 512 window in one tile,
-16 GiB a 768 window."""
+16 GiB a 768 window; 5.5 GiB leaves a 6 GB card room for the rest of the job (768 px
+windows need 15 GiB, see ``segment_large_canvas``)."""
 WHOLE_VIDEO_PTS = (-(1 << 63), (1 << 63) - 1)
 SPEED_TEST_FRAMES = WINDOW_FRAMES + WINDOW_HOP
 """Two windows per track: the speed profile leaves out each canvas's cold first window."""
@@ -78,7 +85,11 @@ class Cancelled(Exception):
 
 
 class FrameWriter(Protocol):
-    def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None: ...
+    """``finish`` once every frame is written; ``close`` (also after ``finish``) releases it."""
+
+    def write(self, frame: torch.Tensor, pts: int) -> None: ...
+
+    def finish(self) -> None: ...
 
     def close(self) -> None: ...
 
@@ -164,6 +175,7 @@ class Progress:
         self._done_share = 0.0
         self._reported_fraction = 0.0
         self._timed = False
+        self._resumed = False
         self._rates: dict[str, float] = {}
         self._work: speed.Work | None = None
         self._estimates: dict[str, tuple[float, float]] | None = None
@@ -218,6 +230,15 @@ class Progress:
         for stage in stages:
             self._done_share += _STAGE_SHARE[stage]
 
+    def skip_saved(self, *stages: LtxStage) -> None:
+        """Count ``stages`` as done and left with no time, for a run resuming their saved results."""
+        self._resumed = True
+        self.skip(*stages)
+        for stage in stages:
+            if self._estimates is not None:
+                self._estimates[stage] = (0.0, 0.0)
+        self._reported_fraction = max(self._reported_fraction, self._done_share)
+
     def profiled_seconds(self, stage: LtxStage, frames: int, windows: dict[int, float]) -> float:
         """The profile's seconds for ``frames`` and ``windows`` (count per canvas) of
         ``stage``, 0 when the profile does not cover this run."""
@@ -254,6 +275,8 @@ class Progress:
                 fraction = self._done_share + _STAGE_SHARE[stage] * stage_fraction
                 self._timed = self._timed or (stage == "denoise" and done > 0)
                 seconds_left = elapsed * (1.0 - fraction) / fraction if self._timed else 0.0
+            if self._resumed:
+                fraction = max(fraction, self._done_share + _STAGE_SHARE[stage] * stage_fraction)
             self._reported_fraction = max(self._reported_fraction, fraction)
             self._report(self._reported_fraction, seconds_left, step)
         return left
@@ -284,6 +307,18 @@ class _StageBar:
     def update(self, n: int) -> None:
         self._frames_done += n
         self._count(n)
+
+    def reuse(self, done: int, frames: int, windows: Counter[int]) -> None:
+        """Count saved work a resumed run skips: ``done`` units holding ``frames`` frames and
+        ``windows`` (count per canvas). Its pace is timed from the next work it does."""
+        if done == 0 and not windows:
+            return
+        self._progress._resumed = True
+        self._frames_done += frames
+        self._windows_done.update(windows)
+        if done:
+            self._count(done)
+            self._warm_from = None
 
     def _count(self, n: int) -> None:
         self._bar.update(n)
@@ -383,7 +418,17 @@ class LatentStore:
         return self._directory / f"{index:06d}.{self._kind}.pt"
 
     def put(self, index: int, latent: torch.Tensor) -> None:
-        torch.save(latent.to("cpu", torch.bfloat16).contiguous(), self._path(index))
+        with atomic_write(self._path(index), "wb") as stream:
+            torch.save(latent.to("cpu", torch.bfloat16).contiguous(), stream)
+
+    def has(self, index: int) -> bool:
+        return self._path(index).is_file()
+
+    def has_track(self, plan: TrackPlan) -> bool:
+        return self._path(plan.track_id).with_suffix(".done").is_file() and all(self.has(w.index) for w in plan.windows)
+
+    def commit_track(self, plan: TrackPlan) -> None:
+        write_json(self._path(plan.track_id).with_suffix(".done"), [w.index for w in plan.windows])
 
     def get(self, index: int) -> torch.Tensor:
         return torch.load(self._path(index), weights_only=True)
@@ -516,7 +561,7 @@ def scan_span(
 
 
 def _vae_pixels(window_pixels: torch.Tensor, device: torch.device) -> torch.Tensor:
-    return window_pixels.to(device).float().div_(127.5).sub_(1.0).to(torch.bfloat16).unsqueeze(0)
+    return window_pixels.to(device).float().div_(127.5).sub_(1.0).to(half_dtype(device)).unsqueeze(0)
 
 
 class _WindowBuffers:
@@ -634,16 +679,17 @@ def segment_decode_budget(total_bytes: int) -> DecodeBudget:
 def _decode_window(
     decoder, latent: torch.Tensor, seed: int, canvas: int, budget: DecodeBudget, device: torch.device
 ) -> torch.Tensor:
-    """Decoded window as uint8 ``[F, 3, S, S]`` on ``device``."""
+    """Decoded window as uint8 ``[F, 3, S, S]`` in host memory: a frame can need every open
+    window of its tracks, and holding them on the GPU would shrink the next decode's budget."""
     torch.cuda.empty_cache()
     free = budget(canvas)
     if isinstance(decoder, WorkerDecoder):
-        return decoder.decode_window(latent, seed, free, device)
+        return decoder.decode_window(latent, seed, free)
     generator = torch.Generator(device=device).manual_seed(seed)
     with torch.inference_mode():
         video = decode_latent(decoder, latent.to(device), free_bytes=free, generator=generator)
         video = ((video + 1.0) / 2.0).clamp(0.0, 1.0)[0].float()
-        return video.mul_(255.0).round_().to(torch.uint8).permute(1, 0, 2, 3).contiguous()
+        return video.mul_(255.0).round_().to(torch.uint8).permute(1, 0, 2, 3).contiguous().cpu()
 
 
 def _decode_shares(windows: list[Window]) -> dict[int, list[tuple[int, float]]]:
@@ -724,8 +770,6 @@ class _SegmentComposer:
     def _decoded_window(self, window: Window) -> torch.Tensor:
         with self._bar.waiting():
             video = self._decoding.pop(window.index).result()
-        if self._stream is not None:
-            video.record_stream(torch.cuda.current_stream(self._device))
         self._decode_next()
         return video
 
@@ -747,7 +791,7 @@ class _SegmentComposer:
             track = self._tracks[window.index]
             candidates.append(
                 Candidate(
-                    canvas=self._decoded[window.index][local],
+                    canvas=self._decoded[window.index][local].to(self._device),
                     crop=window.crops[local],
                     weight=float(self._weights[window.index][local]),
                     track=track.track_id,
@@ -797,9 +841,10 @@ def compose_span(
                     bar.update(len(batch))
                     for frame, frame_pts in zip(batch, pts):
                         if owner is None:
-                            writer.write(frame, frame_pts, apply_lut=False)
+                            writer.write(frame, frame_pts)
                         else:
                             writer.write(composers[owner].frame(frame), frame_pts)
+                writer.finish()
             finally:
                 writer.close()
     finally:
@@ -868,15 +913,36 @@ def prepare_spans(
     """Scan and VAE-encode every span; reference latents go to ``directory``. A ``runtime`` passed
     in will denoise next, so its worker starts and opens the transformer file during the scan; it
     holds no model on the GPU before the encoder loads."""
-    starting = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxWorkerStart")
-    worker_ready = starting.submit(runtime.prepare_transformer) if runtime is not None else None
-    starting.shutdown(wait=False)
+    worker_ready = None
+    if runtime is not None and not all(_plan_path(span, directory).is_file() for span in spans):
+        starting = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LtxWorkerStart")
+        worker_ready = starting.submit(runtime.prepare_transformer)
+        starting.shutdown(wait=False)
     try:
         prepared = _scan_spans(spans, render, directory, progress=progress, cancel=cancel)
     except BaseException:
         _settle(worker_ready)
         raise
-    if sum(p.windows for p in prepared):
+    finals = final_stores(prepared, directory)
+    pending = []
+    reused: Counter[int] = Counter()
+    for p, span_finals in zip(prepared, finals):
+        segment_plans = []
+        for plans, references, store in zip(p.plans, p.references, span_finals):
+            remaining = []
+            for plan in plans:
+                complete = store.has_track(plan)
+                windows = []
+                for window in plan.windows:
+                    if complete or references.has(window.index):
+                        reused[window.canvas] += 1
+                    else:
+                        windows.append(window)
+                if windows:
+                    remaining.append(replace(plan, windows=tuple(windows)))
+            segment_plans.append(remaining)
+        pending.append(replace(p, plans=tuple(segment_plans)))
+    if any(p.windows for p in pending):
         progress.begin("encode")
         owned_runtime = runtime is None
         runtime = runtime or ModelRuntime(render.files, render.device, cancel)
@@ -886,11 +952,17 @@ def prepare_spans(
             encoder = runtime.load_encoder()
             try:
                 with progress.bar("encode", progress.frames, marks=timing_marks(encoder)) as bar:
-                    for p in prepared:
-                        encode_span(
-                            p.span.frames, p.span.segments, p.plans, encoder, p.references,
-                            batch_size=render.batch_size, device=render.device, bar=bar, cancel=cancel,
-                        )
+                    encoded = [p.windows > 0 or not done.windows for p, done in zip(pending, prepared)]
+                    saved_frames = sum(
+                        _saved_frames(p.span, directory) for p, encode in zip(prepared, encoded) if not encode
+                    )
+                    bar.reuse(saved_frames, saved_frames, reused)
+                    for p, encode in zip(pending, encoded):
+                        if encode:
+                            encode_span(
+                                p.span.frames, p.span.segments, p.plans, encoder, p.references,
+                                batch_size=render.batch_size, device=render.device, bar=bar, cancel=cancel,
+                            )
             finally:
                 del encoder
                 runtime.unload_encoder()
@@ -898,6 +970,8 @@ def prepare_spans(
             if owned_runtime:
                 runtime.close()
     else:
+        if reused:
+            progress.skip_saved("encode")
         _settle(worker_ready)
     return prepared
 
@@ -912,29 +986,40 @@ def _settle(worker_ready: Future | None) -> None:
 def _scan_spans(
     spans: Sequence[LtxSpan], render: LtxRender, directory: Path, *, progress: Progress, cancel: threading.Event
 ) -> list[PreparedSpan]:
-    with progress.bar("scan", progress.frames) as bar:
-        plans = [
-            scan_span(
-                span.frames,
-                span.segments,
-                render.detector,
-                batch_size=render.batch_size,
-                frame_h=render.frame_h,
-                frame_w=render.frame_w,
-                large_canvas=render.large_canvas,
-                window_hop=render.window_hop,
-                bar=bar,
-                cancel=cancel,
-            )
-            for span in spans
-        ]
+    plans = []
+    cached = [_saved_plans(span, directory) for span in spans]
+    if all(item is not None for item in cached):
+        progress.skip_saved("scan")
+        plans = [item.plans for item in cached]
+    else:
+        with progress.bar("scan", progress.frames) as bar:
+            for span, saved in zip(spans, cached):
+                _check(cancel)
+                if saved is not None:
+                    plans.append(saved.plans)
+                    bar.reuse(saved.frames, saved.frames, Counter())
+                    continue
+                count = 0
+
+                def counted_frames():
+                    nonlocal count
+                    with closing(span.frames()) as batches:
+                        for batch, pts in batches:
+                            count += len(pts)
+                            yield batch, pts
+
+                span_plans = scan_span(
+                    counted_frames, span.segments, render.detector,
+                    batch_size=render.batch_size, frame_h=render.frame_h, frame_w=render.frame_w,
+                    large_canvas=render.large_canvas, window_hop=render.window_hop, bar=bar, cancel=cancel,
+                )
+                _check(cancel)
+                with atomic_write(_plan_path(span, directory), "wb") as stream:
+                    np.savez(stream, frames=np.array(count), **plans_to_arrays(span_plans))
+                plans.append(span_plans)
     prepared = [
-        PreparedSpan(
-            span,
-            tuple(span_plans),
-            tuple(LatentStore(directory, f"{s}-{g}.reference") for g in range(len(span.segments))),
-        )
-        for s, (span, span_plans) in enumerate(zip(spans, plans))
+        PreparedSpan(span, tuple(span_plans), _span_stores(span, directory, "reference"))
+        for span, span_plans in zip(spans, plans)
     ]
     planned = [w for p in prepared for track_plans in p.plans for plan in track_plans for w in plan.windows]
     crop_pixels = sum(
@@ -951,11 +1036,43 @@ def _scan_spans(
     return prepared
 
 
+def _span_key(span: LtxSpan) -> str:
+    return f"{span.segments[0].start_pts}-{span.segments[-1].end_pts}"
+
+
+def _plan_path(span: LtxSpan, directory: Path) -> Path:
+    return directory / f"{_span_key(span)}.plans.npz"
+
+
+@dataclass(frozen=True)
+class _SavedPlans:
+    frames: int
+    plans: list[list[TrackPlan]]
+
+    @property
+    def large_canvas(self) -> bool:
+        return any(w.canvas == LARGE_CANVAS for segment in self.plans for plan in segment for w in plan.windows)
+
+
+def _saved_plans(span: LtxSpan, directory: Path) -> _SavedPlans | None:
+    path = _plan_path(span, directory)
+    if not path.is_file():
+        return None
+    with np.load(path, allow_pickle=False) as arrays:
+        return _SavedPlans(int(arrays["frames"]), plans_from_arrays(arrays))
+
+
+def _saved_frames(span: LtxSpan, directory: Path) -> int:
+    with np.load(_plan_path(span, directory), allow_pickle=False) as arrays:
+        return int(arrays["frames"])
+
+
+def _span_stores(span: LtxSpan, directory: Path, kind: str) -> tuple[LatentStore, ...]:
+    return tuple(LatentStore(directory, f"{_span_key(span)}-{g}.{kind}") for g in range(len(span.segments)))
+
+
 def final_stores(prepared: Sequence[PreparedSpan], directory: Path) -> list[tuple[LatentStore, ...]]:
-    return [
-        tuple(LatentStore(directory, f"{s}-{g}.final") for g in range(len(p.span.segments)))
-        for s, p in enumerate(prepared)
-    ]
+    return [_span_stores(p.span, directory, "final") for p in prepared]
 
 
 def denoise_spans(
@@ -973,15 +1090,27 @@ def denoise_spans(
     with progress.bar(
         "denoise", len(transformer.conditions) * windows, unit="step", marks=timing_marks(transformer)
     ) as bar:
+        reused = Counter(
+            window.canvas
+            for p, stores in zip(prepared, finals)
+            for plans, store in zip(p.plans, stores)
+            for plan in plans if not keep_references and store.has_track(plan)
+            for window in plan.windows
+        )
+        bar.reuse(sum(reused.values()) * len(transformer.conditions), 0, reused)
         for p, span_finals in zip(prepared, finals):
             for segment, segment_plans, references, store in zip(p.span.segments, p.plans, p.references, span_finals):
                 for plan in segment_plans:
                     _check(cancel)
+                    if not keep_references and store.has_track(plan):
+                        continue
                     advance = bar.track(plan.windows[0].canvas, len(transformer.conditions))
                     latents = denoise_track(plan, transformer, references, seed=segment.seed, advance=advance)
                     for window, latent in zip(plan.windows, latents):
                         store.put(window.index, latent)
-                        if not keep_references:
+                    if not keep_references:
+                        store.commit_track(plan)
+                        for window in plan.windows:
                             references.delete(window.index)
 
 
@@ -1026,7 +1155,10 @@ class _SpeedTestMosaics:
 
 
 class _DiscardedFrames:
-    def write(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True) -> None:
+    def write(self, frame: torch.Tensor, pts: int) -> None:
+        pass
+
+    def finish(self) -> None:
         pass
 
     def close(self) -> None:
@@ -1051,11 +1183,13 @@ def _profile_key(render: LtxRender) -> str:
 
 
 def restore_spans(
-    spans: Sequence[LtxSpan], render: LtxRender, *, work_dir: Path, progress: Progress, cancel: threading.Event
+    spans: Sequence[LtxSpan], render: LtxRender, *, work_dir: Path, resume_dir: Path, progress: Progress,
+    cancel: threading.Event,
 ) -> None:
     """Restore every segment of ``spans`` and write each span's frames to a writer of its own
-    (closed once the span is written). Without a speed profile for this GPU and model, a
-    speed test runs first: the first frames of the first span with two made-up mosaics,
+    (closed once the span is written); plans and latents are kept in ``resume_dir`` to resume.
+    Without a speed profile for this GPU and model, a speed test runs first in a temporary
+    directory under ``work_dir``: the first frames of the first span with two made-up mosaics,
     restored and thrown away, so the run's time left is known once its scan has planned it."""
     if not speed.load_rates(render.speed_profile, _profile_key(render)):
         logger.info("LTX speed test: no speed profile for this GPU and model yet")
@@ -1064,30 +1198,35 @@ def restore_spans(
             (LtxSegment(*WHOLE_VIDEO_PTS, 0),),
             _DiscardedFrames,
         )
-        _restore_spans(
-            [speed_test],
-            replace(render, detector=_SpeedTestMosaics()),
-            work_dir=work_dir,
-            progress=progress.speed_test(),
-            cancel=cancel,
-        )
-    _restore_spans(spans, render, work_dir=work_dir, progress=progress, cancel=cancel)
+        with tempfile.TemporaryDirectory(dir=work_dir, prefix=".ltx-") as temp:
+            _restore_spans(
+                [speed_test],
+                replace(render, detector=_SpeedTestMosaics()),
+                Path(temp),
+                progress=progress.speed_test(),
+                cancel=cancel,
+            )
+    resume_dir.mkdir(parents=True, exist_ok=True)
+    _restore_spans(spans, render, resume_dir, progress=progress, cancel=cancel)
 
 
 def _restore_spans(
-    spans: Sequence[LtxSpan], render: LtxRender, *, work_dir: Path, progress: Progress, cancel: threading.Event
+    spans: Sequence[LtxSpan], render: LtxRender, directory: Path, *, progress: Progress, cancel: threading.Event
 ) -> None:
     profile_key = _profile_key(render)
     progress.expect(speed.load_rates(render.speed_profile, profile_key))
     torch.cuda.reset_peak_memory_stats(render.device)
     blocks = None
-    with ModelRuntime(render.files, render.device, cancel) as runtime, tempfile.TemporaryDirectory(
-        dir=work_dir, prefix=".ltx-"
-    ) as temp:
-        prepared = prepare_spans(spans, render, Path(temp), progress=progress, cancel=cancel, runtime=runtime)
-        finals = final_stores(prepared, Path(temp))
+    resuming = any(directory.glob("*.plans.npz"))
+    with ModelRuntime(render.files, render.device, cancel) as runtime:
+        prepared = prepare_spans(spans, render, directory, progress=progress, cancel=cancel, runtime=runtime)
+        finals = final_stores(prepared, directory)
         windows = sum(p.windows for p in prepared)
-        if windows:
+        pending_tracks = any(
+            not store.has_track(plan)
+            for p, stores in zip(prepared, finals) for plans, store in zip(p.plans, stores) for plan in plans
+        )
+        if pending_tracks:
             progress.begin("denoise")
             transformer = runtime.load_transformer()
             blocks = (transformer.blocks.resident, transformer.blocks.count)
@@ -1096,6 +1235,8 @@ def _restore_spans(
             finally:
                 del transformer
                 runtime.unload_transformer()
+        elif windows:
+            progress.skip_saved("denoise")
         progress.begin("compose")
         decoder = runtime.load_decoder() if windows else None
         try:
@@ -1106,7 +1247,7 @@ def _restore_spans(
         peak_vram_bytes = runtime.peak_vram_bytes()
     for line in progress.summary(profile_key, peak_vram_bytes, blocks):
         logger.info(line)
-    if windows:
+    if windows and not resuming:
         speed.save_rates(render.speed_profile, profile_key, progress.learned_rates())
 
 
@@ -1126,19 +1267,33 @@ def restore_video(
     work_dir: Path,
     speed_profile: Path,
     progress: Progress,
+    resume_dir: Path,
     cancel: threading.Event,
 ) -> None:
     """Restore every mosaic of the video ``frames`` yields as one segment; the 768 px
     decision and the decode tiles follow the VRAM free when they are made."""
+    span = LtxSpan(frames, (LtxSegment(*WHOLE_VIDEO_PTS, seed),), lambda: writer)
+    saved = _saved_plans(span, resume_dir)
+    if saved is None:
+        canvas = large_canvas_fits(large_canvas, device_free_bytes(device))
+    else:
+        canvas = saved.large_canvas
+        free = device_free_bytes(device)
+        if canvas and free < LARGE_CANVAS_MIN_FREE_BYTES:
+            raise RuntimeError(
+                f"The saved LTX work for this video uses 768 px windows, which need "
+                f"{LARGE_CANVAS_MIN_FREE_BYTES / 2**30:.0f} GiB of free GPU memory; {free / 2**30:.1f} GiB is free. "
+                "Close other programs that use the GPU and try again."
+            )
     restore_spans(
-        [LtxSpan(frames, (LtxSegment(*WHOLE_VIDEO_PTS, seed),), lambda: writer)],
+        [span],
         LtxRender(
             detector=detector,
             files=files,
             frame_h=frame_h,
             frame_w=frame_w,
             batch_size=batch_size,
-            large_canvas=large_canvas_fits(large_canvas, device_free_bytes(device)),
+            large_canvas=canvas,
             window_hop=window_hop,
             budget=free_vram_budget(device),
             budget_name="free VRAM",
@@ -1148,4 +1303,5 @@ def restore_video(
         work_dir=work_dir,
         progress=progress,
         cancel=cancel,
+        resume_dir=resume_dir,
     )

@@ -3,6 +3,8 @@ import io
 import runpy
 import ssl
 import urllib.error
+from dataclasses import replace
+from pathlib import Path
 from unittest.mock import Mock
 
 import certifi
@@ -25,12 +27,11 @@ def test_source_model_bundle_and_reader(tmp_path):
         assert torch.equal(handle.get_tensor("weight"), value)
 
 
-def test_model_check_precedes_engine_compilation(tmp_path, monkeypatch):
+def test_model_check_precedes_engine_compilation(tmp_path, monkeypatch, nvidia_vendor):
     from factories import session_config
-    from jasna import accelerator, engine_compiler, session_factory
+    from jasna import engine_compiler, session_factory
 
     compile_engines = Mock()
-    monkeypatch.setattr(accelerator, "is_nvidia_device", lambda device: True)
     monkeypatch.setattr("jasna.ltx.transformer.require_kernels", lambda device: None)
     monkeypatch.setattr(engine_compiler, "ensure_engines_compiled", compile_engines)
     monkeypatch.setattr(LtxModelFiles, "from_dir", Mock(side_effect=ValueError("model unavailable")))
@@ -56,6 +57,39 @@ def test_installed_checks_the_chosen_model_only(tmp_path):
     assert [f.name for f in model_files.missing_downloads(tmp_path, "distilled", fast=True)] == [
         "ltx-restore-alpha1-distill8-nvfp4.safetensors.enc"
     ]
+
+
+@pytest.mark.parametrize("old_size", [64, 96])
+def test_outdated_encrypted_model_is_missing_until_verified_download_replaces_it(tmp_path, monkeypatch, old_size):
+    from jasna.protection import protected_tensors
+
+    names = bundle_names("distilled2", fast=False)
+    current = b"m" * 80
+    entries = {name: replace(model_files.LTX_DOWNLOADS[name], size_bytes=len(current),
+                            sha256=hashlib.sha256(current).hexdigest()) for name in names}
+    monkeypatch.setattr(model_files, "LTX_DOWNLOADS", {**model_files.LTX_DOWNLOADS, **entries})
+    monkeypatch.setattr(model_files, "is_frozen", lambda: True)
+    monkeypatch.setattr("jasna.license_api.require_protection", lambda: None)
+    checked = Mock()
+    monkeypatch.setattr(protected_tensors, "check_ltx_license", checked)
+    for name in names:
+        (tmp_path / (name + ".enc")).write_bytes(current)
+    transformer = tmp_path / (names[0] + ".enc")
+    transformer.write_bytes(b"o" * old_size)
+    with monkeypatch.context() as stat_only:
+        stat_only.setattr(Path, "open", lambda *a, **k: pytest.fail("availability read model bytes"))
+        assert not model_files.model_installed(tmp_path, "distilled2", fast=False)
+        needed = model_files.missing_downloads(tmp_path, "distilled2", fast=False)
+        assert needed == [replace(entries[names[0]], name=transformer.name)]
+        with pytest.raises(FileNotFoundError, match="missing or outdated"):
+            LtxModelFiles.from_dir(tmp_path, "distilled2", fast=False)
+    assert checked.call_count == 1
+    monkeypatch.setattr(model_files.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(current))
+    model_files.download_files(tmp_path, needed, None, mirror_first=False)
+    assert transformer.read_bytes() == current
+    assert model_files.model_installed(tmp_path, "distilled2", fast=False)
+    assert model_files.missing_downloads(tmp_path, "distilled2", fast=False) == []
+    assert LtxModelFiles.from_dir(tmp_path, "distilled2", fast=False).transformer == transformer
 
 
 def test_download_verifies_and_replaces_atomically(tmp_path, monkeypatch):
@@ -94,6 +128,43 @@ def test_download_falls_back_to_the_other_source(tmp_path, monkeypatch):
     monkeypatch.setattr(model_files, "LTX_MIRROR_URL", (tmp_path / "unreachable").as_uri())
     model_files.download_files(tmp_path / "b", [file], None, mirror_first=True)
     assert (tmp_path / "b" / "model.enc").read_bytes() == content
+
+
+@pytest.mark.parametrize("version,expected", [
+    ("0.10.0", "main"), ("0.11.3", "main"), ("0.11.4", "main"),
+    ("0.12.0", "0.12.0"), ("0.12.1", "0.12.0"), ("0.13.0", "0.12.0"),
+])
+def test_model_branch_uses_latest_known_version_not_newer_than_jasna(version, expected):
+    assert model_files._model_branch(version) == expected
+
+
+def test_model_branch_orders_versions_numerically_and_ignores_future_models(monkeypatch):
+    monkeypatch.setattr(model_files, "_MODEL_BRANCHES", ("0.12.10", "0.13.0", "0.12.0", "0.12.2"))
+    assert model_files._model_branch("0.12.1") == "0.12.0"
+    assert model_files._model_branch("0.12.9") == "0.12.2"
+    assert model_files._model_branch("0.12.10") == "0.12.10"
+    assert model_files._model_branch("0.13.0") == "0.13.0"
+
+
+@pytest.mark.parametrize("mirror_first", [False, True])
+def test_replacement_models_use_release_branch_on_both_sources(tmp_path, monkeypatch, mirror_first):
+    content = b"replacement model"
+    name = "ltx-restore-alpha1-distill2-int8.safetensors.enc"
+    file = model_files.DownloadableFile(name, len(content), hashlib.sha256(content).hexdigest())
+    requests = []
+
+    def open_url(url, **kwargs):
+        requests.append(url)
+        if len(requests) == 1:
+            raise urllib.error.URLError("primary unreachable")
+        return io.BytesIO(content)
+
+    monkeypatch.setattr(model_files.urllib.request, "urlopen", open_url)
+    model_files.download_files(tmp_path, [file], None, mirror_first=mirror_first)
+    expected = [f"https://{host}/Kruk2/ltx-restore/resolve/0.12.0/{name}"
+                for host in ("huggingface.co", "hf-mirror.com")]
+    assert requests == (list(reversed(expected)) if mirror_first else expected)
+    assert (tmp_path / name).read_bytes() == content
 
 
 @pytest.mark.parametrize("mirror_first", [False, True])
@@ -143,7 +214,7 @@ def test_mirror_first_tries_the_mirror_before_the_main_source(tmp_path, monkeypa
         model_files.download_files(tmp_path / "models", [file], None, mirror_first=False)
 
 
-def test_cli_offers_the_missing_model_only_when_ltx_runs(tmp_path, monkeypatch):
+def test_cli_offers_the_missing_model_only_when_ltx_runs(tmp_path, monkeypatch, nvidia_vendor):
     import sys
 
     from factories import session_config
@@ -151,6 +222,7 @@ def test_cli_offers_the_missing_model_only_when_ltx_runs(tmp_path, monkeypatch):
 
     asked = []
     monkeypatch.setattr("builtins.input", lambda prompt: asked.append(prompt) or "n")
+    monkeypatch.setattr("jasna.license_api.require_protection", lambda: None)
     main._ensure_ltx_model(session_config(restoration_model_name="basicvsrpp"), None)
     assert asked == []
 
@@ -174,7 +246,7 @@ def test_import_does_not_load_ca_or_start_downloads(monkeypatch):
     runpy.run_path(model_files.__file__)
 
 
-def test_cli_offers_only_the_fast_models_files(tmp_path, monkeypatch):
+def test_cli_offers_only_the_fast_models_files(tmp_path, monkeypatch, nvidia_vendor):
     import sys
 
     from factories import session_config
@@ -184,6 +256,7 @@ def test_cli_offers_only_the_fast_models_files(tmp_path, monkeypatch):
     monkeypatch.setattr("builtins.input", lambda prompt: asked.append(prompt) or "n")
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
     monkeypatch.setattr("jasna.license_api.require_protection", lambda: None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (12, 0))
     fast = session_config(restoration_model_name="ltx", restoration_model_path=tmp_path, ltx_fast=True)
 
     with pytest.raises(FileNotFoundError, match="missing"):
@@ -191,3 +264,103 @@ def test_cli_offers_only_the_fast_models_files(tmp_path, monkeypatch):
 
     assert "ltx-restore-alpha1-distill8-nvfp4" in asked[0] and "int8" not in asked[0]
     assert "9.2 GB" in asked[0]
+
+
+@pytest.mark.parametrize("interactive", [False, True])
+def test_cli_explains_models_copied_from_older_release_need_updating(tmp_path, monkeypatch, nvidia_vendor, interactive):
+    import sys
+
+    from factories import session_config
+    from jasna import main
+
+    monkeypatch.setattr(model_files, "is_frozen", lambda: True)
+    monkeypatch.setattr("jasna.license_api.require_protection", lambda: None)
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: interactive)
+    asked = []
+    monkeypatch.setattr("builtins.input", lambda prompt: asked.append(prompt) or "n")
+    names = bundle_names("distilled2", fast=False)
+    for index, name in enumerate(names):
+        with (tmp_path / (name + ".enc")).open("wb") as stream:
+            stream.truncate(13_368_048_749 if index == 0 else model_files.LTX_DOWNLOADS[name].size_bytes)
+    config = session_config(restoration_model_name="ltx", restoration_model_path=tmp_path, ltx_model="distilled2")
+
+    with pytest.raises(FileNotFoundError) as error:
+        main._ensure_ltx_model(config, None)
+    message = asked[0] if interactive else str(error.value)
+    assert "need updating" in message and "older Jasna" in message
+    assert "License code still works" in message
+    assert names[0] in message and names[1] not in message and names[2] not in message
+    assert (tmp_path / (names[0] + ".enc")).stat().st_size == 13_368_048_749
+    if not interactive:
+        assert asked == [] and "Run jasna in a terminal" in message
+
+
+@pytest.mark.parametrize("nvidia", [False, True], ids=["amd", "older-nvidia"])
+@pytest.mark.parametrize("trial", [False, True])
+def test_cli_fast_ltx_checks_hardware_before_models_or_downloads(tmp_path, monkeypatch, nvidia, trial):
+    from factories import session_config
+    from jasna import accelerator, main
+
+    monkeypatch.setattr(accelerator, "is_nvidia_device", lambda device: nvidia)
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda device: not nvidia)
+    def capability(device):
+        assert nvidia, "AMD capability aliases cannot establish NVIDIA FP4 support"
+        return (8, 9)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    monkeypatch.setattr(model_files, "missing_downloads", lambda *args, **kwargs: pytest.fail("checked/downloaded incompatible files"))
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("offered an incompatible download"))
+    config = session_config(restoration_model_name="ltx", restoration_model_path=tmp_path,
+                            ltx_fast=True, ltx_trial=trial)
+    with pytest.raises(SystemExit, match="Blackwell"):
+        main._ensure_ltx_model(config, None)
+
+
+@pytest.mark.parametrize(("trial", "source_files", "refused"), [(False, False, True), (True, False, False), (False, True, False)])
+@pytest.mark.parametrize("platform", ["linux", "win32", "darwin"])
+def test_licensed_ltx_on_amd_requires_a_supported_worker(tmp_path, monkeypatch, trial, source_files, refused, platform):
+    from factories import session_config
+    from jasna import accelerator, session_factory
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda device=None: True)
+    monkeypatch.setattr(accelerator.sys, "platform", platform)
+    if source_files:
+        for name in bundle_names("distilled", fast=False):
+            (tmp_path / name).touch()
+    config = session_config(
+        restoration_model_name="ltx", restoration_model_path=tmp_path, ltx_model="distilled", ltx_trial=trial
+    )
+    assert session_factory.unsupported_licensed_ltx_on_amd(config) is (refused and platform == "darwin")
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda device=None: False)
+    assert not session_factory.unsupported_licensed_ltx_on_amd(config)
+
+
+def test_licensed_ltx_on_amd_stops_before_the_download_offer_and_the_session(tmp_path, monkeypatch):
+    from factories import session_config
+    from jasna import accelerator, main, session_factory
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda device=None: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: pytest.fail("offered a download"))
+    monkeypatch.setattr("jasna.ltx.transformer.require_kernels", lambda device: pytest.fail("loaded LTX"))
+    monkeypatch.setattr(accelerator.sys, "platform", "darwin")
+    config = session_config(restoration_model_name="ltx", restoration_model_path=tmp_path)
+
+    with pytest.raises(SystemExit, match="LTX quality models are unavailable for this AMD setup"):
+        main._ensure_ltx_model(config, None)
+    with pytest.raises(ValueError, match="LTX quality models are unavailable for this AMD setup"):
+        session_factory._ltx_model_files(config, torch.device("cuda:0"), log_callback=None)
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_supported_licensed_amd_reaches_the_normal_model_preflight(tmp_path, monkeypatch, platform):
+    from factories import session_config
+    from jasna import accelerator, main, session_factory
+
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda device=None: True)
+    monkeypatch.setattr(model_files, "missing_downloads", Mock(side_effect=RuntimeError("normal download preflight")))
+    monkeypatch.setattr("jasna.ltx.transformer.require_kernels", Mock(side_effect=RuntimeError("normal kernel preflight")))
+    monkeypatch.setattr(accelerator.sys, "platform", platform)
+    config = session_config(restoration_model_name="ltx", restoration_model_path=tmp_path)
+    with pytest.raises(RuntimeError, match="normal download preflight"):
+        main._ensure_ltx_model(config, None)
+    with pytest.raises(RuntimeError, match="normal kernel preflight"):
+        session_factory._ltx_model_files(config, torch.device("cuda:0"), log_callback=None)

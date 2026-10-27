@@ -28,12 +28,15 @@ models slowly, and it warns you at startup.
     skipped item back at the end of the queue.
   - **Cross** removes the item.
 - During processing, each item shows progress, FPS and time left.
-- **▶** (start) always processes everything in the queue, including items
-  that are already finished or failed. So you can change settings and press ▶
-  again without adding the files again.
-- **■** (stop) asks first, then ends the run. The current item goes back to **Pending**. The half-written
-  output file stays on disk; **File Conflict** decides what happens with it
-  next time.
+- **▶** (start) continues a paused queue from its pending items. Finished items
+  stay finished. After the queue finishes, press ▶ to process everything again
+  with your current settings.
+- **Ⅱ** (pause) appears for jobs using LTX. It asks first, then keeps saved work
+  and puts the current item back to **Pending**. Press **▶** to continue.
+  If the input, settings or Jasna version changed, Jasna asks before replacing saved work;
+  **No** keeps it and skips that video.
+- **■** (stop) is used for other jobs. They start over next time;
+  **File Conflict** decides what happens to any unfinished output.
 - Closing the window while a video is processing asks first: **Minimize** keeps
   it running, **Stop and quit** ends it.
 - **Clear done** removes finished items. **Clear** removes everything.
@@ -94,6 +97,20 @@ On the first start of each version, Jasna checks FFprobe, the GPU, the driver
 and the install path. You can run it again from the header, for example after a driver
 update.
 
+On AMD it also checks AMD's AMF video runtime, which Jasna needs to read and
+write videos. On Windows it comes with the AMD driver. On Linux, install it once.
+We tested [AMF 26.20](https://repo.radeon.com/amf/26.20/):
+
+```bash
+curl -fLO https://repo.radeon.com/amf/26.20/amf_installer_26.20.zip
+unzip amf_installer_26.20.zip
+sudo bash amf_installer_26.20.sh
+```
+
+Accept AMD's license when prompted, then restart Jasna. If using Distrobox,
+install AMF inside the same container as Jasna. Compiling FFmpeg with
+`--enable-amf` does not install this runtime.
+
 ## Other settings
 
 - **Language**: the first start uses your system language. Change it in the
@@ -107,6 +124,10 @@ update.
 
 Supporter models (UNet 4x, SD 1.5, LTX) need activation. Open **Activate Jasna** in
 the header.
+
+If Jasna is already activated, opening this window checks online and shows
+**Devices used**, for example **2 of 3**. If the count is unavailable, reopen
+the window to try again. Restoration still works offline.
 
 - **Online** (default): enter your **License code** and click
   **Activate online**.

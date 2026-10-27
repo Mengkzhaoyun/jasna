@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from jasna import os_utils
+from jasna import accelerator, os_utils
+
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
 
 
 def test_frozen_linux_application_executable_ignores_the_python_placeholder(monkeypatch) -> None:
@@ -443,6 +445,18 @@ def test_check_sysmem_fallback_returns_false_on_oserror(monkeypatch) -> None:
     assert "nvdrsdb0.bin not found" in info
 
 
+def test_check_sysmem_fallback_skips_nvidia_drs_on_amd(monkeypatch) -> None:
+    monkeypatch.setattr(os_utils.sys, "platform", "win32", raising=False)
+    monkeypatch.setattr(accelerator, "is_amd_device", lambda: True)
+
+    def _read_drs_setting(setting_id):
+        raise AssertionError("AMD must not read the NVIDIA DRS database")
+
+    monkeypatch.setattr(os_utils, "_read_drs_setting", _read_drs_setting)
+
+    assert os_utils.check_windows_nvidia_sysmem_fallback_policy() == (True, "N/A (AMD)")
+
+
 def test_check_sysmem_fallback_returns_na_on_non_windows(monkeypatch) -> None:
     monkeypatch.setattr(os_utils.sys, "platform", "linux", raising=False)
 
@@ -514,6 +528,7 @@ def _as_amd_build(monkeypatch, fake_torch) -> None:
     import jasna.accelerator as accelerator
 
     monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(accelerator, "torch", fake_torch)
     monkeypatch.setattr(accelerator, "vendor_for_device", lambda _device: accelerator.AcceleratorVendor.AMD)
 
 
@@ -762,3 +777,28 @@ def test_mount_source_is_the_innermost_mount_holding_the_path() -> None:
 def test_windows_seek_penalty_query_answers_for_a_drive_and_skips_network_paths() -> None:
     assert isinstance(os_utils._windows_drive_has_seek_penalty(Path(os.environ["SystemDrive"] + "\\")), bool)
     assert not os_utils._windows_drive_has_seek_penalty(Path(r"\\server\share\jasna"))
+
+
+@pytest.mark.parametrize("platform,library", [("linux", "libamfrt64.so.1"), ("win32", "amfrt64.dll")])
+def test_amf_runtime_check_loads_the_platform_library(monkeypatch, platform, library) -> None:
+    import ctypes
+
+    loaded = []
+    monkeypatch.setattr(os_utils.sys, "platform", platform)
+    monkeypatch.setattr(ctypes, "CDLL", loaded.append)
+
+    assert os_utils.check_amd_amf_runtime() == (True, library)
+    assert loaded == [library]
+
+
+@pytest.mark.parametrize('error', [OSError, ImportError])
+def test_amf_runtime_check_reports_the_load_error(monkeypatch, error) -> None:
+    import ctypes
+
+    def missing(name):
+        raise error(f"{name}: cannot open shared object file")
+
+    monkeypatch.setattr(os_utils.sys, "platform", "linux")
+    monkeypatch.setattr(ctypes, "CDLL", missing)
+
+    assert os_utils.check_amd_amf_runtime() == (False, "libamfrt64.so.1: cannot open shared object file")

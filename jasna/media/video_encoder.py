@@ -108,16 +108,28 @@ DEFAULT_AV1_ENCODER_OPTIONS: dict[str, str] = {
     "b_ref_mode": "middle",
 }
 
+def _amf_av1_qindex(cq: int) -> int:
+    # AMF AV1 frame QPs are AV1 qindex 0..255; CQ uses the H.264/HEVC QP scale 0..51.
+    return cq * 255 // 51
+
+
+def _amf_constant_qp(codec: str, cq: int) -> dict[str, str]:
+    if codec == "av1":
+        qindex = str(_amf_av1_qindex(cq))
+        return {"qp_i": qindex, "qp_p": qindex, "qp_b": qindex}
+    if codec == "h264":
+        return {"qp_i": str(cq), "qp_p": str(cq), "qp_b": str(cq)}
+    return {"qp_i": str(cq), "qp_p": str(cq)}
+
+
 DEFAULT_AMF_H264_ENCODER_OPTIONS: dict[str, str] = {
     "usage": "high_quality",
     "quality": "quality",
-    "rc": "qvbr",
-    "qvbr_quality_level": str(
-        encoder_cq_spec("h264", AcceleratorVendor.AMD).default
-    ),
+    "rc": "cqp",
+    **_amf_constant_qp("h264", encoder_cq_spec("h264", AcceleratorVendor.AMD).default),
     "g": "250",
-    "preanalysis": "1",
-    "vbaq": "1",
+    "preanalysis": "0",
+    "vbaq": "0",
     "profile": "high",
 }
 
@@ -125,8 +137,7 @@ DEFAULT_AMF_HEVC_ENCODER_OPTIONS: dict[str, str] = {
     "usage": "high_quality",
     "quality": "quality",
     "rc": "cqp",
-    "qp_i": str(encoder_cq_spec("hevc", AcceleratorVendor.AMD).default),
-    "qp_p": str(encoder_cq_spec("hevc", AcceleratorVendor.AMD).default),
+    **_amf_constant_qp("hevc", encoder_cq_spec("hevc", AcceleratorVendor.AMD).default),
     "g": "250",
     "preanalysis": "0",
     "vbaq": "0",
@@ -135,20 +146,11 @@ DEFAULT_AMF_HEVC_ENCODER_OPTIONS: dict[str, str] = {
 }
 
 
-def _amf_av1_qindex(cq: int) -> int:
-    # AMF AV1 frame QPs are AV1 qindex 0..255; CQ uses the H.264/HEVC QP scale 0..51.
-    return cq * 255 // 51
-
-
-_AMF_AV1_DEFAULT_QINDEX = str(_amf_av1_qindex(encoder_cq_spec("av1", AcceleratorVendor.AMD).default))
-
 DEFAULT_AMF_AV1_ENCODER_OPTIONS: dict[str, str] = {
     "usage": "high_quality",
     "quality": "quality",
     "rc": "cqp",
-    "qp_i": _AMF_AV1_DEFAULT_QINDEX,
-    "qp_p": _AMF_AV1_DEFAULT_QINDEX,
-    "qp_b": _AMF_AV1_DEFAULT_QINDEX,
+    **_amf_constant_qp("av1", encoder_cq_spec("av1", AcceleratorVendor.AMD).default),
     "g": "250",
     "preanalysis": "0",
     "aq_mode": "none",
@@ -323,7 +325,7 @@ def _normalize_amf_cq(
     rc = overrides.get("rc", defaults["rc"])
     cqp_modes = {"cqp", "0"}
     qvbr_modes = {"qvbr", "hqvbr", "4", "5"}
-    if codec in {"hevc", "av1"} and rc not in cqp_modes:
+    if rc not in cqp_modes:
         defaults.pop("qp_i", None)
         defaults.pop("qp_p", None)
         defaults.pop("qp_b", None)
@@ -342,19 +344,12 @@ def _normalize_amf_cq(
         return
 
     value = overrides.pop(aliases[0])
-    if codec in {"hevc", "av1"}:
-        if rc in cqp_modes and codec == "av1":
-            qindex = str(_amf_av1_qindex(int(value)))
-            overrides.update(qp_i=qindex, qp_p=qindex, qp_b=qindex)
-        elif rc in cqp_modes:
-            overrides["qp_i"] = value
-            overrides["qp_p"] = value
-        elif not ten_bit and rc in qvbr_modes:
-            overrides["qvbr_quality_level"] = value
-        else:
-            raise ValueError(f"AMD {codec.upper()} CQ requires rc=cqp")
-    else:
+    if rc in cqp_modes:
+        overrides.update(_amf_constant_qp(codec, int(value)))
+    elif codec == "h264" or (not ten_bit and rc in qvbr_modes):
         overrides["qvbr_quality_level"] = value
+    else:
+        raise ValueError(f"AMD {codec.upper()} CQ requires rc=cqp")
 
 
 def _align_yuv_pitch(packed: torch.Tensor) -> torch.Tensor:
@@ -440,7 +435,6 @@ def resolve_encoder_options(
             _drop_unsupported_nvenc_overrides(codec, overrides, encoder_options)
     uses_amf_cqp = (
         vendor is AcceleratorVendor.AMD
-        and codec in {"hevc", "av1"}
         and overrides.get("rc", encoder_options["rc"]) in {"cqp", "0"}
     )
     if "maxrate" not in overrides and not uses_amf_cqp:
@@ -506,7 +500,6 @@ class VideoEncoder:
             )
 
         self._converter = RgbToYuvConverter(f"{pixel_format}_{color_variant}", device=self.device)
-        self._lut_flags: deque[bool] = deque()
         # Only AMD reuses one packed frame (set in __enter__); NVENC still holds
         # its input frame after encode() returns, so NVIDIA allocates per frame.
         self._packed: torch.Tensor | None = None
@@ -576,19 +569,19 @@ class VideoEncoder:
         # initialized it; current_ctx leaves the context and its flags alone.
         # Keeping conversion and NVENC in one context also avoids a ~500 MiB
         # secondary CUDA context and cross-context scheduling overhead.
-        # NVENC consumes device memory, so conversion runs on its own stream and
-        # overlaps the rest of the pipeline. AMF consumes host memory and the
-        # conversion is eager Torch math, so on AMD everything stays on the
-        # current stream: a private stream there let ROCm recycle in-flight
-        # conversion buffers into the restorer's allocations (issue #252).
+        # Conversion runs on its own stream so it overlaps the rest of the
+        # pipeline. The worker makes that stream wait for the producer's event
+        # and records it on the input frame, and the AMD buffers below live for
+        # the whole encode, so no block is recycled while a conversion still
+        # reads it (issue #252).
         height = self.metadata.video_height
         width = self.metadata.video_width
         self._cuda_ctx = None
         self._host_yuv = None
+        self.stream = new_stream(self.device)
         if self.vendor is AcceleratorVendor.NVIDIA:
             from av.video.frame import CudaContext
 
-            self.stream = new_stream(self.device)
             self._cuda_ctx = CudaContext(
                 device_id=self.device.index or 0,
                 primary_ctx=False,
@@ -596,14 +589,14 @@ class VideoEncoder:
                 cuda_stream=self.stream.cuda_stream,
             )
         else:
-            self.stream = current_stream(self.device)
-            self._packed = torch.empty(
-                (height + height // 2, width),
-                dtype=self._converter.sample_dtype,
-                device=self.device,
-            )
-            if self._cas is not None:
-                self._cas_luma = torch.empty_like(self._packed[:height])
+            with stream_context(self.stream):
+                self._packed = torch.empty(
+                    (height + height // 2, width),
+                    dtype=self._converter.sample_dtype,
+                    device=self.device,
+                )
+                if self._cas is not None:
+                    self._cas_luma = torch.empty_like(self._packed[:height])
             self._host_yuv = torch.empty(
                 (height + height // 2, width),
                 dtype=torch.uint16 if self.spec.ten_bit else torch.uint8,
@@ -611,7 +604,6 @@ class VideoEncoder:
             )
         self.pts_heap: list[int] = []
         self.frame_buffer: deque = deque()
-        self._lut_flags.clear()
         self.pts_set: set[int] = set()
         self._last_emitted_pts: int | None = None
         self._video_started = False
@@ -795,10 +787,10 @@ class VideoEncoder:
                 if item is self._stop_sentinel:
                     return
                 if self._worker_error is None:
-                    frame, pts, apply_lut, ready_event = item
+                    frame, pts, ready_event = item
                     self.stream.wait_event(ready_event)
                     frame.record_stream(self.stream)
-                    self._encode_frame(frame, pts, apply_lut=apply_lut)
+                    self._encode_frame(frame, pts)
             except Exception as exc:
                 self._worker_error = exc
                 logger.exception("[encoder-worker] crashed")
@@ -809,12 +801,11 @@ class VideoEncoder:
         self,
         frame: torch.Tensor,
         pts: int,
-        apply_lut: bool,
-    ) -> tuple[torch.Tensor, int, bool, object]:
+    ) -> tuple[torch.Tensor, int, object]:
         producer_stream = current_stream(self.device)
         ready_event = new_event(self.device)
         producer_stream.record_event(ready_event)
-        return frame, pts, apply_lut, ready_event
+        return frame, pts, ready_event
 
     def _validate_encoder_options(self):
         leftover = dict(self.out_stream.codec_context.options)
@@ -970,7 +961,7 @@ class VideoEncoder:
             self.pts_set.remove(pts_to_assign)
             pts_to_assign = self._clamp_pts_monotonic(pts_to_assign)
             self._encode_queue.put(
-                self._build_encode_item(frame_to_encode, pts_to_assign, self._lut_flags.popleft())
+                self._build_encode_item(frame_to_encode, pts_to_assign)
             )
 
     def _encoder_open_error(self, exc: Exception) -> RuntimeError:
@@ -1017,10 +1008,10 @@ class VideoEncoder:
         self._cas.sharpen_into(luma, packed[:height])
         return packed
 
-    def _encode_frame(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True):
+    def _encode_frame(self, frame: torch.Tensor, pts: int):
         height = self.metadata.video_height
         with stream_context(self.stream):
-            if apply_lut and self._lut_applier is not None:
+            if self._lut_applier is not None:
                 frame = self._lut_applier.apply(frame)
             packed = self._to_yuv(frame, height)
             if self.vendor is AcceleratorVendor.NVIDIA:
@@ -1064,7 +1055,7 @@ class VideoEncoder:
         for packet in packets:
             self._mux_video(packet)
 
-    def encode(self, frame: torch.Tensor, pts: int, *, apply_lut: bool = True):
+    def encode(self, frame: torch.Tensor, pts: int):
         if self._worker_error is not None:
             raise self._worker_error
         pts = int(pts) - self.pts_origin
@@ -1072,6 +1063,5 @@ class VideoEncoder:
             pts += 1
         heapq.heappush(self.pts_heap, pts)
         self.frame_buffer.append(frame)
-        self._lut_flags.append(bool(apply_lut))
         self.pts_set.add(pts)
         self._process_buffer()

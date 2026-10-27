@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import subprocess
 import threading
+from fractions import Fraction
 from pathlib import Path
 
 import torch
@@ -19,6 +21,9 @@ log = logging.getLogger(__name__)
 _WRITE_QUEUE_SIZE = 16
 _WRITER_STOP_TIMEOUT = 5.0
 _BROWSER_HLS_AUDIO_CODECS = frozenset({'aac', 'mp3'})
+# ADTS carries any other layout only in the first frame's PCE, so a player that starts at a
+# later segment gets no channel layout and no sound.
+_ADTS_CHANNEL_LAYOUTS = 'mono|stereo|3.0|4.0|5.0|5.1|7.1'
 
 
 class StreamingEncodeError(RuntimeError):
@@ -45,7 +50,8 @@ class StreamingEncoder:
         self._width = metadata.video_width
         self._height = metadata.video_height
         self._fps = metadata.video_fps_exact
-        self._gop_size = max(1, round(float(metadata.video_fps_exact) * segment_duration))
+        # A GOP never shorter than -hls_time makes the muxer cut every segment at exactly one GOP.
+        self.frames_per_segment = math.ceil(metadata.video_fps_exact * Fraction(str(segment_duration)))
         self._frame_bytes = self._width * self._height * 3
 
         gpu_idx = 0
@@ -166,7 +172,7 @@ class StreamingEncoder:
                 '-qvbr_quality_level', '19',
                 '-bf', '0',
                 '-profile:v', 'high',
-                '-g', str(self._gop_size),
+                '-g', str(self.frames_per_segment),
                 '-pix_fmt', 'yuv420p',
             ]
         else:
@@ -183,7 +189,7 @@ class StreamingEncoder:
                 '-rc-lookahead', '8',
                 '-no-scenecut', '1',
                 '-gpu', str(self._gpu_index),
-                '-g', str(self._gop_size),
+                '-g', str(self.frames_per_segment),
                 '-pix_fmt', 'yuv420p',
             ]
 
@@ -324,5 +330,5 @@ def _browser_audio_args(source_video: str) -> list[str]:
         return []
     if needs_audio_reencode(codec, '.ts', _BROWSER_HLS_AUDIO_CODECS):
         log.info("[stream-enc] re-encoding audio %s -> aac for the browser", codec)
-        return aac_reencode_args(0)
+        return [*aac_reencode_args(0), '-filter:a:0', f'aformat=channel_layouts={_ADTS_CHANNEL_LAYOUTS}']
     return ['-c:a:0', 'copy']

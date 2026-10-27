@@ -1,6 +1,6 @@
 """The native LTX block against ``transformer.block_forward`` on the same trial-shaped weights
-and inputs. Needs a GPU ``kernels.supports``, Triton, comfy-kitchen and the toolchain that
-builds the native block; NVFP4 needs SM 12.x."""
+and inputs. Needs a GPU ``kernel_policy.supports`` (NVIDIA or AMD), Triton, comfy-kitchen and the
+toolchain that builds the native block; NVFP4 needs SM 12.x."""
 
 from __future__ import annotations
 
@@ -13,15 +13,17 @@ pytest.importorskip("comfy_kitchen")
 
 from jasna.ltx import native
 from jasna.ltx import transformer as T
-from jasna.ltx.kernels import supports
+from jasna.ltx.kernel_policy import supports
 from jasna.ltx.model_files import PlaceholderHandle, PlaceholderTensors
+from jasna.tensor_utils import half_dtype
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.cuda is None or not supports(torch.device("cuda")),
+    not torch.cuda.is_available() or not supports(torch.device("cuda")),
     reason="needs a GPU the LTX kernels support",
 )
+AMD = torch.version.hip is not None
 needs_nvfp4 = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in native.FP4_ARCHS,
+    not torch.cuda.is_available() or AMD or torch.cuda.get_device_capability() not in native.FP4_ARCHS,
     reason="NVFP4 blocks need consumer Blackwell",
 )
 QUANTIZATIONS = ["int8", pytest.param("nvfp4", marks=needs_nvfp4)]
@@ -81,7 +83,7 @@ def test_native_prompt_key_value_matches_the_python_heads_and_dtype(block):
         linears, weights["attn2.k_norm.weight"], weights["prompt_scale_shift_table"], cond.prompt_rows, context
     )
     for got, want in zip(actual, expected):
-        assert got.dtype == want.dtype == T.prompt_attention_dtype(DEVICE)
+        assert got.dtype == want.dtype == half_dtype(DEVICE)
         assert _relative_error(got, want) < tolerance
 
 
@@ -130,7 +132,8 @@ def test_native_int8_attention_is_comfy_kitchens_bit_for_bit(int8_block, head_di
     heads = 4096 // head_dim
     generator = torch.Generator(device=DEVICE).manual_seed(rows * head_dim)
     q, k, v = (torch.randn(rows, heads * head_dim, generator=generator, device=DEVICE).to(torch.bfloat16) for _ in range(3))
-    attention = int8_block.block.self_attention(q, k, v, rows, heads, head_dim, native.attention_cta_k(head_dim, rows))
+    cta_k = native.HIP_ATTENTION_CTA_K if AMD else native.attention_cta_k(head_dim, rows)
+    attention = int8_block.block.self_attention(q, k, v, rows, heads, head_dim, cta_k)
 
     def heads_first(t: torch.Tensor) -> torch.Tensor:
         return t.view(1, rows, heads, head_dim).transpose(1, 2)
@@ -139,6 +142,34 @@ def test_native_int8_attention_is_comfy_kitchens_bit_for_bit(int8_block, head_di
     assert torch.equal(attention, expected[0].transpose(0, 1))
     exact = F.scaled_dot_product_attention(heads_first(q).float(), heads_first(k).float(), heads_first(v).float())
     assert _relative_error(attention, exact[0].transpose(0, 1)) < 3e-2
+
+
+# 100 / 500 / 4096 tokens per half: comfy-kitchen's short-key rotation, lengths off the tiles, a 512 canvas
+@pytest.mark.parametrize("frames, side", [(1, 10), (5, 10), (16, 16)])
+def test_native_normed_self_attention_is_norm_rope_then_self_attention(int8_block, frames, side):
+    rows, dim, heads = 2 * frames * side * side, 4096, T.HEADS
+    head_dim = dim // heads
+    generator = torch.Generator(device=DEVICE).manual_seed(rows)
+
+    def projection(shared: float) -> torch.Tensor:  # rows of widely different norms, some outlier channels
+        values = torch.randn(rows, dim, generator=generator, device=DEVICE) + shared * torch.randn(
+            dim, generator=generator, device=DEVICE)
+        values *= torch.logspace(-3, 2, rows, device=DEVICE)[torch.randperm(rows, generator=generator, device=DEVICE)][:, None]
+        values[:, ::97] *= 20
+        return values.to(torch.bfloat16)
+
+    # keys sharing a direction, so comfy-kitchen's K anchor subtraction kicks in
+    q_projection, k_projection, v = projection(0), projection(4), projection(0)
+    q_norm, k_norm = ((1 + 0.2 * torch.randn(dim, generator=generator, device=DEVICE)).to(torch.bfloat16) for _ in range(2))
+    rope = T.build_rope(frames, side, side, dim=dim, heads=heads, device=DEVICE)
+    cta_k = native.HIP_ATTENTION_CTA_K if AMD else native.attention_cta_k(head_dim, rows)
+    module = native._extension()
+    q, k = torch.empty_like(q_projection), torch.empty_like(k_projection)
+    module.norm_rope(q_projection, q_norm, rope.cos, rope.sin, q, head_dim, T.EPS)
+    module.norm_rope(k_projection, k_norm, rope.cos, rope.sin, k, head_dim, T.EPS)
+    expected = int8_block.block.self_attention(q, k, v, rows, heads, head_dim, cta_k)
+    actual = int8_block.block.normed_self_attention(q_projection, k_projection, v, q_norm, k_norm, rope.cos, rope.sin, cta_k)
+    assert torch.equal(actual, expected)
 
 
 def test_native_block_is_deterministic(block):

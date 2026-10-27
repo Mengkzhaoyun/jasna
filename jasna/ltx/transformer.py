@@ -30,6 +30,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from jasna.tensor_utils import half_dtype
+
 Weights = Mapping[str, torch.Tensor]
 
 NUM_BLOCKS = 48
@@ -116,6 +118,8 @@ def int8_linear(
         codes, act_scales = _quant_kernels.int8_rotate_quantize(flat)
         out = _quant_kernels.int8_scaled_mm(codes, act_scales, qdata, scales, bias)
         return out.reshape(*x.shape[:-1], out_features)
+    if _kitchen_int8_linear is not None and x.is_cuda:
+        return _kitchen_int8_linear(x, qdata, scales, bias)
     out = torch.empty(flat.shape[0], out_features, dtype=x.dtype, device=x.device)
     for start in range(0, flat.shape[0], CHUNK_ROWS):
         chunk = flat[start : start + CHUNK_ROWS]
@@ -284,102 +288,143 @@ def linear(w: Weights, name: str, x: torch.Tensor | QuantizedRows | Fp4Activatio
 
 
 _quant_kernels = None
+_kitchen_int8_linear = None
 
 
-def enable_quant_kernels(device: torch.device) -> bool:
-    """Route the INT8 and NVFP4 linears through the fused Triton kernels (``kernels.py``,
-    on the GPU architectures ``kernels.supports``) as opaque ops, so they compile
-    as calls; an INT8 block also fuses its norms, AdaLN modulation and feed-forward residual
-    into them. Returns whether they are in use."""
-    global _quant_kernels
-    if _quant_kernels is None and device.type == "cuda" and torch.version.cuda is not None:
-        from jasna.ltx import kernels
+def enable_quant_kernels(device: torch.device) -> str | None:
+    """Route the INT8 and NVFP4 linears through fused kernels: the Triton kernels of ``kernels.py``
+    on the GPU architectures ``kernel_policy.supports``, as opaque ops so they compile as calls (an INT8
+    block also fuses its norms, AdaLN modulation and feed-forward residual into them); else on AMD
+    comfy-kitchen's ConvRot INT8 linear (Windows ROCm has no Triton). Returns the kernels in use."""
+    global _quant_kernels, _kitchen_int8_linear
+    if _quant_kernels is None and _kitchen_int8_linear is None and device.type == "cuda":
+        if importlib.util.find_spec("triton") is not None:
+            from jasna.ltx import kernel_policy, kernels
 
-        if not kernels.supports(device):
-            return False
+            if kernel_policy.supports(device):
+                _quant_kernels = _triton_ops(kernels)
+        if _quant_kernels is None and torch.version.hip:
+            import comfy_kitchen
 
-        @torch.library.custom_op("jasna::int8_rotate_quantize", mutates_args=())
-        def int8_rotate_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-            return kernels.rotate_quantize(x.contiguous())
+            _kitchen_int8_linear = functools.partial(comfy_kitchen.int8_linear, convrot=True, convrot_groupsize=ROT_SIZE)
+    if _quant_kernels is not None:
+        return "Triton kernels"
+    return "comfy-kitchen" if _kitchen_int8_linear is not None else None
 
-        @int8_rotate_quantize.register_fake
-        def _(x):
-            return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[0], dtype=torch.float32)
 
-        @torch.library.custom_op("jasna::int8_modulate_rotate_quantize", mutates_args=())
-        def int8_modulate_rotate_quantize(
-            x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return kernels.modulate_rotate_quantize(x.contiguous(), shift, scale)
+def _triton_ops(kernels) -> SimpleNamespace:
+    @torch.library.custom_op("jasna::int8_rotate_quantize", mutates_args=())
+    def int8_rotate_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return kernels.rotate_quantize(x.contiguous())
 
-        @int8_modulate_rotate_quantize.register_fake
-        def _(x, shift, scale):
-            return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[0], dtype=torch.float32)
+    @int8_rotate_quantize.register_fake
+    def _(x):
+        return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[0], dtype=torch.float32)
 
-        @torch.library.custom_op("jasna::int8_scaled_mm", mutates_args=())
-        def int8_scaled_mm(
-            codes: torch.Tensor,
-            act_scales: torch.Tensor,
-            qdata: torch.Tensor,
-            scales: torch.Tensor,
-            bias: torch.Tensor | None,
-        ) -> torch.Tensor:
-            return kernels.int8_scaled_mm(codes, act_scales, qdata, scales, bias, False)
+    @torch.library.custom_op("jasna::int8_modulate_rotate_quantize", mutates_args=())
+    def int8_modulate_rotate_quantize(
+        x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return kernels.modulate_rotate_quantize(x.contiguous(), shift, scale)
 
-        @int8_scaled_mm.register_fake
-        def _(codes, act_scales, qdata, scales, bias):
-            return codes.new_empty(codes.shape[0], qdata.shape[0], dtype=torch.bfloat16)
+    @int8_modulate_rotate_quantize.register_fake
+    def _(x, shift, scale):
+        return x.new_empty(x.shape, dtype=torch.int8), x.new_empty(x.shape[0], dtype=torch.float32)
 
-        @torch.library.custom_op("jasna::int8_feed_forward", mutates_args=())
-        def int8_feed_forward(
-            codes: torch.Tensor,
-            act_scales: torch.Tensor,
-            up_qdata: torch.Tensor,
-            up_scales: torch.Tensor,
-            up_bias: torch.Tensor | None,
-            down_qdata: torch.Tensor,
-            down_scales: torch.Tensor,
-            down_bias: torch.Tensor | None,
-            residual: torch.Tensor,
-            gate: torch.Tensor,
-        ) -> torch.Tensor:
-            return kernels.int8_feed_forward(
-                codes, act_scales, up_qdata, up_scales, up_bias, down_qdata, down_scales, down_bias,
-                residual, gate, CHUNK_ROWS,
-            )
+    @torch.library.custom_op("jasna::int8_scaled_mm", mutates_args=())
+    def int8_scaled_mm(
+        codes: torch.Tensor,
+        act_scales: torch.Tensor,
+        qdata: torch.Tensor,
+        scales: torch.Tensor,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return kernels.int8_scaled_mm(codes, act_scales, qdata, scales, bias, False)
 
-        @int8_feed_forward.register_fake
-        def _(codes, act_scales, up_qdata, up_scales, up_bias, down_qdata, down_scales, down_bias, residual, gate):
-            return torch.empty_like(residual, memory_format=torch.contiguous_format)
+    @int8_scaled_mm.register_fake
+    def _(codes, act_scales, qdata, scales, bias):
+        return codes.new_empty(codes.shape[0], qdata.shape[0], dtype=torch.bfloat16)
 
-        @torch.library.custom_op("jasna::quantize_fp4", mutates_args=())
-        def quantize_fp4_op(
-            x: torch.Tensor, tensor_scale: torch.Tensor, gelu: bool
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return kernels.quantize_fp4(x.contiguous(), tensor_scale, gelu)
+    @torch.library.custom_op("jasna::int8_gated_rotate_quantize", mutates_args=())
+    def int8_gated_rotate_quantize(heads: torch.Tensor, gate_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return kernels.gated_rotate_quantize(heads.contiguous(), gate_logits.contiguous())
 
-        @quantize_fp4_op.register_fake
-        def _(x, tensor_scale, gelu):
-            rows, k = x.shape
-            return (
-                x.new_empty(rows, k // 2, dtype=torch.uint8),
-                x.new_empty(kernels.fp4_scale_shape(rows, k), dtype=torch.float8_e4m3fn),
-            )
+    @int8_gated_rotate_quantize.register_fake
+    def _(heads, gate_logits):
+        count, rows, head_dim = heads.shape
+        return heads.new_empty(rows, count * head_dim, dtype=torch.int8), heads.new_empty(rows, dtype=torch.float32)
 
-        _quant_kernels = SimpleNamespace(
-            int8_rotate_quantize=int8_rotate_quantize,
-            int8_modulate_rotate_quantize=int8_modulate_rotate_quantize,
-            int8_scaled_mm=int8_scaled_mm,
-            int8_feed_forward=int8_feed_forward,
-            quantize_fp4=quantize_fp4_op,
+    @torch.library.custom_op("jasna::int8_residual_mm", mutates_args=())
+    def int8_residual_mm(
+        codes: torch.Tensor,
+        act_scales: torch.Tensor,
+        qdata: torch.Tensor,
+        scales: torch.Tensor,
+        bias: torch.Tensor | None,
+        residual: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        return kernels.int8_residual_mm(codes, act_scales, qdata, scales, bias, residual, gate)
+
+    @int8_residual_mm.register_fake
+    def _(codes, act_scales, qdata, scales, bias, residual, gate):
+        return torch.empty_like(residual, memory_format=torch.contiguous_format)
+
+    @torch.library.custom_op("jasna::int8_feed_forward", mutates_args=())
+    def int8_feed_forward(
+        codes: torch.Tensor,
+        act_scales: torch.Tensor,
+        up_qdata: torch.Tensor,
+        up_scales: torch.Tensor,
+        up_bias: torch.Tensor | None,
+        down_qdata: torch.Tensor,
+        down_scales: torch.Tensor,
+        down_bias: torch.Tensor | None,
+        residual: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor:
+        return kernels.int8_feed_forward(
+            codes, act_scales, up_qdata, up_scales, up_bias, down_qdata, down_scales, down_bias,
+            residual, gate, CHUNK_ROWS,
         )
-    return _quant_kernels is not None
+
+    @int8_feed_forward.register_fake
+    def _(codes, act_scales, up_qdata, up_scales, up_bias, down_qdata, down_scales, down_bias, residual, gate):
+        return torch.empty_like(residual, memory_format=torch.contiguous_format)
+
+    @torch.library.custom_op("jasna::quantize_fp4", mutates_args=())
+    def quantize_fp4_op(
+        x: torch.Tensor, tensor_scale: torch.Tensor, gelu: bool
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return kernels.quantize_fp4(x.contiguous(), tensor_scale, gelu)
+
+    @quantize_fp4_op.register_fake
+    def _(x, tensor_scale, gelu):
+        rows, k = x.shape
+        return (
+            x.new_empty(rows, k // 2, dtype=torch.uint8),
+            x.new_empty(kernels.fp4_scale_shape(rows, k), dtype=torch.float8_e4m3fn),
+        )
+
+    return SimpleNamespace(
+        int8_rotate_quantize=int8_rotate_quantize,
+        int8_modulate_rotate_quantize=int8_modulate_rotate_quantize,
+        int8_scaled_mm=int8_scaled_mm,
+        int8_gated_rotate_quantize=int8_gated_rotate_quantize,
+        int8_residual_mm=int8_residual_mm,
+        int8_feed_forward=int8_feed_forward,
+        # AMD also quantizes gated attention outputs straight from their heads and adds the attention
+        # residuals in the output projections' epilogue (fewer passes over the block's activations).
+        attention_epilogues=torch.version.hip is not None,
+        quantize_fp4=quantize_fp4_op,
+    )
 
 
 def require_kernels(device: torch.device) -> None:
-    """Fail unless Triton and comfy-kitchen's INT8 attention can run on ``device``: without them
-    every LTX pass would run on far slower fallbacks."""
-    for package in ("triton", "comfy_kitchen"):
+    """Fail unless Triton (NVIDIA; AMD without it runs comfy-kitchen and prebuilt kernels) and
+    comfy-kitchen's INT8 attention can run on ``device``: without them every LTX pass would run on
+    far slower fallbacks."""
+    for package in ("comfy_kitchen",) if torch.version.hip else ("triton", "comfy_kitchen"):
         if importlib.util.find_spec(package) is None:
             raise RuntimeError(f"LTX restoration needs {package}, which is missing from this install. Reinstall Jasna.")
     import comfy_kitchen
@@ -413,6 +458,16 @@ def enable_int8_attention() -> None:
 def self_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     """Video self-attention ``[1, heads, tokens, d]``: INT8 attention once enabled."""
     if _int8_attention is not None and q.is_cuda:
+        return _int8_attention(q, k, v)
+    with sdpa_kernel(SDPA_PRIORITY, set_priority=True):
+        return F.scaled_dot_product_attention(q, k, v)
+
+
+def cross_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Prompt cross-attention ``[1, heads, tokens, d]`` against ``[1, heads, prompt, d]``: INT8 attention
+    on AMD once enabled (twice AOTriton's flash speed on RDNA4, and Windows ROCm ships no AOTriton
+    kernels), else SDPA (on NVIDIA INT8 is slower here)."""
+    if _int8_attention is not None and torch.version.hip and q.is_cuda:
         return _int8_attention(q, k, v)
     with sdpa_kernel(SDPA_PRIORITY, set_priority=True):
         return F.scaled_dot_product_attention(q, k, v)
@@ -546,27 +601,42 @@ def _gated(w: Weights, prefix: str, x: torch.Tensor | QuantizedRows, out: torch.
     return (out.unflatten(-1, (heads, -1)) * gates.unsqueeze(-1)).flatten(2)
 
 
-def _self_attention(w: Weights, x: torch.Tensor | QuantizedRows, rope: Rope, heads: int, *, skip: bool) -> torch.Tensor:
+def _gated_heads(
+    w: Weights, prefix: str, x: torch.Tensor | QuantizedRows, out: torch.Tensor, heads: int
+) -> torch.Tensor | QuantizedRows:
+    """``_gated`` of attention output heads ``[1, heads, tokens, d]``, quantized for the output
+    projection when the attention epilogues are fused."""
+    if isinstance(x, QuantizedRows) and _quant_kernels.attention_epilogues:
+        logits = linear(w, f"{prefix}.to_gate_logits", x)
+        return QuantizedRows(*_quant_kernels.int8_gated_rotate_quantize(out[0], logits[0]))
+    return _gated(w, prefix, x, out.transpose(1, 2).flatten(2), heads)
+
+
+def _residual_linear(
+    w: Weights, name: str, x: torch.Tensor | QuantizedRows, residual: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """``residual + _gate(linear(w, name, x), gate)``, in the GEMM epilogue for quantized ``x`` when the
+    attention epilogues are fused."""
+    if isinstance(x, QuantizedRows) and _quant_kernels.attention_epilogues:
+        return _quant_kernels.int8_residual_mm(
+            x.codes, x.scales, w[f"{name}.qdata"], w[f"{name}.scales"], w.get(f"{name}.bias"), residual[0], gate[0],
+        )[None]
+    return residual + _gate(linear(w, name, x), gate)
+
+
+def _self_attention(
+    w: Weights, x: torch.Tensor | QuantizedRows, rope: Rope, heads: int, *, skip: bool
+) -> torch.Tensor | QuantizedRows:
     """Gated video self-attention output before its ``to_out.0`` projection; NVFP4 Q/K/V
     projections share one quantization of ``x``."""
     qkv_in = _shared_fp4_input(w, "attn1.to_v", x)
     v = linear(w, "attn1.to_v", qkv_in)
     if skip:
-        out = v
-    else:
-        q = rms_norm(linear(w, "attn1.to_q", qkv_in), w["attn1.q_norm.weight"])
-        k = rms_norm(linear(w, "attn1.to_k", qkv_in), w["attn1.k_norm.weight"])
-        out = self_attention(_apply_rope(q, rope, heads), _apply_rope(k, rope, heads), _heads(v, heads))
-        out = out.transpose(1, 2).flatten(2)
-    return _gated(w, "attn1", x, out, heads)
-
-
-def prompt_attention_dtype(device: torch.device) -> torch.dtype:
-    """Dtype of the prompt key/value heads: bf16, or fp16 on CUDA GPUs before SM 8.0, where
-    no fused attention kernel takes bf16."""
-    if device.type == "cuda" and torch.cuda.get_device_properties(device).major < 8:
-        return torch.float16
-    return torch.bfloat16
+        return _gated(w, "attn1", x, v, heads)
+    q = rms_norm(linear(w, "attn1.to_q", qkv_in), w["attn1.q_norm.weight"])
+    k = rms_norm(linear(w, "attn1.to_k", qkv_in), w["attn1.k_norm.weight"])
+    out = self_attention(_apply_rope(q, rope, heads), _apply_rope(k, rope, heads), _heads(v, heads))
+    return _gated_heads(w, "attn1", x, out, heads)
 
 
 def prompt_key_value(
@@ -580,20 +650,19 @@ def prompt_key_value(
         prompt = QuantizedRows(*_quant_kernels.int8_rotate_quantize(prompt[0]))
     prompt = _shared_fp4_input(w, "attn2.to_v", prompt)
     key = rms_norm(linear(w, "attn2.to_k", prompt), w["attn2.k_norm.weight"])
-    dtype = prompt_attention_dtype(context.device)
+    dtype = half_dtype(context.device)
     return _heads(key, heads).to(dtype), _heads(linear(w, "attn2.to_v", prompt), heads).to(dtype)
 
 
 def _cross_attention(
     w: Weights, x: torch.Tensor | QuantizedRows, prompt: tuple[torch.Tensor, torch.Tensor], heads: int
-) -> torch.Tensor:
+) -> torch.Tensor | QuantizedRows:
     """Gated prompt cross-attention output before its ``to_out.0`` projection, computed in the
     prompt key/value dtype."""
     q = rms_norm(linear(w, "attn2.to_q", x), w["attn2.q_norm.weight"])
     key, value = prompt
-    with sdpa_kernel(SDPA_PRIORITY, set_priority=True):
-        out = F.scaled_dot_product_attention(_heads(q, heads).to(key.dtype), key, value).to(q.dtype)
-    return _gated(w, "attn2", x, out.transpose(1, 2).flatten(2), heads)
+    out = cross_attention(_heads(q, heads).to(key.dtype), key, value).to(q.dtype)
+    return _gated_heads(w, "attn2", x, out, heads)
 
 
 def block_forward(
@@ -612,10 +681,10 @@ def block_forward(
     fused = _quant_kernels is not None and x.is_cuda and "ff.net.2.qdata" in w
     attn_in = _modulated(x, ada[:, :, 0], ada[:, :, 1], fused)
     attn_out = _self_attention(w, attn_in, rope, heads, skip=skip_self_attention)
-    x = x + _gate(linear(w, "attn1.to_out.0", attn_out), ada[:, :, 2])
+    x = _residual_linear(w, "attn1.to_out.0", attn_out, x, ada[:, :, 2])
     query = _modulated(x, ada[:, :, 6], ada[:, :, 7], fused)
     attn_out = _cross_attention(w, query, prompt, heads)
-    x = x + _gate(linear(w, "attn2.to_out.0", attn_out), ada[:, :, 8])
+    x = _residual_linear(w, "attn2.to_out.0", attn_out, x, ada[:, :, 8])
     ff_in = _modulated(x, ada[:, :, 3], ada[:, :, 4], fused)
     if fused:
         return _quant_kernels.int8_feed_forward(

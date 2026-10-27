@@ -20,7 +20,6 @@ from pathlib import Path
 import torch
 
 from jasna._frozen import is_frozen
-from jasna.ltx import native
 from jasna.ltx import transformer as T
 from jasna.ltx.blocks import BlockStore, OpaqueBlockStore
 from jasna.ltx.model_files import PlaceholderHandle, PlaceholderTensors, open_tensors
@@ -140,13 +139,15 @@ def _block_functions(
     """(block forward, prompt key/value, backend name) for plain-tensor blocks: the native block
     when it can run here, with eager prompt keys/values (once per block and step), else both
     compiled."""
+    from jasna.ltx import native
+
     native_forward = native.load(device, block_specs)
     if native_forward is not None:
         return native_forward, T.prompt_key_value, "native"
     T.enable_int8_attention()
     return (
         compiled_block_forward(device),
-        compile_static(T.prompt_key_value, mode="max-autotune-no-cudagraphs", device=device),
+        compile_static(T.prompt_key_value, mode="max-autotune-no-cudagraphs", device=device, dtype=torch.bfloat16),
         "torch.compile",
     )
 
@@ -187,7 +188,7 @@ class LtxTransformer:
                     self.blocks = OpaqueBlockStore.from_reader(handle, names, device, resident=resident)
                 else:
                     self.blocks = BlockStore.from_reader(handle, names, device, resident=resident)
-            logger.info("LTX quantized linears: %s", "Triton kernels" if T.enable_quant_kernels(device) else "torch")
+            logger.info("LTX quantized linears: %s", T.enable_quant_kernels(device) or "torch")
             if isinstance(self.blocks, OpaqueBlockStore):
                 T.enable_int8_attention()
             else:
@@ -403,7 +404,7 @@ def compiled_block_forward(device: torch.device):
     are autotuned on the first compile and the picks kept in the compile cache
     (``engine_paths.configure_torch_compile_cache``), so later runs reuse them and a seed
     keeps its pixels. No CUDA graphs: every block passes its own weight tensors."""
-    return compile_static(T.block_forward, mode="max-autotune-no-cudagraphs", device=device)
+    return compile_static(T.block_forward, mode="max-autotune-no-cudagraphs", device=device, dtype=torch.bfloat16)
 
 
 def _euler(sample: torch.Tensor, denoised: torch.Tensor, sigmas: torch.Tensor, step: int) -> torch.Tensor:

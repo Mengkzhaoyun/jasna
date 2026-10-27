@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import struct
 import subprocess
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from jasna.media.audio_utils import source_audio_codec
 from jasna.media.probe import get_video_meta_data
 from jasna.media.splice import (
     SpliceSpan,
+    build_splice_plan,
     concatenate_fragments,
     create_copy_fragment,
     mux_final_output,
@@ -20,8 +22,13 @@ from jasna.media.splice import (
     resolve_smart_encoder_settings,
 )
 from jasna.os_utils import resolve_executable, subprocess_no_window_kwargs
+from jasna.segments import SegmentRange
 
-from factories import write_double_adts_aac_source, write_non_utf8_metadata_source
+from factories import (
+    write_double_adts_aac_source,
+    write_hrd_timing_sei_source,
+    write_non_utf8_metadata_source,
+)
 
 
 def _ffmpeg(*args: str) -> None:
@@ -34,6 +41,78 @@ def _ffmpeg(*args: str) -> None:
     )
     if completed.returncode != 0:
         pytest.fail(completed.stderr)
+
+
+def _shorten_mp4_video_duration(path: Path, ticks: int) -> None:
+    """Lower the video track's mdhd duration, leaving every sample in place."""
+    data = bytearray(path.read_bytes())
+
+    def boxes(start: int, end: int):
+        while start + 8 <= end:
+            size, kind = struct.unpack_from(">I4s", data, start)
+            yield start, size, kind
+            start += size
+
+    def child(start: int, size: int, kind: bytes) -> int:
+        return next(at for at, _, k in boxes(start + 8, start + size) if k == kind)
+
+    moov, moov_size = next((at, size) for at, size, kind in boxes(0, len(data)) if kind == b"moov")
+    for trak, trak_size, kind in boxes(moov + 8, moov + moov_size):
+        if kind != b"trak":
+            continue
+        mdia = child(trak, trak_size, b"mdia")
+        mdia_size = struct.unpack_from(">I", data, mdia)[0]
+        hdlr = child(mdia, mdia_size, b"hdlr")
+        if data[hdlr + 16 : hdlr + 20] != b"vide":
+            continue
+        mdhd = child(mdia, mdia_size, b"mdhd")
+        field, offset = (">Q", 32) if data[mdhd + 8] == 1 else (">I", 24)
+        (duration,) = struct.unpack_from(field, data, mdhd + offset)
+        struct.pack_into(field, data, mdhd + offset, duration - ticks)
+        path.write_bytes(bytes(data))
+        return
+    raise AssertionError(f"{path} has no video track")
+
+
+def test_copy_span_keeps_frames_past_the_recorded_video_duration(tmp_path: Path) -> None:
+    # Some MP4s, e.g. lossless cuts of B-frame streams, record a video duration that
+    # ends before the last frame. The tail copy must still carry that frame: the
+    # B-frames shown before it reference it.
+    source = tmp_path / "short-duration.mp4"
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=12:duration=3",
+        "-an",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-g", "12",
+        "-keyint_min", "12",
+        "-bf", "3",
+        "-x264-params", "scenecut=0",
+        str(source),
+    )
+    with av.open(str(source)) as container:
+        stream = container.streams.video[0]
+        frame_ticks = round(1 / (stream.average_rate * stream.time_base))
+    _shorten_mp4_video_duration(source, frame_ticks)
+    with av.open(str(source)) as container:
+        stream = container.streams.video[0]
+        last_pts = max(packet.pts for packet in container.demux(stream) if packet.pts is not None)
+        assert stream.start_time + stream.duration <= last_pts
+    with av.open(str(source)) as container:
+        source_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    assert len(source_frames) == 36
+
+    metadata = get_video_meta_data(str(source))
+    index = probe_keyframes(source, metadata)
+    assert index.end_pts > last_pts
+
+    copied = tmp_path / "tail.nut"
+    create_copy_fragment(source, SpliceSpan("copy", index.pts[-1], index.end_pts), index, copied, codec="h264")
+    with av.open(str(copied)) as container:
+        tail_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+    assert len(tail_frames) == 12
+    for frame_index, frame in enumerate(tail_frames):
+        assert np.array_equal(frame, source_frames[24 + frame_index])
 
 
 def test_h264_probe_resolves_source_compatible_smart_settings(tmp_path: Path) -> None:
@@ -155,6 +234,121 @@ def test_mixed_encoder_splice_decodes_with_exact_duration_and_audio(
         render_frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
     for frame_index in range(12):
         assert np.array_equal(output_frames[12 + frame_index], render_frames[frame_index])
+
+
+@pytest.mark.parametrize(
+    "selections",
+    [
+        [SegmentRange(1.2, 1.8)],
+        [SegmentRange(1.1, 1.4), SegmentRange(3.1, 3.5)],
+    ],
+)
+def test_splice_keeps_source_timestamps_of_hrd_timing_sei_source(
+    tmp_path: Path, selections: list[SegmentRange]
+) -> None:
+    source = write_hrd_timing_sei_source(tmp_path / "hrd.mp4")
+    metadata = get_video_meta_data(str(source))
+    index = probe_keyframes(source, metadata)
+    plan = build_splice_plan(selections, index, duration=metadata.duration)
+    assert [span.kind for span in plan.spans][:2] == ["copy", "render"]
+
+    fragments = []
+    for span_index, span in enumerate(plan.spans):
+        raw = tmp_path / f"raw-{span_index}.nut"
+        duration = float((span.end_pts - span.start_pts) * index.time_base)
+        if span.kind == "copy":
+            create_copy_fragment(source, span, index, raw, codec="h264")
+        else:
+            _ffmpeg(
+                "-ss", f"{index.seconds_for_pts(span.start_pts):.6f}",
+                "-i", str(source),
+                "-t", f"{duration:.6f}",
+                "-map", "0:v:0",
+                "-an",
+                "-vf", "hue=s=0",
+                "-c:v", "libx264", "-profile:v", "main",
+                "-g", "30", "-bf", "3", "-flags", "+cgop", "-b:v", "500k",
+                "-x264-params", "nal-hrd=vbr:vbv-maxrate=1000:vbv-bufsize=2000",
+                "-f", "nut",
+                str(raw),
+            )
+        normalized = tmp_path / f"part-{span_index}.ts"
+        normalize_fragment(raw, normalized, codec="h264")
+        fragments.append((normalized, duration))
+    assembled = tmp_path / "assembled.ts"
+    concatenate_fragments(fragments, manifest=tmp_path / "parts.ffconcat", destination=assembled, codec="h264")
+    output = tmp_path / "output.mp4"
+    mux_final_output(assembled, source, output, codec="h264")
+
+    def shown_seconds(path: Path) -> list[float]:
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            return sorted(
+                round(float((packet.pts - stream.start_time) * stream.time_base), 4)
+                for packet in container.demux(stream)
+                if packet.size
+            )
+
+    assert shown_seconds(output) == shown_seconds(source)
+
+
+@pytest.mark.parametrize("selection", [SegmentRange(0.0, 0.25), SegmentRange(0.9, 1.1)])
+def test_mid_gop_cut_splices_to_the_shown_frames_and_duration(tmp_path: Path, selection: SegmentRange) -> None:
+    # A `-c copy` cut at 1.5 s keeps the GOP from 1.0 s as a hidden lead-in, so the
+    # shown video starts half a GOP before the first keyframe at or after its start.
+    full = tmp_path / "full.mp4"
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=12:duration=4.5",
+        "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=4.5",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-g", "12", "-keyint_min", "12", "-sc_threshold", "0", "-bf", "3",
+        "-c:a", "aac",
+        str(full),
+    )
+    source = tmp_path / "cut.mp4"
+    _ffmpeg("-ss", "1.5", "-i", str(full), "-c", "copy", str(source))
+    metadata = get_video_meta_data(str(source))
+    index = probe_keyframes(source, metadata)
+    assert index.pts[0] < index.start_pts
+    plan = build_splice_plan([selection], index, duration=metadata.duration)
+
+    fragments = []
+    for span_index, span in enumerate(plan.spans):
+        raw = tmp_path / f"raw-{span_index}.nut"
+        if span.kind == "copy":
+            assert span.start_pts in index.pts
+            create_copy_fragment(source, span, index, raw, codec="h264")
+        else:
+            _ffmpeg(
+                "-ss", f"{index.seconds_for_pts(span.start_pts):.6f}",
+                "-i", str(source),
+                "-t", f"{float((span.end_pts - span.start_pts) * index.time_base):.6f}",
+                "-map", "0:v:0",
+                "-an",
+                "-c:v", "libx264",
+                "-g", "12", "-bf", "3", "-flags", "+cgop",
+                "-f", "nut",
+                str(raw),
+            )
+        normalized = tmp_path / f"part-{span_index}.ts"
+        normalize_fragment(raw, normalized, codec="h264")
+        fragments.append((normalized, float((span.end_pts - span.start_pts) * index.time_base)))
+    assembled = tmp_path / "assembled.ts"
+    concatenate_fragments(fragments, manifest=tmp_path / "parts.ffconcat", destination=assembled, codec="h264")
+    output = tmp_path / "output.mp4"
+    mux_final_output(assembled, source, output, codec="h264")
+
+    with av.open(str(source)) as container:
+        source_frames = sum(1 for _ in container.decode(video=0))
+    with av.open(str(output)) as container:
+        assert sum(1 for _ in container.decode(video=0)) == source_frames
+        video, audio = container.streams.video[0], container.streams.audio[0]
+        video_seconds = float(video.duration * video.time_base)
+        assert video_seconds == pytest.approx(source_frames / 12, abs=0.01)
+        assert float(audio.start_time * audio.time_base) == pytest.approx(
+            float(video.start_time * video.time_base), abs=0.05
+        )
 
 
 @pytest.mark.parametrize(
@@ -357,3 +551,28 @@ def test_source_with_non_utf8_tags_probes_and_splices(tmp_path: Path) -> None:
     with av.open(str(output), metadata_errors="replace") as container:
         assert container.metadata["title"] == "JASNA\ufffdTAG"
         assert container.streams.audio
+
+
+def test_restored_fragment_with_long_multibyte_title_splices_and_keeps_title(tmp_path: Path) -> None:
+    title = "長いタイトル" * 20
+    assert len(title) < 255 < len(title.encode("utf-8"))
+    source = tmp_path / "long-title.mp4"
+    _ffmpeg(
+        "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=12:duration=1",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-metadata", f"title={title}",
+        str(source),
+    )
+    restored = tmp_path / "restored.nut"
+    _ffmpeg("-i", str(source), "-map", "0:v:0", "-c:v", "libx264", "-f", "nut", str(restored))
+    with av.open(str(restored)) as container:
+        assert container.metadata["title"] == title
+
+    normalized = tmp_path / "restored.ts"
+    normalize_fragment(restored, normalized, codec="h264")
+    output = tmp_path / "output.mp4"
+    mux_final_output(normalized, source, output, codec="h264")
+
+    with av.open(str(output)) as container:
+        assert container.metadata["title"] == title

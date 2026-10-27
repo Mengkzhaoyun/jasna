@@ -41,7 +41,7 @@ Jasna 优先使用 `TMP`，其次使用 `TEMP`。不使用 `TMPDIR`。
 | `--output` | — | 输出文件；当 `--input` 是文件夹时为输出文件夹。 |
 | `--output-pattern` | `{original}_out` | 文件夹输入的文件名模板。`{original}` 是输入文件名主干。图片保留源扩展名；视频在模板提供扩展名时使用该扩展名。Jasna 会在处理前检查计划输出路径，如果两个输入映射到同一个文件则报错退出。 |
 | `--device` | `cuda:0` | GPU 选择。AMD 显卡通过 ROCm 也使用相同的 `cuda:N` 名称。 |
-| `--batch-size` | `4` | 检测批处理大小。旧版 `rfdetr-v5` 始终使用 4。 |
+| `--batch-size` | `4`，AMD 为 `8` | 检测批处理大小。旧版 `rfdetr-v5` 始终使用 4。 |
 | `--fp16` / `--no-fp16` | 开启 | 半精度：占用更少显存，通常更快，看不出画质损失。 |
 | `--log-level` | `error` | `debug`、`info`、`warning`、`error`。 |
 | `--no-progress` | 关闭 | 禁用进度条。 |
@@ -114,19 +114,25 @@ Jasna 优先使用 `TMP`，其次使用 `TEMP`。不使用 `TMPDIR`。
 | ------ | ------- | ----- |
 | `--vr-mode` | `auto` | `auto`、`off`、`sbs`、`sbs-fisheye`。见 [VR180](vr180.md)。 |
 
+## 继续 LTX 任务
+
+按 Ctrl+C、出错或关闭应用后，重新运行同一 LTX 命令即可从已保存的进度继续。
+`--segments` 和 `--ltx-auto-split` 也支持。未完成的跟踪段可能需要重做，输出保存会从头开始。
+如果输入、设置或应用版本改变，替换进度前会先询问；没有交互终端时会停止并保留进度。
+
 ## 编码
 
 | 选项 | 默认值 | 说明 |
 | ------ | ------- | ----- |
 | `--codec` | `hevc` | 离线输出可选 `hevc`、`h264` 或 `av1`。HLS 流媒体始终使用 H.264。 |
-| `--cq` | 根据 GPU/编解码器 | 视频质量。越低质量越好、文件越大。NVIDIA 默认值：H.264 25、HEVC 28、AV1 35；AMD 默认值：H.264 24、HEVC 25、AV1 32。 |
+| `--cq` | 根据 GPU/编解码器 | 视频质量。越低质量越好、文件越大。NVIDIA 默认值：H.264 25、HEVC 28、AV1 35；AMD 默认值：H.264 24、HEVC 25、AV1 16。 |
 | `--encoder-settings` | — | JSON 对象或逗号分隔的高级 `key=value` 设置，例如 `{"rc-lookahead":32}` 或 `rc-lookahead=32,bf=4`。见下文。 |
 | `--lut` | — | `.cube` 色彩 LUT（1D 或 3D），在写入视频时应用。也可在 GUI 的编码设置部分设置。 |
 | `--sharpen` | `0` | 编码前锐化画面，取值 `0`（关闭）到 `1`（最强）。与 ffmpeg 的 `cas` 滤镜一致，无需二次转码。见[高级处理](advanced_processing.md)。 |
 | `--retarget-high-fps` | 关闭 | 每两帧保留一帧，实现 60 → 30 FPS（以及 59.94 → 29.97）。其他帧率不变；音频保持同步。不能与 `--stream` 或 `--segments` 同时使用。 |
 | `--fmp4` | 关闭 | `.mp4`/`.mov` 输出在生成过程中即可播放，任务中断后仍可播放。不能与 `--stream`、`--segments` 或 `--ltx-auto-split` 同时使用。见[高级处理](advanced_processing.md)。 |
 | `--segments` | — | 只修复一个视频中的这些区间，单位为秒或 `mm:ss`，例如 `10-25,01:10-01:30.5`。不能与 `--stream`、`--retarget-high-fps`、`--fmp4` 或 `--ltx-auto-split` 同时使用，也不能用于图片或文件夹输入。见[区间](segments.md)。 |
-| `--working-directory` | 输出目录 | `--segments` 和 LTX 临时文件的写入位置。见[区间](segments.md)。 |
+| `--working-directory` | 输出目录 | `--segments` 临时文件和 LTX 保存进度的写入位置。见[区间](segments.md)。 |
 
 ### 选择编解码器
 
@@ -215,21 +221,21 @@ NVIDIA H.264 的余量更大，因为它需要更多码率来保留修复后的�
 源有影响。高码率的源本来就低于上限。达到上限时，相近的 CQ 值可能得到相同的文件大小。
 
 自己设置 `maxrate` 可替换这个上限，设一个很大的值则相当于关闭。如果源没有码率信息，
-Jasna 会记录警告，并且不设上限。AMD HEVC 和 AV1（10-bit）使用固定 QP，没有上限。
+Jasna 会记录警告，并且不设上限。AMD 默认使用固定 QP，没有上限。
 
 #### AMD (AMF) 参数，所有编解码器
 
 | 参数 | 作用 |
 | --- | ------------ |
-| `cq` | AMF 的质量值：H.264 使用 QVBR，10-bit HEVC/AV1 使用固定 QP（AV1 内部刻度更细，CQ 会乘以 5 后传入）。越低越好；默认值依次为 24、25、32。 |
+| `cq` | AMF 的质量值，作为固定 QP 传入（AV1 内部刻度更细，CQ 会乘以 5 后传入）。H.264 设置 `rc=qvbr` 时改为 QVBR 质量等级。越低越好；默认值：H.264 24、HEVC 25、AV1 16。 |
 | `qvbr_quality_level` | 旧版 CQ 别名。省略 `--cq` 时可用于 CLI 高级设置；GUI 自定义参数中不接受。 |
 | `usage` | 编码器用途配置。默认 `high_quality`。 |
 | `quality` | 速度/质量预设：`speed`、`balanced`、`quality`（默认）。 |
-| `rc` | 码率控制模式。H.264 默认 `qvbr`；10-bit HEVC/AV1 默认 `cqp`。 |
+| `rc` | 码率控制模式。默认 `cqp`。 |
 | `preset` | AMF 预设。 |
 | `g` | 关键帧间隔（帧数）。默认 250。 |
 | `bf` | 最大连续 B 帧数。 |
-| `preanalysis` | 预分析。H.264 默认开启，10-bit HEVC/AV1 默认关闭。 |
+| `preanalysis` | 预分析。默认关闭。 |
 | `maxrate` / `bufsize` | 码率上限和 VBV 缓冲区大小（比特/秒）。除 CQP 模式外，会根据源码率自动设置。 |
 | `profile` / `level` | 编解码器 profile 和 level。 |
 
@@ -238,7 +244,7 @@ Jasna 会记录警告，并且不设上限。AMD HEVC 和 AV1（10-bit）使用�
 | 编解码器 | 额外参数 |
 | ----- | ---------- |
 | `hevc` | `tier`、`bitdepth`（默认 10）、`vbaq`（默认关闭） |
-| `h264` | `coder`、`bf_ref`（B 帧引用）、`pa_adaptive_mini_gop`（自适应 B 帧排列）、`vbaq`（默认开启） |
+| `h264` | `coder`、`bf_ref`（B 帧引用）、`pa_adaptive_mini_gop`（自适应 B 帧排列）、`vbaq`（默认关闭） |
 | `av1` | `bitdepth`（默认 10）、`aq_mode`（默认关闭） |
 
 ## 流媒体

@@ -13,7 +13,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils._triton import has_triton_package
 
+from jasna.accelerator import is_amd_device
+from jasna.models.ltx_vae.diffusion_hip import QKV_DIMS
 from jasna.models.ltx_vae.eager_na import na3d
 from jasna.tensor_utils import compile_static
 
@@ -138,6 +141,8 @@ class QKVProjections(nn.Module):
 
 
 _fused_na3d = None
+_fused_residual_swiglu = None
+_fused_slab_qkv = None
 
 
 @torch.compiler.disable
@@ -149,16 +154,31 @@ def _fp16_eager_na3d(
     return na3d(q.half(), k.half(), v.half(), tuple(kernel_size), query_w_start).to(q.dtype)
 
 
-def enable_fused_attention(device: torch.device) -> None:
-    """Run CUDA neighborhood attention through jasna's Triton kernel (``na_triton``), or before
-    SM 8.0, where Triton has no tensor-core dot, through the fp16 pure-torch ``na3d``."""
-    global _fused_na3d
+def enable_fused_kernels(device: torch.device) -> None:
+    """Run CUDA neighborhood attention through jasna's Triton kernel (``na_triton``): JIT, or on
+    AMD without Triton (Windows ROCm) built ahead of time (``na_hip``); before SM 8.0, where Triton
+    has no tensor-core dot, through the fp16 pure-torch ``na3d``. On AMD the diffusion blocks'
+    residual MLP and the slab Q/K/V projections run as fused kernels (``diffusion_triton``, ahead of
+    time ``diffusion_hip``); the Q/K/V kernel also serves the 512-wide deterministic stages."""
+    global _fused_na3d, _fused_residual_swiglu, _fused_slab_qkv
     if device.type == "cuda" and torch.cuda.get_device_capability(device) < (8, 0):
         _fused_na3d = _fp16_eager_na3d
+        return
+    if not has_triton_package():
+        from jasna.models.ltx_vae import diffusion_hip, na_hip
+
+        _fused_na3d = na_hip.na3d
+        _fused_residual_swiglu = diffusion_hip.residual_swiglu_
+        _fused_slab_qkv = diffusion_hip.slab_qkv
         return
     from jasna.models.ltx_vae import na_triton
 
     _fused_na3d = na_triton.na3d
+    if is_amd_device(device):
+        from jasna.models.ltx_vae import diffusion_triton
+
+        _fused_residual_swiglu = diffusion_triton.residual_swiglu_
+        _fused_slab_qkv = diffusion_triton.slab_qkv
 
 
 def neighborhood_attention(
@@ -196,6 +216,29 @@ class NeighborhoodAttention3D(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=_NORM_EPS)
         self.k_norm = nn.RMSNorm(head_dim, eps=_NORM_EPS)
 
+    def fused_qkv(
+        self, x: torch.Tensor, left_halo: torch.Tensor, columns: torch.Tensor, modulation: list[torch.Tensor],
+        w_pos: torch.Tensor, core_len: int, halo: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q (scaled) of the core columns and K/V of every column of the slab ``left_halo`` then ``x``'s W
+        ``columns`` (modulated by the norm weight, scale and shift in ``modulation`` unless empty) through
+        the fused Q/K/V kernel."""
+        qkv = self.qkv
+        return _fused_slab_qkv(
+            x,
+            left_halo,
+            columns,
+            modulation,
+            [qkv.to_q.weight, qkv.to_q.bias, qkv.to_k.weight, qkv.to_k.bias, qkv.to_v.weight, qkv.to_v.bias,
+             self.q_norm.weight, self.k_norm.weight],
+            torch.cat([self.rope_inv_t, self.rope_inv_h, self.rope_inv_w]),
+            w_pos,
+            [self.rope_inv_t.numel(), self.rope_inv_h.numel()],
+            core_len,
+            halo,
+            float(self.scale),
+        )
+
     def project_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, t, h, w, _ = x.shape
         q, k, v = self.qkv(x)
@@ -211,13 +254,18 @@ class NeighborhoodAttention3D(nn.Module):
                 f"3D neighborhood attention requires spatial dims >= kernel_size; "
                 f"got (T,H,W)=({t},{h},{w}) vs kernel={self.kernel_size}"
             )
-        q, k, v = self.project_qkv(x)
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        q = q * self.scale
         w_pos = torch.arange(w, dtype=torch.float32, device=x.device)
-        q = apply_abs_rope_slab(q, self, w_pos)
-        k = apply_abs_rope_slab(k, self, w_pos)
+        if _fused_slab_qkv is not None and x.is_cuda and self.dim in QKV_DIMS:
+            x = x.contiguous()
+            columns = torch.arange(w, device=x.device)
+            q, k, v = self.fused_qkv(x, x, columns, [], w_pos, w, 0)
+        else:
+            q, k, v = self.project_qkv(x)
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+            q = q * self.scale
+            q = apply_abs_rope_slab(q, self, w_pos)
+            k = apply_abs_rope_slab(k, self, w_pos)
         out = neighborhood_attention(self, q.contiguous(), k.contiguous(), v.contiguous(), 0)
         out = out.reshape(batch, t, h, w, self.dim)
         return self.proj(out)
@@ -286,6 +334,13 @@ def residual_modulating_mlp(
     x_flat = x.reshape(-1, dim)
     s = scale.reshape(-1, dim)
     sh = shift.reshape(-1, dim)
+    if _fused_residual_swiglu is not None and x.is_cuda:
+        for start in range(0, x_flat.shape[0], SWIGLU_TILE_TOKENS):
+            _fused_residual_swiglu(
+                x_flat[start : start + SWIGLU_TILE_TOKENS], norm.weight, s[0], sh[0],
+                mlp.w_gate.weight, mlp.w_up.weight, mlp.w_down.weight,
+            )
+        return x
     chunk_mlp = _mlp_chunk if x.is_cuda else modulated_swiglu
     w_gate_up = torch.cat([mlp.w_gate.weight, mlp.w_up.weight])
     for start in range(0, x_flat.shape[0], SWIGLU_TILE_TOKENS):
@@ -320,26 +375,29 @@ def _attn_on_w_slab(
     shift: torch.Tensor,
     core_len: int,
 ) -> torch.Tensor:
-    """One W slab, ``left_halo`` then ``x``'s W ``columns`` (compiled, that gather fuses into the
-    slab's first read): rms_norm + modulate + QKV / in-slab RoPE / NA / proj, output for the
-    ``core_len`` columns after the ``kernel_w // 2`` halo only."""
-    x_chunk = torch.cat([left_halo, x.index_select(3, columns)], dim=3)
-    batch, t, h, ext_w, _ = x_chunk.shape
+    """One W slab, ``left_halo`` then ``x``'s W ``columns`` (the fused Q/K/V kernel, or compiled, reads
+    that gather in the slab's first read): rms_norm + modulate + QKV / in-slab RoPE / NA / proj, output
+    for the ``core_len`` columns after the ``kernel_w // 2`` halo only."""
+    batch, t, h = x.shape[:3]
     halo = attn.kernel_size[2] // 2
-    y = F.rms_norm(x_chunk, (attn.dim,), norm.weight, _NORM_EPS)
-    y = y * (1.0 + scale) + shift
-
-    head_shape = (batch, t, h, ext_w, attn.num_heads, attn.head_dim)
-    core_shape = (batch, t, h, core_len, attn.num_heads, attn.head_dim)
-    y_core = y[:, :, :, halo : halo + core_len].reshape(-1, attn.dim)
-    q = F.linear(y_core, attn.qkv.to_q.weight, attn.qkv.to_q.bias).view(core_shape)
-    q = F.rms_norm(q, (attn.head_dim,), attn.q_norm.weight, _NORM_EPS) * float(attn.scale)
-    q = apply_abs_rope_slab(q, attn, w_pos[halo : halo + core_len])
-    k = F.linear(y, attn.qkv.to_k.weight, attn.qkv.to_k.bias).view(head_shape)
-    k = F.rms_norm(k, (attn.head_dim,), attn.k_norm.weight, _NORM_EPS)
-    k = apply_abs_rope_slab(k, attn, w_pos)
-    v = F.linear(y, attn.qkv.to_v.weight, attn.qkv.to_v.bias).view(head_shape)
-    del y
+    if _fused_slab_qkv is not None and x.is_cuda and scale.numel() == attn.dim:
+        q, k, v = attn.fused_qkv(x, left_halo, columns, [norm.weight, scale, shift], w_pos, core_len, halo)
+    else:
+        x_chunk = torch.cat([left_halo, x.index_select(3, columns)], dim=3)
+        ext_w = x_chunk.shape[3]
+        y = F.rms_norm(x_chunk, (attn.dim,), norm.weight, _NORM_EPS)
+        y = y * (1.0 + scale) + shift
+        head_shape = (batch, t, h, ext_w, attn.num_heads, attn.head_dim)
+        core_shape = (batch, t, h, core_len, attn.num_heads, attn.head_dim)
+        y_core = y[:, :, :, halo : halo + core_len].reshape(-1, attn.dim)
+        q = F.linear(y_core, attn.qkv.to_q.weight, attn.qkv.to_q.bias).view(core_shape)
+        q = F.rms_norm(q, (attn.head_dim,), attn.q_norm.weight, _NORM_EPS) * float(attn.scale)
+        q = apply_abs_rope_slab(q, attn, w_pos[halo : halo + core_len])
+        k = F.linear(y, attn.qkv.to_k.weight, attn.qkv.to_k.bias).view(head_shape)
+        k = F.rms_norm(k, (attn.head_dim,), attn.k_norm.weight, _NORM_EPS)
+        k = apply_abs_rope_slab(k, attn, w_pos)
+        v = F.linear(y, attn.qkv.to_v.weight, attn.qkv.to_v.bias).view(head_shape)
+        del y
 
     out = neighborhood_attention(attn, q.contiguous(), k.contiguous(), v.contiguous(), halo)
     del q, k, v
@@ -393,14 +451,14 @@ _slab_attention = _attn_on_w_slab
 _mlp_chunk = modulated_swiglu
 
 
-def compile_diffusion_blocks(device: torch.device) -> None:
-    """Compile the stage-5 attention slab, MLP chunk and context inject with static shapes (one
-    graph per shape, shared by all blocks); CUDA tensors use them from then on."""
+def compile_diffusion_blocks(device: torch.device, dtype: torch.dtype) -> None:
+    """Compile the stage-5 attention slab, MLP chunk and context inject (computing in ``dtype``)
+    with static shapes (one graph per shape, shared by all blocks); CUDA tensors use them from then on."""
     global _slab_attention, _mlp_chunk, _add_context
     if _slab_attention is _attn_on_w_slab:
-        _slab_attention = compile_static(_attn_on_w_slab, mode=DECODER_COMPILE_MODE, device=device)
-        _mlp_chunk = compile_static(modulated_swiglu, mode=DECODER_COMPILE_MODE, device=device)
-        _add_context = compile_static(add_folded_context, mode=DECODER_COMPILE_MODE, device=device)
+        _slab_attention = compile_static(_attn_on_w_slab, mode=DECODER_COMPILE_MODE, device=device, dtype=dtype)
+        _mlp_chunk = compile_static(modulated_swiglu, mode=DECODER_COMPILE_MODE, device=device, dtype=dtype)
+        _add_context = compile_static(add_folded_context, mode=DECODER_COMPILE_MODE, device=device, dtype=dtype)
 
 
 def fold_context_projection(

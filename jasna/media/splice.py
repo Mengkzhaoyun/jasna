@@ -57,10 +57,15 @@ class KeyframeIndex:
     def seconds_for_pts(self, pts: int) -> float:
         return float((int(pts) - self.start_pts) * self.time_base)
 
+    def keyframe_seconds(self) -> tuple[float, ...]:
+        """Keyframe times past the stream start; the lead-in keyframe of an MP4 cut
+        mid-GOP counts as the start, where its render span begins."""
+        return tuple(max(0.0, self.seconds_for_pts(pts)) for pts in self.pts)
+
 
 @dataclass(frozen=True)
 class SpliceSpan:
-    kind: str  # "copy" or "render"
+    kind: str  # "copy", "render", or "reencode" (encoded again unrestored: it cannot be copied)
     start_pts: int
     end_pts: int
     effect_ranges: tuple[tuple[int, int], ...] = ()
@@ -273,19 +278,16 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
     with av.open(str(path), metadata_errors="replace") as container:
         stream = container.streams.video[0]
         codec = canonical_codec(metadata.codec_name)
-        extradata = bytes(stream.codec_context.extradata or b"")
-        length_size = 4
-        length_prefixed = codec == "h264" and len(extradata) > 4 and extradata[0] == 1
-        if length_prefixed:
-            length_size = (extradata[4] & 0x03) + 1
-        elif codec == "hevc" and len(extradata) > 21 and extradata[0] == 1:
-            length_prefixed = True
-            length_size = (extradata[21] & 0x03) + 1
+        length_size, length_prefixed = _nal_framing(stream, codec)
         time_base = Fraction(stream.time_base)
         start_pts = resolve_video_start_pts(stream.start_time, metadata.start_pts)
+        frame_ticks = max(1, round(1 / (metadata.video_fps * time_base)))
+        packets_end: int | None = None
         for packet in container.demux(stream):
             if packet.pts is not None:
                 packet_pts.append(int(packet.pts))
+                packet_end = int(packet.pts) + (int(packet.duration) if packet.duration else frame_ticks)
+                packets_end = packet_end if packets_end is None else max(packets_end, packet_end)
             if (
                 packet.pts is not None
                 and packet.is_keyframe
@@ -306,8 +308,12 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
         end_pts = start_pts + int(stream_duration)
     else:
         end_pts = start_pts + round(float(metadata.duration) / time_base)
+    # The recorded duration can end before the last frame (seen in MP4 edit lists);
+    # dropping that frame would also break the B-frames that reference it.
+    if packets_end is not None:
+        end_pts = max(end_pts, packets_end)
     if end_pts <= keyframes[-1]:
-        end_pts = keyframes[-1] + max(1, round(1 / (metadata.video_fps * time_base)))
+        end_pts = keyframes[-1] + frame_ticks
     max_b_frames, uses_b_references = _analyze_packet_reordering(packet_pts)
     return KeyframeIndex(
         tuple(keyframes),
@@ -319,42 +325,76 @@ def probe_keyframes(path: str | Path, metadata: VideoMetadata) -> KeyframeIndex:
     )
 
 
-def _nal_unit_types(
+def _nal_framing(stream: av.VideoStream, codec: str) -> tuple[int, bool]:
+    """NAL length-field size and whether packets are length-prefixed (avcC/hvcC) rather
+    than Annex B."""
+    extradata = bytes(stream.codec_context.extradata or b"")
+    if codec == "h264" and len(extradata) > 4 and extradata[0] == 1:
+        return (extradata[4] & 0x03) + 1, True
+    if codec == "hevc" and len(extradata) > 21 and extradata[0] == 1:
+        return (extradata[21] & 0x03) + 1, True
+    return 4, False
+
+
+def _nal_units(
     data: bytes,
     *,
     codec: str,
     length_size: int,
     length_prefixed: bool,
-) -> tuple[int, ...]:
-    units: list[bytes] = []
+) -> tuple[tuple[int, int], ...]:
+    """(offset of the unit's start code or length field, NAL unit type) per unit."""
+    units: list[tuple[int, int]] = []
     if not length_prefixed:
         starts: list[tuple[int, int]] = []
-        i = 0
-        while i + 3 <= len(data):
-            if data[i:i + 4] == b"\x00\x00\x00\x01":
-                starts.append((i, 4))
-                i += 4
-            elif data[i:i + 3] == b"\x00\x00\x01":
-                starts.append((i, 3))
-                i += 3
+        position = data.find(b"\x00\x00\x01")
+        while position >= 0:
+            if position > 0 and data[position - 1] == 0:
+                starts.append((position - 1, 4))
             else:
-                i += 1
+                starts.append((position, 3))
+            position = data.find(b"\x00\x00\x01", position + 3)
         for index, (start, prefix) in enumerate(starts):
             end = starts[index + 1][0] if index + 1 < len(starts) else len(data)
             if start + prefix < end:
-                units.append(data[start + prefix:end])
+                units.append((start, data[start + prefix]))
     else:
         offset = 0
         while offset + length_size <= len(data):
             size = int.from_bytes(data[offset:offset + length_size], "big")
-            offset += length_size
-            if size <= 0 or offset + size > len(data):
+            if size <= 0 or offset + length_size + size > len(data):
                 break
-            units.append(data[offset:offset + size])
-            offset += size
+            units.append((offset, data[offset + length_size]))
+            offset += length_size + size
     if codec == "h264":
-        return tuple(unit[0] & 0x1F for unit in units if unit)
-    return tuple((unit[0] >> 1) & 0x3F for unit in units if unit)
+        return tuple((offset, header & 0x1F) for offset, header in units)
+    return tuple((offset, (header >> 1) & 0x3F) for offset, header in units)
+
+
+_VCL_NAL_TYPES = {"h264": frozenset(range(1, 6)), "hevc": frozenset(range(0, 32))}
+# NAL units that may only open an access unit (H.264 7.4.1.2.3, HEVC 7.4.2.4.4).
+_ACCESS_UNIT_START_NAL_TYPES = {
+    "h264": frozenset({6, 7, 8, 9, *range(14, 19)}),
+    "hevc": frozenset({32, 33, 34, 35, 39, *range(41, 45), *range(48, 56)}),
+}
+
+
+def _next_access_unit_offset(
+    data: bytes,
+    *,
+    codec: str,
+    length_size: int,
+    length_prefixed: bool,
+) -> int:
+    """Where NAL units of the next picture begin in a packet that carries them after its
+    own picture (some muxers store the next AUD/SEI there); ``len(data)`` when none do."""
+    units = _nal_units(data, codec=codec, length_size=length_size, length_prefixed=length_prefixed)
+    vcl = [i for i, (_, nal_type) in enumerate(units) if nal_type in _VCL_NAL_TYPES[codec]]
+    after_picture = units[vcl[-1] + 1:] if vcl else ()
+    return next(
+        (offset for offset, nal_type in after_picture if nal_type in _ACCESS_UNIT_START_NAL_TYPES[codec]),
+        len(data),
+    )
 
 
 def _is_safe_random_access_packet(
@@ -366,12 +406,10 @@ def _is_safe_random_access_packet(
 ) -> bool:
     if codec == "av1":
         return True
-    nal_types = _nal_unit_types(
-        data,
-        codec=codec,
-        length_size=length_size,
-        length_prefixed=length_prefixed,
-    )
+    nal_types = [
+        nal_type
+        for _, nal_type in _nal_units(data, codec=codec, length_size=length_size, length_prefixed=length_prefixed)
+    ]
     if codec == "h264":
         return 5 in nal_types
     return any(16 <= nal_type <= 20 for nal_type in nal_types)
@@ -393,12 +431,21 @@ def segment_render_span(segment: SegmentRange, index: KeyframeIndex) -> SpliceSp
             "The first selected segment begins before the first random-access keyframe",
             reason="before_first_keyframe",
         )
-    render_start = index.pts[left_index]
+    render_start = max(index.pts[left_index], index.start_pts)
     right_index = bisect.bisect_left(index.pts, effect_end)
     render_end = index.pts[right_index] if right_index < len(index.pts) else index.end_pts
     if render_end <= render_start:
         render_end = index.end_pts
     return SpliceSpan("render", render_start, render_end, ((effect_start, effect_end),))
+
+
+def _first_copyable_pts(index: KeyframeIndex) -> int:
+    """Where stream copy may start. An MP4 cut mid-GOP shows video from before its
+    first keyframe at or after the stream start: that keyframe is hidden lead-in."""
+    if index.pts[0] >= index.start_pts:
+        return index.start_pts
+    position = bisect.bisect_left(index.pts, index.start_pts)
+    return index.pts[position] if position < len(index.pts) else index.end_pts
 
 
 def build_splice_plan(
@@ -430,14 +477,21 @@ def build_splice_plan(
         require_one_model(tuple(owners))
 
     spans: list[SpliceSpan] = []
+    copy_from = _first_copyable_pts(index)
+
+    def add_unrendered(start: int, end: int) -> None:
+        if start < min(end, copy_from):
+            spans.append(SpliceSpan("reencode", start, min(end, copy_from)))
+            start = copy_from
+        if start < end:
+            spans.append(SpliceSpan("copy", start, end))
+
     cursor = index.start_pts
     for start, end, effects, _owners in merged:
-        if cursor < start:
-            spans.append(SpliceSpan("copy", cursor, start))
+        add_unrendered(cursor, start)
         spans.append(SpliceSpan("render", start, end, tuple(effects)))
         cursor = end
-    if cursor < index.end_pts:
-        spans.append(SpliceSpan("copy", cursor, index.end_pts))
+    add_unrendered(cursor, index.end_pts)
     if (
         len(spans) == 1
         and spans[0].is_render
@@ -497,21 +551,41 @@ def create_copy_fragment(
         ]
         _run_ffmpeg(args, purpose=f"copy AV1 smart-render span at {start:.3f}s")
         return
+    codec = canonical_codec(codec)
     with (
         av.open(str(source), metadata_errors="replace") as src,
         av.open(str(destination), "w", format="nut") as dst,
     ):
         in_stream = src.streams.video[0]
         out_stream = dst.add_stream_from_template(in_stream)
+        length_size, length_prefixed = _nal_framing(in_stream, codec)
         src.seek(span.start_pts, stream=in_stream, backward=True)
+        carried = b""
         for packet in src.demux(in_stream):
+            if not packet.size:
+                continue
+            data = bytes(packet)
+            cut = _next_access_unit_offset(
+                data, codec=codec, length_size=length_size, length_prefixed=length_prefixed
+            )
+            access_unit, carried = carried + data[:cut], data[cut:]
             if packet.pts is None or not (span.start_pts <= packet.pts < span.end_pts):
                 continue
+            if access_unit != data:
+                packet = _repacked(packet, access_unit)
             packet.pts -= span.start_pts
             if packet.dts is not None:
                 packet.dts -= span.start_pts
             packet.stream = out_stream
             dst.mux(packet)
+
+
+def _repacked(packet: av.Packet, payload: bytes) -> av.Packet:
+    repacked = av.Packet(payload)
+    repacked.pts, repacked.dts = packet.pts, packet.dts
+    repacked.duration, repacked.time_base = packet.duration, packet.time_base
+    repacked.is_keyframe = packet.is_keyframe
+    return repacked
 
 
 def normalize_fragment(source: Path, destination: Path, *, codec: str) -> None:
@@ -526,6 +600,7 @@ def normalize_fragment(source: Path, destination: Path, *, codec: str) -> None:
         [
             "-i", str(source),
             "-map", "0:v:0",
+            "-map_metadata", "-1",
             "-an",
             "-c:v", "copy",
             "-bsf:v", bitstream_filter,

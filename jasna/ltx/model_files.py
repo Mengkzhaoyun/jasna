@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import ssl
+import stat
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -20,6 +21,7 @@ from typing import get_args
 
 import certifi
 
+from jasna import __version__
 from jasna._frozen import is_frozen
 from jasna.session_config import LtxModelName
 
@@ -27,10 +29,19 @@ logger = logging.getLogger(__name__)
 
 LTX_MODELS: tuple[LtxModelName, ...] = get_args(LtxModelName)
 
-# Where the model files are published; each file is fetched from f"{LTX_DOWNLOAD_URL}/{name}",
-# and from the same path on LTX_MIRROR_URL (reachable from mainland China) when that fails.
-LTX_DOWNLOAD_URL = "https://huggingface.co/Kruk2/ltx-restore/resolve/main"
-LTX_MIRROR_URL = "https://hf-mirror.com/Kruk2/ltx-restore/resolve/main"
+# Register new model branches with their matching download hashes before building a release.
+_MODEL_BRANCHES = ("0.12.0",)
+
+
+def _model_branch(version: str) -> str:
+    version_key = tuple(map(int, version.split(".")))
+    branches = sorted(_MODEL_BRANCHES, key=lambda branch: tuple(map(int, branch.split("."))), reverse=True)
+    return next((branch for branch in branches if tuple(map(int, branch.split("."))) <= version_key), "main")
+
+
+LTX_MODEL_BRANCH = _model_branch(__version__)
+LTX_DOWNLOAD_URL = f"https://huggingface.co/Kruk2/ltx-restore/resolve/{LTX_MODEL_BRANCH}"
+LTX_MIRROR_URL = f"https://hf-mirror.com/Kruk2/ltx-restore/resolve/{LTX_MODEL_BRANCH}"
 _NETWORK_ERRORS = (urllib.error.URLError, http.client.HTTPException, ConnectionError, TimeoutError)
 
 DownloadProgressCallback = Callable[[int, int], None]
@@ -59,14 +70,14 @@ _SHARED_NAMES = ("vae.safetensors", "vae-decoder.safetensors")
 LTX_DOWNLOADS: dict[str, DownloadableFile] = {
     name: DownloadableFile(name, size, checksum)
     for name, size, checksum in (
-        ("ltx-restore-alpha1-distill2-int8.safetensors", 13_368_048_749, "c23559f9d120df49266fc2dbe60ec384058d51834cf1a2da049e54b28aea51ad"),
-        ("ltx-restore-alpha1-distill2-nvfp4.safetensors", 7_733_294_997, "4aa08c146c8cc335e7f90d19aa293cc0dfe4f14520fd85efc257fe809510693b"),
-        ("ltx-restore-alpha1-distill4-int8.safetensors", 13_368_048_733, "1c0f1642232813f690d949b05fe90bdc02d3203e0092950de25e9cc961f30965"),
-        ("ltx-restore-alpha1-distill4-nvfp4.safetensors", 7_733_294_981, "57098e622d02598467f903049f4d1a613852f832847a01c43da148f506876973"),
-        ("ltx-restore-alpha1-distill8-int8.safetensors", 13_368_048_773, "b006342a109c640a46ae91a5cd10e67186d968c63ef2f715c78bedf36936e057"),
-        ("ltx-restore-alpha1-distill8-nvfp4.safetensors", 7_733_295_021, "54f2f4f6f7d3f5d60e18aca7bf6137da206a2b66f282e1a9078743c3173e62e2"),
-        ("ltx-restore-alpha1-int8.safetensors", 13_368_048_821, "c72161b1afefe4d8cc0592fa57afef6c20466dcf912912f3628a451468780f83"),
-        ("ltx-restore-alpha1-nvfp4.safetensors", 7_733_295_061, "8301d5ba17660b577ebe906d343963208f7e5453e589ef2f7470087a3ba2ccb5"),
+        ("ltx-restore-alpha1-distill2-int8.safetensors", 13_368_048_765, "84ef795457d34dae31cac8adeccc9ce0bab68ae8462843aae36ef2df7ee96be1"),
+        ("ltx-restore-alpha1-distill2-nvfp4.safetensors", 7_733_295_013, "78ec351e5570984b8c1d851e8d1d2fbc26f6bdefb24cfc6678c8a0ad1c8968bb"),
+        ("ltx-restore-alpha1-distill4-int8.safetensors", 13_368_048_765, "d4aaf55e40bcb6af395b8909e5e2232a1573c8f16a78340b5edb1357bb16b158"),
+        ("ltx-restore-alpha1-distill4-nvfp4.safetensors", 7_733_295_013, "f7a1a879bb5904649de614c535e0ecd7940c16c014edc6496ed49a5e6211df01"),
+        ("ltx-restore-alpha1-distill8-int8.safetensors", 13_368_048_765, "93677e283ec81b0d713581d7a75ffcd35769df8105214b458be3713d9a145c9f"),
+        ("ltx-restore-alpha1-distill8-nvfp4.safetensors", 7_733_295_013, "43b8a1cee700dff80a69e2c69caf68a9b47c177ce161fbc8c5f9a0ab42bf82db"),
+        ("ltx-restore-alpha1-int8.safetensors", 13_368_048_765, "2892db743471ef1574f4dc47412a1b901a0e02accdc8cbda31c65dbe3c4b06a6"),
+        ("ltx-restore-alpha1-nvfp4.safetensors", 7_733_295_013, "71bbbccf96c25f8509fe16da00ef090195e600ad8f467040485bdf75da9aefbd"),
         ("vae.safetensors", 1_472_223_815, "b9252d5a799748d1932d4eed60a2d77461949a19f6feb57f2238dbffe08f5e25"),
         ("vae-decoder.safetensors", 38_718_609, "c60c3572871203bd364d6bb2390225fa4c347f7ea5c64fe468256c900caeea2d"),
     )
@@ -237,9 +248,25 @@ def bundle_names(model: LtxModelName, *, fast: bool) -> tuple[str, str, str]:
     return (_TRANSFORMER_NAMES[(model, fast)], *_SHARED_NAMES)
 
 
-def _bundle_paths(directory: Path, model: LtxModelName, *, fast: bool) -> list[Path]:
+def bundle_paths(directory: Path, model: LtxModelName, *, fast: bool) -> list[Path]:
     paths = [directory / name for name in bundle_names(model, fast=fast)]
     return [path.with_name(path.name + ".enc") if is_frozen() or not path.is_file() else path for path in paths]
+
+
+def needs_license(directory: Path, model: LtxModelName, *, fast: bool) -> bool:
+    """Whether this model choice runs from the protected (``.enc``) files, which need a license."""
+    return any(path.suffix == ".enc" for path in bundle_paths(directory, model, fast=fast))
+
+
+def _current_model_file(path: Path) -> bool:
+    try:
+        info = path.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    # Size detects outdated downloads cheaply; native loading authenticates their bytes.
+    return stat.S_ISREG(info.st_mode) and (
+        path.suffix != ".enc" or info.st_size == LTX_DOWNLOADS[path.name.removesuffix(".enc")].size_bytes
+    )
 
 
 @dataclass(frozen=True)
@@ -269,22 +296,22 @@ class LtxModelFiles:
     @classmethod
     def from_dir(cls, directory: Path, model: LtxModelName, *, fast: bool) -> LtxModelFiles:
         """The bundle of ``model``; ``fast`` picks its NVFP4 transformer over the INT8 one."""
-        paths = _bundle_paths(directory, model, fast=fast)
+        paths = bundle_paths(directory, model, fast=fast)
         if any(path.suffix == ".enc" for path in paths):
             from jasna.license_api import require_protection
 
             require_protection()
             from jasna.protection.protected_tensors import check_ltx_license
             check_ltx_license()
-        missing = [str(path) for path in paths if not path.is_file()]
+        missing = [str(path) for path in paths if not _current_model_file(path)]
         if missing:
-            raise FileNotFoundError(f"LTX model files missing: {', '.join(missing)}")
+            raise FileNotFoundError(f"LTX model files missing or outdated: {', '.join(missing)}")
         return cls(*paths)
 
 
 def model_installed(directory: Path, model: LtxModelName, *, fast: bool) -> bool:
-    """Whether every file of this model choice is on disk; checks no license."""
-    return all(path.is_file() for path in _bundle_paths(directory, model, fast=fast))
+    """Whether this model's files are present, with current encrypted sizes; checks no license."""
+    return all(_current_model_file(path) for path in bundle_paths(directory, model, fast=fast))
 
 
 def bundle_present(directory: Path) -> bool:
@@ -295,8 +322,8 @@ def bundle_present(directory: Path) -> bool:
 def missing_downloads(directory: Path, model: LtxModelName, *, fast: bool) -> list[DownloadableFile]:
     """The files this model choice still needs, as published (``.enc`` in releases)."""
     missing = []
-    for path in _bundle_paths(directory, model, fast=fast):
-        if not path.is_file():
+    for path in bundle_paths(directory, model, fast=fast):
+        if not _current_model_file(path):
             entry = LTX_DOWNLOADS[path.name.removesuffix(".enc")]
             missing.append(DownloadableFile(path.name, entry.size_bytes, entry.sha256))
     return missing

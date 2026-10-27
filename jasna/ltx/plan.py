@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import bisect
 import functools
-from collections.abc import Sequence
+import itertools
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -113,6 +114,52 @@ class TrackPlan:
     @property
     def stop(self) -> int:
         return self.start + len(self.polygons)
+
+
+def plans_to_arrays(segments: Sequence[Sequence[TrackPlan]]) -> dict[str, np.ndarray]:
+    """Every segment's track plans as flat arrays for ``np.savez``; ``plans_from_arrays`` reads them back."""
+    plans = [(s, plan) for s, segment in enumerate(segments) for plan in segment]
+    polygons = [polygon for _, plan in plans for frame in plan.polygons for polygon in frame]
+    windows = [(t, window) for t, (_, plan) in enumerate(plans) for window in plan.windows]
+    return {
+        "segments": np.array(len(segments)),
+        "tracks": np.array(
+            [(s, plan.track_id, plan.start, plan.window_hop, len(plan.polygons)) for s, plan in plans], dtype=np.int64
+        ).reshape(-1, 5),
+        "presence": np.array([value for _, plan in plans for value in plan.presence], dtype=np.float64),
+        "frame_polygons": np.array([len(frame) for _, plan in plans for frame in plan.polygons], dtype=np.int64),
+        "polygon_points": np.array([len(polygon) for polygon in polygons], dtype=np.int64),
+        "polygon_float": np.array([polygon.dtype == np.float64 for polygon in polygons], dtype=bool),
+        "points": np.concatenate([np.zeros((0, 2)), *polygons]),
+        "windows": np.array(
+            [(t, w.index, w.track_id, w.start, w.real_frames) for t, w in windows], dtype=np.int64
+        ).reshape(-1, 5),
+        "crops": np.array(
+            [(*c.crop_box, *c.resize_hw, *c.pad) for _, w in windows for c in w.crops], dtype=np.int64
+        ).reshape(-1, 10),
+    }
+
+
+def plans_from_arrays(arrays: Mapping[str, np.ndarray]) -> list[list[TrackPlan]]:
+    points = np.split(arrays["points"], np.cumsum(arrays["polygon_points"])[:-1])
+    polygons = iter(
+        polygon if is_float else polygon.astype(np.int32) for polygon, is_float in zip(points, arrays["polygon_float"])
+    )
+    frame_polygons = iter(arrays["frame_polygons"].tolist())
+    presence = iter(arrays["presence"].tolist())
+    crops = iter(CropFrame(tuple(c[:4]), tuple(c[4:6]), tuple(c[6:])) for c in arrays["crops"].tolist())
+    windows: dict[int, list[Window]] = {}
+    for t, index, track_id, start, real_frames in arrays["windows"].tolist():
+        windows.setdefault(t, []).append(
+            Window(index, track_id, start, real_frames, tuple(itertools.islice(crops, real_frames)))
+        )
+    segments: list[list[TrackPlan]] = [[] for _ in range(int(arrays["segments"]))]
+    for t, (s, track_id, start, window_hop, frames) in enumerate(arrays["tracks"].tolist()):
+        frame_tuples = tuple(tuple(itertools.islice(polygons, next(frame_polygons))) for _ in range(frames))
+        segments[s].append(TrackPlan(
+            track_id, start, frame_tuples, tuple(itertools.islice(presence, frames)), tuple(windows.get(t, ())), window_hop,
+        ))
+    return segments
 
 
 def feather_pixels(frame_h: int) -> int:
@@ -566,12 +613,19 @@ def plan_video(
     return plans
 
 
+UNFUSED_LEAD_FRAMES = 1 + TEMPORAL_SCALE
+"""A later window's free latent 0 sits in front of latents fused with the earlier window, and
+the decoder garbles the colour of the frames of that latent and the next one."""
+
+
 def crossfade_weights(windows: Sequence[Window]) -> list[np.ndarray]:
-    """Per-frame compose weights of one track's windows: linear ramps across each overlap."""
+    """Per-frame compose weights of one track's windows: across each overlap the earlier
+    window alone over the later one's ``UNFUSED_LEAD_FRAMES``, then a linear ramp."""
     weights = [np.ones(window.real_frames, dtype=np.float32) for window in windows]
     for index, (left, right) in enumerate(zip(windows, windows[1:])):
         overlap = left.stop - right.start
-        ramp = np.linspace(0.0, 1.0, overlap, dtype=np.float32)
+        ramp = np.zeros(overlap, dtype=np.float32)
+        ramp[UNFUSED_LEAD_FRAMES - 1 :] = np.linspace(0.0, 1.0, overlap - UNFUSED_LEAD_FRAMES + 1, dtype=np.float32)
         weights[index][len(weights[index]) - overlap :] = 1.0 - ramp
         weights[index + 1][:overlap] = ramp
     return weights

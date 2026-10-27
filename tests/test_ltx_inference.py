@@ -180,6 +180,34 @@ def test_worker_peak_vram_counts_the_native_block_store(monkeypatch, allocator):
     assert stats["peak_vram_bytes"] == (5 << 30) + (13 << 30)
 
 
+def test_worker_reports_denoise_progress_after_gpu_completion(monkeypatch, allocator):
+    backend = inference.WorkerBackend({"transformer": "t.enc", "vae": "v.enc", "tuned_decoder": "d.enc", "device": "cpu"})
+    events = []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: events.append(("synchronize", device)))
+
+    class Transformer:
+        def native_vram_bytes(self):
+            return 0
+
+        def denoise_chain(self, references, seeds, window_hop, advance):
+            for count in (1, 2):
+                events.append(("queued", count))
+                advance(count)
+            return references
+
+    backend.transformer = Transformer()
+    latent = torch.zeros(1)
+    _, result = backend.dispatch(
+        "denoise_chain", {"seeds": [1], "window_hop": 88}, [latent],
+        lambda count: events.append(("progress", count)),
+    )
+    assert result == [latent]
+    assert events == [
+        ("queued", 1), ("synchronize", backend.device), ("progress", 1),
+        ("queued", 2), ("synchronize", backend.device), ("progress", 2),
+    ]
+
+
 def test_worker_sizes_the_transformer_from_the_parents_device_wide_free_vram(monkeypatch, allocator):
     """On Windows the worker's CUDA view misses the parent's and other programs' VRAM."""
     gib = 1 << 30
@@ -304,4 +332,47 @@ def test_runtime_asks_the_worker_to_open_the_transformer_only_while_none_is_load
     assert requests == ["prepare_transformer", "load_transformer"]
     local = inference.ModelRuntime(LtxModelFiles.placeholder("distilled", fast=False), torch.device("cpu"), threading.Event())
     monkeypatch.setattr(local, "request", lambda *_args: pytest.fail("trial files have no worker"))
+    monkeypatch.setattr(inference, "TransformerSource", lambda path: SimpleNamespace(close=lambda: None))
     local.prepare_transformer()
+
+
+def test_local_runtime_opens_the_transformer_file_ahead_once(monkeypatch):
+    """Without a worker the runtime opens the file itself in ``prepare_transformer`` (the scan's
+    thread); the load takes that source, and one never loaded is closed with the runtime."""
+    opened, loaded, closed = [], [], []
+
+    class Source:
+        def __init__(self, path):
+            opened.append(path)
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(inference, "TransformerSource", Source)
+    monkeypatch.setattr(
+        inference, "LtxTransformer",
+        lambda source, device, free_vram: loaded.append(source) or SimpleNamespace(close=lambda: None),
+    )
+    files = LtxModelFiles.placeholder("distilled", fast=False)
+    runtime = inference.ModelRuntime(files, torch.device("cpu"), threading.Event())
+    runtime.prepare_transformer()
+    runtime.prepare_transformer()
+    runtime.load_transformer()
+    runtime.prepare_transformer()
+    assert len(opened) == 1 and len(loaded) == 1 and isinstance(loaded[0], Source)
+    runtime.unload_transformer()
+    runtime.prepare_transformer()
+    runtime.close()
+    assert len(opened) == 2 and len(closed) == 1 and closed[0] is not loaded[0]
+
+
+def test_gpu_libraries_load_ahead_only_on_a_gpu(monkeypatch):
+    monkeypatch.setattr(inference.F, "linear", lambda *_args: pytest.fail("no GPU library to load on the CPU"))
+    inference.load_gpu_libraries_ahead(torch.device("cpu"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_gpu_libraries_load_ahead_on_another_thread():
+    worker = threading.Thread(target=inference.load_gpu_libraries_ahead, args=(torch.device("cuda"),))
+    worker.start()
+    worker.join()

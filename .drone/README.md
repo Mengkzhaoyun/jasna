@@ -8,7 +8,7 @@
 git remote add upstream git@github.com:Kruk2/jasna.git
 git fetch upstream
 git switch dev
-git merge v0.11.3
+git merge upstream/main
 ```
 
 ## CI/CD
@@ -31,10 +31,10 @@ git checkout build ;`
 
 ```powershell
 # 1. 本地测试构建 builder 环境镜像
-docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.11.3-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
+docker build -f .drone/dockerfile.build -t ghcr.io/mengkzhaoyun/jasna:v0.12.0-build --build-arg BASE=nvidia/cuda:13.0.3-devel-ubuntu24.04 .
 
 # 2. 本地测试运行镜像构建 (内置预编译 LTX C++/CUDA 算子与 Triton AOT 内核)
-docker build -f .drone/dockerfile -t registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3 .
+docker build -f .drone/dockerfile -t registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.12.0 .
 ```
 
 ## Hot Update
@@ -124,17 +124,17 @@ Jasna 容器运行依赖挂载目录（如 `/nas/sglang/model_weights`）中的�
 mkdir -p /nas/sglang/model_weights
 cd /nas/sglang/model_weights
 
-# 1. LTX-2.5 22B 去马赛克修复模型套件 (默认推荐，支持国内 hf-mirror 高速直连)
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae.safetensors.enc
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae.safetensors.enc.manifest.json
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae-decoder.safetensors.enc
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/vae-decoder.safetensors.enc.manifest.json
+# 1. LTX-2.5 22B 去马赛克修复模型套件 (v0.12.0 分支推荐，支持国内 hf-mirror 高速直连；v0.11.3 请将 0.12.0 替换为 main)
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/vae.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/vae.safetensors.enc.manifest.json
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/vae-decoder.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/vae-decoder.safetensors.enc.manifest.json
 # RTX 4090 / SM 8.9 推荐 INT8 2-step 蒸馏权重 (13.3 GB):
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-int8.safetensors.enc
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-int8.safetensors.enc.manifest.json
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/ltx-restore-alpha1-distill2-int8.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/ltx-restore-alpha1-distill2-int8.safetensors.enc.manifest.json
 # RTX 5090 / SM 12.0 专属 NVFP4 2-step 蒸馏权重 (7.7 GB，配合 LTX_FAST=true):
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-nvfp4.safetensors.enc
-curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/main/ltx-restore-alpha1-distill2-nvfp4.safetensors.enc.manifest.json
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/ltx-restore-alpha1-distill2-nvfp4.safetensors.enc
+curl -L -O https://hf-mirror.com/Kruk2/ltx-restore/resolve/0.12.0/ltx-restore-alpha1-distill2-nvfp4.safetensors.enc.manifest.json
 
 # 2. BasicVSR++ 传统去马赛克修复模型
 curl -L -O https://hf-mirror.com/ladaapp/lada/resolve/main/lada_mosaic_restoration_model_generic_v1.2.pth

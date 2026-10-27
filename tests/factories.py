@@ -1,6 +1,7 @@
 """Builders shared by tests that need a SessionConfig, a Pipeline, or test media."""
 from __future__ import annotations
 
+import struct
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +65,10 @@ def session_config(**overrides) -> SessionConfig:
     )
     base.update(overrides)
     return SessionConfig(**base)
+
+
+def no_resume_conflict(directory: Path):
+    raise AssertionError(f"unexpected saved-progress conflict: {directory}")
 
 
 def fake_session(*, device: torch.device, restoration_pipeline, detection_model=None) -> SimpleNamespace:
@@ -154,6 +159,61 @@ def write_double_adts_aac_source(tmp_path: Path) -> Path:
     return source
 
 
+def _length_prefixed_units(data: bytes) -> list[bytes]:
+    units, offset = [], 0
+    while offset + 4 <= len(data):
+        size = int.from_bytes(data[offset:offset + 4], "big")
+        units.append(data[offset + 4:offset + 4 + size])
+        offset += 4 + size
+    return units
+
+
+def write_hrd_timing_sei_source(path: Path) -> Path:
+    """29.97 fps H.264 + AAC MP4 with HRD buffering_period/pic_timing SEI whose samples
+    end with the next picture's access unit delimiter and SEI, as some muxers store them."""
+    plain = path.with_name(f"{path.stem}-plain.mp4")
+    subprocess.run(
+        [
+            resolve_executable("ffmpeg"), "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=160x96:rate=30000/1001:duration=4.004",
+            "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=48000:duration=4.004",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "main",
+            "-g", "30", "-keyint_min", "30", "-sc_threshold", "0", "-bf", "3", "-b:v", "500k",
+            "-x264-params", "nal-hrd=vbr:vbv-maxrate=1000:vbv-bufsize=2000:aud=1",
+            "-bsf:v", "h264_metadata=fixed_frame_rate_flag=1",
+            "-c:a", "aac", str(plain),
+        ],
+        check=True,
+    )
+    with av.open(str(plain)) as src:
+        samples = []
+        for packet in src.demux(src.streams.video[0]):
+            if packet.size:
+                units = _length_prefixed_units(bytes(packet))
+                first_slice = next(i for i, unit in enumerate(units) if unit[0] & 0x1F in {1, 5})
+                samples.append((units[:first_slice], units[first_slice:]))
+    moved = [samples[0][0] + samples[0][1] + samples[1][0]]
+    moved += [pictures + following[0] for (_, pictures), following in zip(samples[1:], samples[2:])]
+    moved.append(samples[-1][1])
+    with av.open(str(plain)) as src, av.open(str(path), "w") as dst:
+        outputs = {stream.index: dst.add_stream_from_template(stream) for stream in src.streams}
+        video_samples = iter(moved)
+        for packet in src.demux():
+            if not packet.size:
+                continue
+            output = outputs[packet.stream.index]
+            if packet.stream.type == "video":
+                units = next(video_samples)
+                rewritten = av.Packet(b"".join(len(unit).to_bytes(4, "big") + unit for unit in units))
+                rewritten.pts, rewritten.dts, rewritten.duration = packet.pts, packet.dts, packet.duration
+                rewritten.time_base, rewritten.is_keyframe = packet.time_base, packet.is_keyframe
+                packet = rewritten
+            packet.stream = output
+            dst.mux(packet)
+    plain.unlink()
+    return path
+
+
 def ltx_models(root, directory: Path, *, installed: bool, on_change=lambda: None):
     """A real ``LtxModels`` over ``directory``; ``installed`` puts every model file there."""
     from jasna.gui.ltx_models import LtxModels
@@ -177,7 +237,8 @@ def write_non_utf8_metadata_source(path: Path) -> Path:
     subprocess.run(
         [
             resolve_executable("ffmpeg"), "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", "testsrc2=size=256x256:rate=12:duration=2",
+            # 384 px wide: the narrowest frame hevc_amf encodes.
+            "-f", "lavfi", "-i", "testsrc2=size=384x256:rate=12:duration=2",
             "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
             "-i", str(chapters), "-map", "0", "-map", "1", "-map_chapters", "2",
             "-metadata", f"title={marker.decode()}",
@@ -190,3 +251,19 @@ def write_non_utf8_metadata_source(path: Path) -> Path:
     assert data.count(marker) >= 2
     path.write_bytes(data.replace(marker, b"JASNA\x90TAG"))
     return path
+
+
+def offload_bundle_targets(path: Path) -> set[str]:
+    """Target IDs in an uncompressed clang offload bundle (``.hipfb``)."""
+    data = path.read_bytes()
+    magic = b"__CLANG_OFFLOAD_BUNDLE__"
+    assert data.startswith(magic), f"{path.name} is not an uncompressed offload bundle"
+    (count,) = struct.unpack_from("<Q", data, len(magic))
+    offset = len(magic) + 8
+    targets = set()
+    for _ in range(count):
+        _, _, id_length = struct.unpack_from("<QQQ", data, offset)
+        offset += 24
+        targets.add(data[offset:offset + id_length].decode())
+        offset += id_length
+    return targets

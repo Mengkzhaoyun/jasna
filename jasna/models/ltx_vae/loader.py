@@ -11,13 +11,20 @@ from typing import TypeVar
 
 import torch
 from torch import nn
+from torch.utils._triton import has_triton_package
 
+from jasna.accelerator import is_amd_device
 from jasna.ltx.model_files import open_tensors
 from jasna.models.ltx_vae.diffusion_video_decoder import DiffusionVideoDecoder
 from jasna.models.ltx_vae.tiling import TileSizeConfig
-from jasna.models.ltx_vae.transformer import compile_diffusion_blocks, enable_fused_attention
-from jasna.models.ltx_vae.video_encoder import VideoEncoder, compile_video_encoder
-from jasna.tensor_utils import compiles_bf16
+from jasna.models.ltx_vae.transformer import compile_diffusion_blocks, enable_fused_kernels
+from jasna.models.ltx_vae.video_encoder import (
+    KITCHEN_DOWN_BLOCKS,
+    VideoEncoder,
+    compile_video_encoder,
+    enable_kitchen_conv3d,
+)
+from jasna.tensor_utils import half_dtype
 
 _VAE_CLASS_NAME = "CausalDiffusionVAE"
 _DECODER_CLASS_NAME = "NADiffusionDecoder"
@@ -155,14 +162,16 @@ def decoder_state_dict(checkpoint: dict[str, torch.Tensor]) -> dict[str, torch.T
         raise
 
 
-def _build_bf16(factory: Callable[[], _Model], state: dict[str, torch.Tensor], device: torch.device) -> _Model:
+def _build(
+    factory: Callable[[], _Model], state: dict[str, torch.Tensor], device: torch.device, dtype: torch.dtype
+) -> _Model:
     model, result = None, None
     converted = {}
     try:
         with torch.device("meta"):
             model = factory()
         for name, tensor in state.items():
-            converted[name] = tensor.to(torch.bfloat16)
+            converted[name] = tensor.to(dtype)
         model.load_state_dict(converted, strict=True, assign=True)
         result = model.to(device).eval().requires_grad_(False)
         return result
@@ -174,25 +183,37 @@ def _build_bf16(factory: Callable[[], _Model], state: dict[str, torch.Tensor], d
 
 
 def load_video_encoder(vae_path: Path, device: torch.device) -> VideoEncoder:
-    """bf16 eval ``VideoEncoder``; call it on ``(B, 3, 1+8k, H, W)`` pixels in [-1, 1]."""
+    """Eval ``VideoEncoder`` in ``half_dtype(device)`` (before SM 8.0 fp16 with an fp32 tail; on
+    AMD the full-resolution head in fp16 on comfy-kitchen's conv3d); call it on
+    ``(B, 3, 1+8k, H, W)`` pixels in [-1, 1] for bf16 latents."""
     checkpoint, encoder = {}, None
     try:
         with open_tensors(vae_path) as reader:
             kwargs = encoder_kwargs(read_vae_config(reader))
             checkpoint = _read_tensors(reader, ("encoder.", "per_channel_statistics."))
-        encoder = _build_bf16(lambda: VideoEncoder(**kwargs), encoder_state_dict(checkpoint), device)
-        if compiles_bf16(device):
-            contiguous_weights = list(encoder.state_dict().values())
-            encoder.to(memory_format=torch.channels_last_3d)
-            _clear_tensors(contiguous_weights, encoder)
-            compile_video_encoder(device)
+        encoder = _build(lambda: VideoEncoder(**kwargs), encoder_state_dict(checkpoint), device, torch.bfloat16)
+        dtype = half_dtype(device)
+        bf16_contiguous_weights = list(encoder.state_dict().values())
+        if dtype == torch.float16:
+            encoder.to_fp16_with_float32_tail()
+        elif is_amd_device(device):
+            encoder.to_fp16_head(KITCHEN_DOWN_BLOCKS)
+            enable_kitchen_conv3d()
+        # Without Triton the encoder runs eagerly: there MIOpen and ROCm's copies run the tail faster
+        # in NCDHW (1.39 -> 1.28 s per 512 window on an R9700); kitchen's head needs channels-last.
+        eager_amd = is_amd_device(device) and not has_triton_package()
+        for layer in (encoder.conv_in, *encoder.down_blocks[:KITCHEN_DOWN_BLOCKS]) if eager_amd else (encoder,):
+            layer.to(memory_format=torch.channels_last_3d)
+        _clear_tensors(bf16_contiguous_weights, encoder)
+        compile_video_encoder(device, dtype)
         return encoder
     finally:
         _clear_tensors(checkpoint.values(), encoder)
 
 
 def load_video_decoder(vae_path: Path, tuned_decoder_path: Path, device: torch.device) -> DiffusionVideoDecoder:
-    """bf16 eval ``DiffusionVideoDecoder`` with the fine-tuned decoder tensors overlaid."""
+    """Eval ``DiffusionVideoDecoder`` in ``half_dtype(device)`` (fp16 before SM 8.0) with the
+    fine-tuned decoder tensors overlaid."""
     decoder, complete = None, False
     checkpoint, tuned, overlay = {}, {}, {}
     try:
@@ -200,7 +221,8 @@ def load_video_decoder(vae_path: Path, tuned_decoder_path: Path, device: torch.d
             kwargs = decoder_kwargs(read_vae_config(reader))
             checkpoint = _read_tensors(reader, ("decoder.", "per_channel_statistics."))
         state = decoder_state_dict(checkpoint)
-        decoder = _build_bf16(lambda: DiffusionVideoDecoder(**kwargs), state, device)
+        dtype = half_dtype(device)
+        decoder = _build(lambda: DiffusionVideoDecoder(**kwargs), state, device, dtype)
         with open_tensors(tuned_decoder_path) as reader:
             tuned = _read_tensors(reader, ("",))
         own = decoder.state_dict()
@@ -210,8 +232,8 @@ def load_video_decoder(vae_path: Path, tuned_decoder_path: Path, device: torch.d
         for name, tensor in tuned.items():
             overlay[name] = tensor.to(own[name].dtype)
         decoder.load_state_dict(overlay, strict=False)
-        enable_fused_attention(device)
-        compile_diffusion_blocks(device)
+        enable_fused_kernels(device)
+        compile_diffusion_blocks(device, dtype)
         complete = True
         return decoder
     except BaseException:
@@ -235,8 +257,9 @@ def decode_latent(
 ) -> torch.Tensor:
     """Tiled decode of a normalized ``(B, 128, T, h, w)`` latent to ``(B, 3, F, H, W)`` pixels in ~[-1, 1].
 
-    The tile layout is chosen from ``free_bytes`` (activation budget); raises ``ValueError``
-    when even the minimum tile does not fit.
+    The decoder computes in its own dtype; the pixels come back in ``latent``'s. The tile layout
+    is chosen from ``free_bytes`` (activation budget); raises ``ValueError`` when even the
+    minimum tile does not fit.
     """
     _b, _c, frames, height, width = latent.shape
     scale = decoder.video_downscale_factors
@@ -248,7 +271,8 @@ def decode_latent(
     first_of_layout = layout not in _decoded_layouts
     if first_of_layout:
         _log_tiling(*layout)
-    video = torch.cat(list(decoder.tiled_decode(latent, tiling, generator)), dim=2)
+    chunks = decoder.tiled_decode(latent.to(decoder.conv_in.weight.dtype), tiling, generator)
+    video = torch.cat(list(chunks), dim=2).to(latent.dtype)
     if first_of_layout:
         _decoded_layouts.add(layout)
         _free_compile_garbage()

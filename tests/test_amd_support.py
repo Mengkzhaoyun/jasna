@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import replace
 from fractions import Fraction
@@ -107,8 +108,44 @@ def test_video_encoder_selects_amf_and_normalizes_cq(monkeypatch, tmp_path) -> N
     )
     assert encoder.encoder_name == "h264_amf"
     assert encoder.spec.frame_format == "nv12"
-    assert encoder.encoder_options["qvbr_quality_level"] == "21"
+    assert encoder.encoder_options["rc"] == "cqp"
+    assert all(encoder.encoder_options[key] == "21" for key in ("qp_i", "qp_p", "qp_b"))
     assert "cq" not in encoder.encoder_options
+    assert "qvbr_quality_level" not in encoder.encoder_options
+
+
+def test_amf_h264_defaults_to_constant_qp_without_bitrate_cap() -> None:
+    from jasna.media.video_encoder import resolve_encoder_options
+
+    _, options = resolve_encoder_options(
+        AcceleratorVendor.AMD,
+        "h264",
+        replace(_metadata(), video_bitrate=20_000_000),
+        {},
+        smart_fragment=False,
+    )
+    assert options["rc"] == "cqp"
+    assert all(options[key] == "24" for key in ("qp_i", "qp_p", "qp_b"))
+    assert options["preanalysis"] == "0"
+    assert options["vbaq"] == "0"
+    assert "qvbr_quality_level" not in options
+    assert "maxrate" not in options
+
+
+def test_amf_h264_qvbr_override_keeps_cq_and_source_bitrate_cap() -> None:
+    from jasna.media.video_encoder import resolve_encoder_options
+
+    _, options = resolve_encoder_options(
+        AcceleratorVendor.AMD,
+        "h264",
+        replace(_metadata(), video_bitrate=20_000_000),
+        {"cq": 21, "rc": "qvbr"},
+        smart_fragment=False,
+    )
+    assert options["rc"] == "qvbr"
+    assert options["qvbr_quality_level"] == "21"
+    assert not {"qp_i", "qp_p", "qp_b"} & options.keys()
+    assert options["maxrate"] == "20000000"
 
 
 def test_amf_hevc_maps_cq_to_constant_qp(monkeypatch, tmp_path) -> None:
@@ -156,7 +193,7 @@ def test_amf_hevc_cqp_skips_source_bitrate_cap(monkeypatch, tmp_path) -> None:
 @pytest.mark.parametrize(
     ("settings", "smart_fragment", "frame_format", "expected_qindex"),
     [
-        ({}, False, "p010le", "160"),
+        ({}, False, "p010le", "80"),
         ({"cq": 21}, False, "p010le", "105"),
         ({"qvbr_quality_level": 51}, False, "p010le", "255"),
         ({"cq": 1}, True, "nv12", "5"),
@@ -421,7 +458,7 @@ def test_amf_decoder_survives_pyav18_time_base_regression(monkeypatch) -> None:
 def test_yuv_eager_converter_runs_on_gpu_planes(monkeypatch) -> None:
     import jasna.media.yuv_to_rgb as module
 
-    monkeypatch.setattr(module, "is_nvidia_device", lambda _device: False)
+    monkeypatch.setattr(module, "has_precompiled_kernels", lambda _device: False)
     H = W = 16
     generator = torch.Generator().manual_seed(0)
     y = torch.randint(16, 236, (H, W), dtype=torch.uint8, generator=generator)
@@ -463,38 +500,75 @@ def test_amf_8bit_downgrade_drops_bitdepth(monkeypatch, tmp_path) -> None:
     assert encoder.encoder_options["forced_idr"] == "1"
     assert "bitdepth" not in encoder.encoder_options
 
+class _FakeRfDetrCore:
+    def __init__(self):
+        self.loaded_state = None
+        self.dtype = torch.float32
+        self.input_dtypes: list[torch.dtype] = []
+        self.runs_sync_free_export = False
+
+    def to(self, *, device, dtype):
+        self.dtype = dtype
+        return self
+
+    def eval(self):
+        return self
+
+    def load_state_dict(self, state):
+        self.loaded_state = state
+
+    def __call__(self, x):
+        self.input_dtypes.append(x.dtype)
+        batch = x.shape[0]
+        return (
+            torch.zeros(batch, 5, 4, dtype=self.dtype),
+            torch.zeros(batch, 5, 3, dtype=self.dtype),
+            torch.zeros(batch, 5, 8, 8, dtype=self.dtype),
+        )
+
+
+class _FakeRfDetrModel:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.model_config = SimpleNamespace(positional_encoding_size=48)
+        self.model = SimpleNamespace(model=_FakeRfDetrCore())
+
+
+def _install_fake_rfdetr(monkeypatch, checkpoint: dict) -> list[tuple]:
+    import jasna.mosaic.rfdetr_torch_runner as module
+
+    loads: list[tuple] = []
+
+    def load(*args, **kwargs):
+        loads.append((args, kwargs))
+        return checkpoint
+
+    def interpolate_position_embeddings(state, positional_encoding_size):
+        state["interpolated_to"] = positional_encoding_size
+
+    monkeypatch.setitem(sys.modules, "rfdetr", SimpleNamespace(RFDETRSegMedium=_FakeRfDetrModel))
+    monkeypatch.setitem(
+        sys.modules,
+        "rfdetr.config",
+        SimpleNamespace(PretrainWeightsCompatibilityWarning=UserWarning),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "rfdetr.models.weights",
+        SimpleNamespace(interpolate_position_embeddings=interpolate_position_embeddings),
+    )
+    monkeypatch.setattr(module.torch, "load", load)
+    monkeypatch.setattr(module, "export_without_host_syncs", lambda core: setattr(core, "runs_sync_free_export", True))
+    monkeypatch.setattr(module, "fuse_segmentation_head", lambda core, resolution: setattr(core, "fused_head_resolution", resolution))
+    return loads
+
+
 def test_rfdetr_torch_runner_maps_outputs(monkeypatch, tmp_path) -> None:
     import jasna.mosaic.rfdetr_torch_runner as module
 
     weights = tmp_path / "rfdetr-v6.pt"
     weights.write_bytes(b"pt")
-
-    class FakeCore:
-        def to(self, _device):
-            return self
-
-        def eval(self):
-            return self
-
-        def __call__(self, x):
-            batch = x.shape[0]
-            return {
-                "pred_boxes": torch.zeros(batch, 5, 4),
-                "pred_logits": torch.zeros(batch, 5, 3),
-                "pred_masks": torch.zeros(batch, 5, 8, 8),
-            }
-
-    class FakeModel:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.model = SimpleNamespace(model=FakeCore())
-
-    monkeypatch.setitem(sys.modules, "rfdetr", SimpleNamespace(RFDETRSegMedium=FakeModel))
-    monkeypatch.setattr(
-        module.torch,
-        "load",
-        lambda *_a, **_k: {"model": {"class_embed.weight": torch.zeros(3, 256)}},
-    )
+    _install_fake_rfdetr(monkeypatch, {"model": {"class_embed.weight": torch.zeros(3, 256)}})
 
     runner = module.RfDetrTorchRunner(
         weights,
@@ -514,6 +588,8 @@ def test_rfdetr_torch_runner_maps_outputs(monkeypatch, tmp_path) -> None:
     assert runner.outputs["masks"].ndim == 4
     # num_classes derived from class_embed rows - 1 (rfdetr adds a reserve slot).
     assert runner._wrapper.kwargs["num_classes"] == 2
+    assert runner._core.runs_sync_free_export
+    assert runner._core.fused_head_resolution == 576
 
     out = runner.infer({"input": torch.zeros(2, 3, 576, 576)})
     assert set(out) == {"dets", "labels", "masks"}
@@ -524,6 +600,119 @@ def test_rfdetr_torch_runner_maps_outputs(monkeypatch, tmp_path) -> None:
     runner.close()
     with pytest.raises(RuntimeError, match="closed"):
         runner.infer({"input": torch.zeros(2, 3, 576, 576)})
+
+
+def test_rfdetr_torch_runner_loads_the_checkpoint_once_weights_only(monkeypatch, tmp_path) -> None:
+    import jasna.mosaic.rfdetr_torch_runner as module
+
+    weights = tmp_path / "rfdetr-v6.pt"
+    weights.write_bytes(b"pt")
+    state = {"class_embed.weight": torch.zeros(3, 256)}
+    loads = _install_fake_rfdetr(monkeypatch, {"model": state})
+
+    runner = module.RfDetrTorchRunner(
+        weights,
+        input_shapes=[(2, 3, 576, 576)],
+        device=torch.device("cpu"),
+        fp16=False,
+        resolution=576,
+        variant="medium",
+    )
+
+    assert loads == [((weights,), {"map_location": "cpu", "weights_only": True})]
+    assert runner._wrapper.kwargs["pretrain_weights"] is None
+    assert runner._core.loaded_state is state
+    assert state["interpolated_to"] == 48
+
+
+def test_rfdetr_torch_runner_loads_the_first_batch_libraries_on_a_thread_before_building(monkeypatch, tmp_path) -> None:
+    import jasna.mosaic.rfdetr_torch_runner as module
+
+    weights = tmp_path / "rfdetr-v6.pt"
+    weights.write_bytes(b"pt")
+    loads = _install_fake_rfdetr(monkeypatch, {"model": {"class_embed.weight": torch.zeros(3, 256)}})
+    started = []
+
+    class Thread:
+        def __init__(self, target, args, name, daemon):
+            self.call = (target, args, daemon)
+
+        def start(self):
+            started.append((self.call, len(loads)))
+
+    monkeypatch.setattr(module.threading, "Thread", Thread)
+    module.RfDetrTorchRunner(
+        weights, input_shapes=[(2, 3, 576, 576)], device=torch.device("cpu"), fp16=True, resolution=576, variant="medium"
+    )
+    assert started == [((module.load_first_batch_libraries, (torch.device("cpu"), torch.float16), False), 0)]
+    module.load_first_batch_libraries(torch.device("cpu"), torch.float32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_rfdetr_torch_runner_load_failure_exits_without_a_teardown_crash(tmp_path) -> None:
+    pytest.importorskip("rfdetr")
+    weights = tmp_path / "rfdetr-v6.pt"
+    weights.write_bytes(b"not a checkpoint")
+    code = (
+        "import sys, torch, rfdetr\n"
+        "from jasna.accelerator import configure_rocm_process_env\n"
+        "from jasna.mosaic.rfdetr_torch_runner import RfDetrTorchRunner\n"
+        "configure_rocm_process_env()\n"
+        "torch.zeros(1, device='cuda')\n"
+        "RfDetrTorchRunner(sys.argv[1], [(2, 3, 576, 576)], torch.device('cuda'), "
+        "fp16=True, resolution=576, variant='medium')\n"
+    )
+    result = subprocess.run([sys.executable, "-c", code, str(weights)], capture_output=True, text=True)
+    assert result.returncode == 1, result.stderr
+
+
+def test_rfdetr_torch_runner_fp16_runs_a_half_model_without_autocast(monkeypatch, tmp_path) -> None:
+    import jasna.mosaic.rfdetr_torch_runner as module
+
+    weights = tmp_path / "rfdetr-v6.pt"
+    weights.write_bytes(b"pt")
+    _install_fake_rfdetr(monkeypatch, {"model": {"class_embed.weight": torch.zeros(3, 256)}})
+    monkeypatch.setattr(
+        module.torch,
+        "autocast",
+        lambda *_a, **_k: pytest.fail("autocast recasts the weights on every call"),
+    )
+
+    runner = module.RfDetrTorchRunner(
+        weights,
+        input_shapes=[(2, 3, 576, 576)],
+        device=torch.device("cpu"),
+        fp16=True,
+        resolution=576,
+        variant="medium",
+    )
+    out = runner.infer({"input": torch.zeros(2, 3, 576, 576)})
+
+    assert runner._core.dtype == torch.float16
+    assert runner._core.input_dtypes[-1] == torch.float16
+    assert out["dets"].dtype == torch.float32
+    assert out["labels"].dtype == torch.float32
+
+
+def test_rfdetr_torch_runner_fp16_keeps_the_masks_half(monkeypatch, tmp_path) -> None:
+    import jasna.mosaic.rfdetr_torch_runner as module
+
+    weights = tmp_path / "rfdetr-v6.pt"
+    weights.write_bytes(b"pt")
+    _install_fake_rfdetr(monkeypatch, {"model": {"class_embed.weight": torch.zeros(3, 256)}})
+
+    runner = module.RfDetrTorchRunner(
+        weights,
+        input_shapes=[(2, 3, 576, 576)],
+        device=torch.device("cpu"),
+        fp16=True,
+        resolution=576,
+        variant="medium",
+    )
+    out = runner.infer({"input": torch.zeros(2, 3, 576, 576)})
+
+    assert runner.outputs["masks"].dtype == torch.float16
+    assert out["masks"].dtype == torch.float16
 
 
 def test_rfdetr_torch_runner_rejects_unknown_variant(monkeypatch, tmp_path) -> None:

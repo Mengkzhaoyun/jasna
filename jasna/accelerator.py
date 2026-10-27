@@ -5,17 +5,26 @@ from contextlib import nullcontext
 import ctypes
 from enum import StrEnum
 import functools
+import logging
 import os
+from pathlib import Path
 import sys
 from typing import Any
 
 import torch
+
+log = logging.getLogger(__name__)
 
 # BasicVSR++ meets a new convolution batch for every clip length. FAST never
 # writes the user FindDb, and the Windows ROCm wheels ship no system FindDb
 # (ROCm/TheRock#7958), so every miss falls back to slow heuristic kernels forever.
 # HYBRID runs a real find once per new problem and keeps the result across runs
 # (issue #481: 4x faster primary restoration once the DB is seeded).
+#
+# That first find also benchmarks the im2col/GEMM conv solvers, whose workspace
+# is about 27x the conv input: 17 GiB for the LTX VAE encoder at 768, so a
+# 16 GB card runs out of memory, the find never finishes and every run fails.
+# The CK solvers win those benchmarks anyway; without GEMM the peak is 4.3 GiB.
 #
 # Expandable segments release memory by unmapping virtual address ranges rather
 # than by a device-synchronizing free, so a VramOffloader empty_cache() could
@@ -24,15 +33,36 @@ import torch
 # names cover the versions in the field; whichever one the build reads wins.
 def apply_rocm_env_defaults(environ: MutableMapping[str, str]) -> None:
     environ.setdefault("MIOPEN_FIND_MODE", "HYBRID")
+    environ.setdefault("MIOPEN_DEBUG_CONV_GEMM", "0")
     environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:False")
     environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:False")
-    environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+    if sys.platform != "win32":
+        environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
+
+
+def has_aotriton_flash_images(torch_lib: Path) -> bool:
+    return any((torch_lib / "aotriton.images").glob("*/flash/attn_fwd.zip"))
 
 
 def configure_rocm_process_env() -> None:
     """Apply the ROCm defaults to this process; call at entry points before GPU work."""
-    if torch.version.hip:
-        apply_rocm_env_defaults(os.environ)
+    if not torch.version.hip:
+        return
+    apply_rocm_env_defaults(os.environ)
+    # MIOpen then runs channels-last 3D convs in NDHWC instead of transposing every input, weight
+    # and output: the compiled LTX VAE encoder 5 % faster and 0.5 GiB lighter on an R9700. Eager
+    # encoders (no Triton: Windows ROCm, AMD releases) run 1.6x slower with it, and BasicVSR++ and
+    # RF-DETR pass no channels-last conv inputs.
+    from torch.utils._triton import has_triton_package
+
+    if has_triton_package():
+        os.environ.setdefault("PYTORCH_MIOPEN_SUGGEST_NHWC", "1")
+    # Windows ROCm ships the AOTriton kernel images in a separate device wheel;
+    # without them the first flash/mem-efficient SDPA launch dies with a HIP error.
+    if not has_aotriton_flash_images(Path(torch.__file__).parent / "lib"):
+        log.warning("PyTorch has no AOTriton attention kernels installed; attention runs slower without them")
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
 
 
 class AcceleratorVendor(StrEnum):
@@ -58,6 +88,20 @@ def is_nvidia_device(device: torch.device | str | None = None) -> bool:
 
 def is_amd_device(device: torch.device | str | None = None) -> bool:
     return vendor_for_device(device) is AcceleratorVendor.AMD
+
+
+def supports_licensed_ltx_on_amd() -> bool:
+    """Whether this OS has the protected AMD worker; GPU kernels are checked separately."""
+    return sys.platform in {"linux", "win32"}
+
+
+def supports_nvfp4(device: torch.device | str) -> bool:
+    return is_nvidia_device(device) and torch.cuda.get_device_capability(device)[0] >= 10
+
+
+def amd_gpu_architecture(device: torch.device | str) -> str:
+    """The AMD GPU's architecture without target features, e.g. ``gfx1201``."""
+    return torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
 
 
 def device_module(device: torch.device | str):
@@ -165,9 +209,10 @@ def _nvml_free_bytes(device: torch.device) -> int:
 
 def device_free_bytes(device: torch.device) -> int:
     """VRAM free on the whole GPU. On Windows, CUDA counts only this process's memory (WDDM
-    hides every other process's), so NVML's device-wide figure caps it there."""
+    hides every other process's), so NVML's device-wide figure caps it on NVIDIA there; AMD
+    reads HIP's figure alone."""
     free = torch.cuda.mem_get_info(device)[0]
-    if sys.platform == "win32":
+    if sys.platform == "win32" and is_nvidia_device(device):
         return min(free, _nvml_free_bytes(device))
     return free
 

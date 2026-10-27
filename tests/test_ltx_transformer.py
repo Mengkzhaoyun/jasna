@@ -1,6 +1,5 @@
 import os
 import sys
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -92,13 +91,6 @@ def test_fp16_prompt_attention_keeps_the_block_in_bf16():
     fp16 = T.block_forward(weights, x, cond, tuple(t.half() for t in prompt), rope, heads=heads)
     assert fp16.dtype == torch.bfloat16
     torch.testing.assert_close(fp16, bf16, atol=2e-2, rtol=2e-2)
-
-
-@pytest.mark.parametrize("major, dtype", [(7, torch.float16), (8, torch.bfloat16)])
-def test_prompt_attention_runs_in_fp16_before_sm80(major, dtype, monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(major=major))
-    assert T.prompt_attention_dtype(torch.device("cuda")) == dtype
-    assert T.prompt_attention_dtype(torch.device("cpu")) == torch.bfloat16
 
 
 def test_latent_positions_are_causal_seconds():
@@ -206,6 +198,7 @@ def test_self_attention_falls_back_to_sdpa_off_gpu():
 def test_ltx_refuses_to_run_without_its_kernels(package, monkeypatch):
     import importlib.util
 
+    monkeypatch.setattr(torch.version, "hip", None)
     real_find_spec = importlib.util.find_spec
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == package else real_find_spec(name))
     with pytest.raises(RuntimeError, match=package):
@@ -235,7 +228,7 @@ def test_compiled_functions_fail_instead_of_running_eager_past_the_recompile_lim
 
     monkeypatch.setattr(torch._dynamo.config, "fail_on_recompile_limit_hit", False)
     monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
-    compile_static(T.block_forward, mode="default", device=torch.device("cpu"))
+    compile_static(T.block_forward, mode="default", device=torch.device("cpu"), dtype=torch.bfloat16)
     assert torch._dynamo.config.fail_on_recompile_limit_hit is True
 
 
@@ -291,3 +284,56 @@ def test_compile_cache_lives_in_model_weights_unless_set(monkeypatch):
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", "/elsewhere")
     configure_torch_compile_cache()
     assert os.environ["TORCHINDUCTOR_CACHE_DIR"] == "/elsewhere"
+
+
+def _without_triton(monkeypatch, hip):
+    import importlib.util
+
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "triton" else real_find_spec(name))
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(T, "_quant_kernels", None)
+    monkeypatch.setattr(T, "_kitchen_int8_linear", None)
+
+
+def test_amd_without_triton_runs_the_int8_linears_on_comfy_kitchen(monkeypatch):
+    """Windows ROCm ships no Triton: the ConvRot INT8 linears run on comfy-kitchen instead of torch."""
+    from types import SimpleNamespace
+
+    calls = []
+    kitchen = SimpleNamespace(int8_linear=lambda x, qdata, scales, bias, **options: calls.append(options) or x)
+    monkeypatch.setitem(sys.modules, "comfy_kitchen", kitchen)
+    _without_triton(monkeypatch, "7.0")
+    assert T.enable_quant_kernels(torch.device("cuda")) == "comfy-kitchen"
+    x = torch.zeros(1, 4, 256)
+    weights = {"proj.qdata": torch.zeros(256, 256, dtype=torch.int8), "proj.scales": torch.ones(256)}
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    assert T.linear(weights, "proj", x) is x
+    assert calls == [{"convrot": True, "convrot_groupsize": T.ROT_SIZE}]
+
+
+def test_nvidia_without_triton_kernels_keeps_the_torch_linears(monkeypatch):
+    _without_triton(monkeypatch, None)
+    assert T.enable_quant_kernels(torch.device("cuda")) is None
+
+
+@pytest.mark.parametrize("hip, expected", [("7.0", "int8"), (None, "sdpa")])
+def test_prompt_cross_attention_runs_int8_attention_only_on_amd(monkeypatch, hip, expected):
+    q, k, v = torch.randn(1, 2, 8, 64), torch.randn(1, 2, 4, 64), torch.randn(1, 2, 4, 64)
+    monkeypatch.setattr(T, "_int8_attention", lambda q, k, v: "int8")
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
+    monkeypatch.setattr(T.F, "scaled_dot_product_attention", lambda q, k, v: "sdpa")
+    assert T.cross_attention(q, k, v) == expected
+
+
+def test_amd_runs_ltx_without_triton(monkeypatch):
+    """Windows ROCm ships no Triton; its LTX runs comfy-kitchen and prebuilt kernels instead."""
+    import importlib.util
+
+    comfy_kitchen = pytest.importorskip("comfy_kitchen")
+    real_find_spec = importlib.util.find_spec
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None if name == "triton" else real_find_spec(name))
+    monkeypatch.setattr(torch.version, "hip", "7.0")
+    monkeypatch.setattr(comfy_kitchen, "int8_attention_is_available", lambda device: True)
+    T.require_kernels(torch.device("cuda"))

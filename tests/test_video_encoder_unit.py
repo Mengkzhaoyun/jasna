@@ -33,6 +33,8 @@ from jasna.media.video_encoder import (
 
 from factories import write_double_adts_aac_source
 
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
+
 
 def _fake_metadata(**overrides) -> VideoMetadata:
     defaults = dict(
@@ -534,21 +536,6 @@ class TestEncoderOptions:
         assert enc.encoder_options["maxrate"] == "40000000"
         assert enc.encoder_options["bufsize"] == "80000000"
 
-    def test_amf_h264_output_keeps_source_codec_ceiling(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(
-            video_encoder_module,
-            "vendor_for_device",
-            lambda _device: AcceleratorVendor.AMD,
-        )
-        enc = _make_encoder(
-            tmp_path,
-            codec="h264",
-            codec_name="h264",
-            video_bitrate=20_000_000,
-        )
-        assert enc.encoder_options["maxrate"] == "20000000"
-        assert enc.encoder_options["bufsize"] == "40000000"
-
     def test_no_ceiling_without_source_bitrate(self, tmp_path):
         enc = _make_encoder(tmp_path, video_bitrate=0)
         assert "maxrate" not in enc.encoder_options
@@ -779,7 +766,7 @@ def _buffered_encoder(tmp_path, **meta_overrides) -> VideoEncoder:
     enc._last_emitted_pts = None
     enc._worker_error = None
     enc._encode_queue = MagicMock()
-    enc._build_encode_item = MagicMock(side_effect=lambda frame, pts, apply_lut: (frame, pts, None))
+    enc._build_encode_item = MagicMock(side_effect=lambda frame, pts: (frame, pts, None))
     return enc
 
 
@@ -930,12 +917,6 @@ class TestEncodeBuffer:
         enc.encode("frame", 110)
         assert enc.pts_heap == [10]
 
-    def test_bridge_frame_records_lut_bypass(self, tmp_path):
-        enc = _buffered_encoder(tmp_path)
-        enc.encode("frame", 10, apply_lut=False)
-        assert list(enc.frame_buffer) == ["frame"]
-        assert list(enc._lut_flags) == [False]
-
     def test_encode_pushes_to_buffer_and_heap(self, tmp_path):
         enc = _buffered_encoder(tmp_path)
         enc.encode("frame0", 10)
@@ -1008,8 +989,8 @@ class TestWorkerErrorChannel:
 
         worker = threading.Thread(target=enc._encode_worker, daemon=True)
         worker.start()
-        enc._encode_queue.put((MagicMock(), 0, True, None))
-        enc._encode_queue.put((MagicMock(), 1, True, None))
+        enc._encode_queue.put((MagicMock(), 0, None))
+        enc._encode_queue.put((MagicMock(), 1, None))
         enc._encode_queue.join()
         enc._encode_queue.put(enc._stop_sentinel)
         worker.join(timeout=5)

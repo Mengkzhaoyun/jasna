@@ -21,6 +21,8 @@ from jasna.mosaic.detection_registry import (
     require_detection_model_weights,
 )
 
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
+
 
 def test_default_detection_model_is_rfdetr_v6() -> None:
     assert DEFAULT_DETECTION_MODEL_NAME == "rfdetr-v6"
@@ -405,3 +407,12 @@ def test_resolve_detection_model_rejects_a_missing_explicit_path(tmp_path) -> No
 
     with pytest.raises(FileNotFoundError):
         resolve_detection_model("rfdetr-v6", str(tmp_path / "missing.onnx"), None)
+
+
+@pytest.mark.parametrize(("amd", "expected"), [(True, 8), (False, 4)])
+def test_default_detection_batch_size_is_eight_on_amd(monkeypatch, amd, expected):
+    import jasna.mosaic.detection_registry as registry
+
+    monkeypatch.setattr(registry, "is_amd_device", lambda _device: amd)
+
+    assert registry.default_detection_batch_size("cuda:0") == expected

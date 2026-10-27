@@ -3,6 +3,9 @@
 You don't have to restore the whole video. Choose only the scenes with mosaics.
 Jasna copies the rest without changes, so it is much faster and the other
 parts keep their original quality. The output is still the full video.
+With a [Color LUT](advanced_processing.md#color-lut) or
+[Sharpening](advanced_processing.md#sharpening), the rest is encoded again
+instead, so they cover the whole video. This takes longer.
 
 ## Segment Editor (GUI)
 
@@ -26,8 +29,9 @@ Open it with the scissors button on a video in the queue.
   **Reset view** goes back.
 - With ranges selected, the output keeps the codec of the source video. The
   **Codec** setting in **Encoding** is not used, because the parts between
-  ranges are copied. If a video can't be processed in parts, the editor tells
-  you at once.
+  ranges are copied. If another codec is chosen there, its CQ and custom
+  encoder settings are not used either. If a video can't be processed in
+  parts, the editor tells you at once.
 - A BasicVSR++ range and an LTX range need some space between them. If they
   are too close, the editor tells you.
 
@@ -102,7 +106,8 @@ jasna --input videos/ --output restored/ --restoration-model-name ltx --ltx-auto
 ```
 
 The number is the mosaic size, as % of the video height. The output keeps
-the codec of the source video. If a video can't be processed in parts, it is
+the codec of the source video. If that is not `--codec`, `--cq` and
+`--encoder-settings` are not used for it. If a video can't be processed in parts, it is
 restored whole with LTX. Cannot be used with `--segments` or `--fmp4`.
 
 ## Working Directory
@@ -114,3 +119,9 @@ folder next to the output. To use another disk (faster or bigger), set
 ```bash
 jasna --input input.mp4 --output output.mp4 --segments "10-25" --working-directory /fast/scratch
 ```
+
+LTX keeps saved work in `.{output name}.jasna-resume` in the same folder
+(default: next to the output; in a Working Directory the name also gets a short code),
+including range jobs and auto split. It can take several GB.
+It stays after pause, an error, closing Jasna or removing a queue item, and is deleted
+after the video finishes successfully. Keep the same Working Directory when continuing.

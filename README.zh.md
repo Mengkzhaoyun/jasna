@@ -31,7 +31,7 @@ Jasna 修复视频和图片中的马赛克。Jasna 免费，提供简单的应�
 ## Jasna 能做什么
 
 - 找出视频中的马赛克并修复。画面的其他部分不会被改动。
-- 两个修复模型：快速的 **BasicVSR++**（免费），以及慢但细节更多的 **LTX**（支持者专享，仅限 NVIDIA）。
+- 两个修复模型：快速的 **BasicVSR++**（免费），以及慢但细节更多的 **LTX**（支持者专享，支持 NVIDIA 或兼容的 AMD 显卡；Windows AMD LTX 为测试版）。
 - 在**区间编辑器**中只修复你选择的部分，并可预览。
 - 可用于 VR180 视频和静态图片（支持者专享的 SD 1.5 模型）。
 - 在**视频播放器**中实时观看修复后的视频，不用生成文件。
@@ -49,10 +49,11 @@ Jasna 修复视频和图片中的马赛克。Jasna 免费，提供简单的应�
 - NVIDIA：你的 GPU 在 NVIDIA 的 [GPU 表格](https://developer.nvidia.com/cuda/gpus)
   中需要计算能力 7.5 或更高。
 - AMD：ROCm 支持的 GPU（Radeon RX 7000/9000、Radeon 780M/760M/740M、Ryzen AI）。
-  Windows 上需要 AMD Adrenalin 驱动 26.8.1 或更新。二次修复和 LTX 仅限 NVIDIA。
+  Windows 上需要 AMD Adrenalin 驱动 26.8.1 或更新。二次修复仅限 NVIDIA。
+  LTX 支持 Linux 上的 Radeon RX 7000/9000 和 Radeon AI PRO R9700；Windows AMD LTX 为测试版，尚待 GPU 测试。
 - 磁盘格式：Windows 用 NTFS；Linux 用 ext4、Btrfs、XFS 或 ZFS。不支持网络磁盘。请使用
   固态硬盘（SSD）；在机械硬盘（HDD）上 Jasna 启动和加载模型都很慢。
-- LTX 需要 NVIDIA RTX GPU，至少 8 GB 显存和 16 GB 内存。见
+- LTX 需要 NVIDIA RTX 显卡或兼容的 AMD 显卡，至少 8 GB 显存和 16 GB 内存。见
   [LTX 需要什么](docs/zh/models.md#ltx-需要什么)。
 
 </details>
@@ -64,12 +65,27 @@ Jasna 修复视频和图片中的马赛克。Jasna 免费，提供简单的应�
 3. 启动应用：
    - Windows：双击 `jasna.exe`。
    - Linux NVIDIA：运行 `jasna` 文件。
-   - Linux AMD：运行 `run_jasna_amd.sh`。
+   - Linux AMD：先安装一次 AMD 的 AMF 视频运行库。我们测试过
+     [AMF 26.20](https://repo.radeon.com/amf/26.20/)：
+
+     ```bash
+     curl -fLO https://repo.radeon.com/amf/26.20/amf_installer_26.20.zip
+     unzip amf_installer_26.20.zip
+     sudo bash amf_installer_26.20.sh
+     ```
+
+     按提示同意 AMD 的许可协议，然后运行 `run_jasna_amd.sh`。
+     如果使用 Distrobox，请在运行 Jasna 的同一个容器内安装 AMF。
 4. 添加视频，选择设置，点击界面底部的 **▶** 按钮。
 
 **第一个任务会很慢。** 在 NVIDIA 上，Jasna 会先为你的 GPU 准备模型。这大约需要
 **15–60 分钟**，只会发生一次。在此期间请关闭其他应用，也不要使用电脑。更新 Jasna 时，
 把 `model_weights` 文件夹复制到新版本中，这样就不用再等一次。
+
+**0.12 的 LTX 更新：** 从 0.11.3 复制的模型需要重新下载，NVIDIA 也一样。
+请按 **▶** 并同意更新模型。原来的许可证代码和共用 VAE 文件仍然可用。
+[手动下载模型](docs/zh/models.md#手动下载-ltx)时，Jasna 0.12 请使用 `0.12.0`
+分支，0.11.3 或更早版本请使用 `main`。
 
 每个设置都有提示：把鼠标移到 ⓘ 图标上即可查看。GPU 显存不足？降低
 **最大片段大小**，例如从 `90` 降到 `60`。见[调整显存和 GPU 占用](docs/zh/tuning.md)。
@@ -91,7 +107,7 @@ Jasna 是免费的。你的支持用于训练新模型，主要是租用 GPU。�
 | 支持 | 模型 |
 | --- | --- |
 | 累计 **15 美元**或以上 | **UNet 4x**：让修复区域更清晰。<br>**SD 1.5**：用于静态图片的实验性模型。 |
-| **25 美元** | **UNet 4x** 和 **SD 1.5**，再加上<br>**LTX**：比 BasicVSR++ 慢很多，但细节更多。仅限 NVIDIA。包含这个 LTX 模型以后的更新。 |
+| **25 美元** | **UNet 4x** 和 **SD 1.5**，再加上<br>**LTX**：比 BasicVSR++ 慢很多，但细节更多。支持 NVIDIA 或兼容的 AMD 显卡；Windows AMD LTX 为测试版。包含这个 LTX 模型以后的更新。 |
 
 **截至 2026 年 10 月 14 日（含当天）**累计支持 **15 美元或以上**的支持者可免费获得 LTX。
 
@@ -142,6 +158,8 @@ Jasna 是免费的。你的支持用于训练新模型，主要是租用 GPU。�
 一个许可证码可用于 **3 台电脑或云工作区**。激活后，Jasna 可以离线使用。租用的 GPU：
 见[云 GPU](docs/zh/cloud.md)。
 
+激活后，打开**激活 Jasna**会联网查询并显示已用设备名额。
+
 什么算新电脑：Windows 上是更换主板；Linux 上是重新安装 Linux。每种情况都会占用
 3 个名额中的 1 个。重装 Windows 或更换显卡、硬盘、内存不会占用新名额：用同一个
 许可证码重新激活即可。少数 Windows 电脑的主板没有真正的 ID，在这些电脑上更换
@@ -174,6 +192,10 @@ Jasna 0.10 的邮箱和密钥已不能使用，请向购买的地方申请新的
 LTX 的工作方式不同。它会把视频处理 4 遍：查找马赛克、准备、用扩散模型修复、保存。它更慢，但能加入更多真实细节。
 画质可选：标准（默认，最快）、良好（慢约 1.5 倍）、高画质（慢约 2.5 倍）、顶级（慢约 5 倍）。见
 [选择模型](docs/zh/models.md#修复模型)。
+
+LTX 任务支持暂停与继续，包括区间任务和自动分配任务。见[暂停与继续](docs/zh/models.md#暂停与继续)。
+
+更新后，Jasna 可能会要求重新下载所选的 LTX 模型。原来的许可证代码仍然可用。
 
 ### 命令行
 

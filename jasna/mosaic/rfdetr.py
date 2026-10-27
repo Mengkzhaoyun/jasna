@@ -9,7 +9,7 @@ from torch.nn import functional as F
 
 logger = logging.getLogger(__name__)
 
-from jasna.accelerator import is_amd_device, is_nvidia_device
+from jasna.accelerator import current_stream, is_amd_device, is_nvidia_device, new_stream, stream_context
 from jasna.engine_paths import get_onnx_tensorrt_engine_path
 from jasna.media.resize_normalize import ResizeNormalizer
 from jasna.mosaic.detections import Detections
@@ -103,6 +103,7 @@ class RfDetrMosaicDetectionModel:
                 variant=torch_variant,
             )
             self.engine_path = self.weights_path
+            self._stream = new_stream(self.device)
         elif is_nvidia_device(self.device):
             self.engine_path = get_onnx_tensorrt_engine_path(
                 self.weights_path, batch_size=self.batch_size, fp16=bool(fp16),
@@ -120,6 +121,7 @@ class RfDetrMosaicDetectionModel:
                 ],
                 device=self.device,
             )
+            self._stream = None
         else:
             raise RuntimeError(
                 f"RF-DETR is not supported on device backend {self.device.type!r}"
@@ -212,27 +214,24 @@ class RfDetrMosaicDetectionModel:
         topk_values, topk_indexes = torch.topk(prob.view(b, -1), k, dim=1)
         topk_boxes = topk_indexes // c
 
-        x_c, y_c, w, h = pred_boxes.unbind(-1)
-        boxes = torch.stack((x_c - 0.5 * w, y_c - 0.5 * h, x_c + 0.5 * w, y_c + 0.5 * h), dim=-1)
-        boxes = boxes.gather(1, topk_boxes.unsqueeze(-1).expand(b, k, 4))
-
         th, tw = target_hw
-        boxes = boxes * boxes.new_tensor((tw, th, tw, th))
+        x_c, y_c, w, h = pred_boxes.unbind(-1)
+        boxes = torch.stack(
+            ((x_c - 0.5 * w) * tw, (y_c - 0.5 * h) * th, (x_c + 0.5 * w) * tw, (y_c + 0.5 * h) * th), dim=-1
+        )
+        boxes = boxes.gather(1, topk_boxes.unsqueeze(-1).expand(b, k, 4))
 
         hm, wm = pred_masks.shape[-2], pred_masks.shape[-1]
         masks = pred_masks.gather(1, topk_boxes[:, :, None, None].expand(b, k, hm, wm)) > 0.0
 
-        valid_mask = topk_values > score_threshold  # (B, K)
-        boxes_cpu = boxes.to(device='cpu', dtype=torch.float32).numpy()  # (B, K, 4)
-        valid_mask_cpu = valid_mask.cpu().numpy()  # (B, K)
-        
-        boxes_list: list[np.ndarray] = []
-        masks_list: list[torch.Tensor] = []
-        for i in range(b):
-            valid_i = valid_mask_cpu[i]
-            boxes_list.append(boxes_cpu[i][valid_i])  # (N_i, 4) CPU
-            masks_list.append(masks[i][valid_mask[i]])  # (N_i, Hm, Wm) GPU
-        
+        # topk is sorted, so each frame's detections above the threshold are a prefix of its K.
+        counts = (topk_values > score_threshold).sum(1)
+        boxes_and_counts = torch.cat((boxes.float().reshape(b, k * 4), counts[:, None].float()), 1).cpu().numpy()
+        boxes_cpu = boxes_and_counts[:, :-1].reshape(b, k, 4)
+        counts_cpu = boxes_and_counts[:, -1].astype(np.int64)
+
+        boxes_list = [boxes_cpu[i, : counts_cpu[i]] for i in range(b)]
+        masks_list = [masks[i, : counts_cpu[i]].clone() for i in range(b)]
         return boxes_list, masks_list
 
     def scan_scores_masks(
@@ -253,6 +252,32 @@ class RfDetrMosaicDetectionModel:
         return scores, merged[:, 0]
 
     def __call__(self, frames_uint8_bchw: torch.Tensor, *, target_hw: tuple[int, int]) -> Detections:
+        if self._stream is None:
+            return self._detect(frames_uint8_bchw, target_hw)
+        return self._detect_on_own_stream(frames_uint8_bchw, target_hw)
+
+    def _detect_on_own_stream(self, frames_uint8_bchw: torch.Tensor, target_hw: tuple[int, int]) -> Detections:
+        """Detect on the model's stream, so the pipeline's restore and blend work on the
+        caller's stream does not queue between the detector's kernels.
+
+        The model stream first waits for the caller's work (the frames' writers). Every
+        intermediate is allocated and freed on it, so the allocator reuses them in stream
+        order. ``_postprocess`` copies to the host on it, which returns only after every
+        read of the frames, so the frames need no ``record_stream``. Only the masks leave:
+        the caller's stream waits for them, and each is recorded on it so its block is not
+        handed back to the model stream while the caller's queued work still reads it
+        (issue #252).
+        """
+        caller = current_stream(self.device)
+        self._stream.wait_stream(caller)
+        with stream_context(self._stream):
+            detections = self._detect(frames_uint8_bchw, target_hw)
+        caller.wait_stream(self._stream)
+        for masks in detections.masks:
+            masks.record_stream(caller)
+        return detections
+
+    def _detect(self, frames_uint8_bchw: torch.Tensor, target_hw: tuple[int, int]) -> Detections:
         x = self._preprocess(frames_uint8_bchw)
         outs = self._infer(x)
         boxes_list, masks_list = self._postprocess(

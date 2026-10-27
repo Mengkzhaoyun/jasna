@@ -10,6 +10,7 @@ import pytest
 
 from factories import ltx_models
 from jasna import os_utils
+from jasna.accelerator import AcceleratorVendor
 from jasna.gui import ltx_models as ltx_models_module
 from jasna.gui.locales import t
 from jasna.gui.ltx_models import (
@@ -19,12 +20,17 @@ from jasna.gui.ltx_models import (
     read_install_state,
     run_unavailable_reason,
     trial_only,
+    trial_only_reason,
 )
 from jasna.gui.models import AppSettings, JobItem, PresetManager
 from jasna.ltx import model_files
 from jasna.ltx.model_files import bundle_names
 from jasna.segments import SegmentRange, SegmentRestoration
 from jasna.session_config import LTX_DEFAULT_MODEL
+
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
+
+NVIDIA, AMD, CPU = AcceleratorVendor.NVIDIA, AcceleratorVendor.AMD, AcceleratorVendor.CPU
 
 
 class _NowCalls:
@@ -62,22 +68,50 @@ def test_availability_without_downloads(tmp_path) -> None:
 
     assert not state.downloadable
     assert state.installed("distilled", False) and not state.installed("distilled", True)
-    assert card_unavailable_reason(nvidia=True) is None
-    assert card_unavailable_reason(nvidia=False) == "model_ltx_needs_nvidia"
-    assert not trial_only(state) and trial_only(read_install_state(tmp_path / "empty"))
-    assert run_unavailable_reason(state, "undistilled", False, nvidia=True, trial=False) == "model_ltx_not_installed"
-    assert run_unavailable_reason(state, "undistilled", False, nvidia=True, trial=True) is None
-    assert run_unavailable_reason(state, "distilled", False, nvidia=None, trial=False) is None
-    assert run_unavailable_reason(state, "distilled", True, nvidia=True, trial=False) == "model_ltx_not_installed"
-    assert run_unavailable_reason(state, "distilled", True, nvidia=False, trial=True) == "model_ltx_needs_nvidia"
+    assert card_unavailable_reason(NVIDIA) is None
+    assert card_unavailable_reason(AMD) is None
+    assert card_unavailable_reason(CPU) == "model_ltx_needs_nvidia"
+    assert not trial_only(state, NVIDIA) and trial_only(read_install_state(tmp_path / "empty"), NVIDIA)
+    assert run_unavailable_reason(state, "undistilled", False, NVIDIA, trial=False) == "model_ltx_not_installed"
+    assert run_unavailable_reason(state, "undistilled", False, NVIDIA, trial=True) is None
+    assert run_unavailable_reason(state, "distilled", False, None, trial=False) is None
+    assert run_unavailable_reason(state, "distilled", True, NVIDIA, trial=False) == "model_ltx_not_installed"
+    assert run_unavailable_reason(state, "distilled", True, CPU, trial=True) == "model_ltx_needs_nvidia"
 
 
 def test_availability_with_downloads(tmp_path, downloadable) -> None:
     state = read_install_state(tmp_path)
 
     assert state.downloadable
-    assert not trial_only(state)
-    assert run_unavailable_reason(state, "undistilled", False, nvidia=True, trial=False) == "model_ltx_not_downloaded"
+    assert not trial_only(state, NVIDIA)
+    assert run_unavailable_reason(state, "undistilled", False, NVIDIA, trial=False) == "model_ltx_not_downloaded"
+
+
+def test_unsupported_amd_os_runs_trial_and_source_models_only(tmp_path, downloadable, monkeypatch) -> None:
+    from jasna import accelerator
+
+    monkeypatch.setattr(accelerator.sys, "platform", "darwin")
+    _install(tmp_path, "distilled", fast=False)
+    state = read_install_state(tmp_path)
+
+    assert not trial_only(state, AMD) and trial_only(read_install_state(tmp_path / "empty"), AMD)
+    assert run_unavailable_reason(state, "distilled", False, AMD, trial=False) is None
+    assert run_unavailable_reason(state, "undistilled", False, AMD, trial=False) == "model_ltx_licensed_needs_nvidia"
+    assert run_unavailable_reason(state, "undistilled", False, AMD, trial=True) is None
+    assert trial_only_reason(AMD) == "model_ltx_licensed_needs_nvidia"
+    assert trial_only_reason(NVIDIA) == "model_ltx_trial_only"
+
+
+@pytest.mark.parametrize("platform", ["linux", "win32"])
+def test_supported_amd_os_uses_normal_licensed_model_downloads(tmp_path, downloadable, monkeypatch, platform) -> None:
+    from jasna import accelerator
+
+    monkeypatch.setattr(accelerator.sys, "platform", platform)
+    state = read_install_state(tmp_path)
+    assert not trial_only(state, AMD)
+    assert state.usable("distilled2", False, AMD)
+    assert run_unavailable_reason(state, "distilled2", False, AMD, trial=False) == "model_ltx_not_downloaded"
+    assert trial_only_reason(AMD) == "model_ltx_trial_only"
 
 
 def _answer(monkeypatch, yes: bool) -> list[str]:
@@ -120,6 +154,27 @@ def test_ensure_does_nothing_when_the_user_declines(tmp_path, monkeypatch, downl
 
     assert not models.ensure("distilled", False, on_ready=lambda: pytest.fail("not downloaded"))
     assert downloads == [] and not models.downloading
+
+
+@pytest.mark.parametrize("fast,old_size", [(False, 13_368_048_749), (True, 7_733_294_997)])
+def test_ensure_warns_before_replacing_models_from_older_release(tmp_path, monkeypatch, downloadable, fast, old_size):
+    from jasna.gui.locales import EN
+
+    monkeypatch.setattr(model_files, "is_frozen", lambda: True)
+    monkeypatch.setattr(ltx_models_module, "t", lambda key, **values: EN[key].format(**values))
+    names = bundle_names("distilled2", fast=fast)
+    for index, name in enumerate(names):
+        with (tmp_path / (name + ".enc")).open("wb") as stream:
+            stream.truncate(old_size if index == 0 else model_files.LTX_DOWNLOADS[name].size_bytes)
+    asked = _answer(monkeypatch, yes=False)
+    downloads = _fake_download(monkeypatch, error=None)
+    models = LtxModels(tmp_path, _NowCalls(), lambda: None)
+
+    assert not models.ensure("distilled2", fast, on_ready=lambda: pytest.fail("download declined"))
+    assert len(asked) == 1 and "needs updating" in asked[0]
+    assert "older Jasna" in asked[0] and "License code still works" in asked[0]
+    assert len(models.state.missing[("distilled2", fast)]) == 1
+    assert downloads == [] and (tmp_path / (names[0] + ".enc")).stat().st_size == old_size
 
 
 def test_ensure_shows_the_download_error(tmp_path, monkeypatch, downloadable) -> None:
@@ -186,7 +241,7 @@ def test_picking_a_missing_variant_never_asks_or_reverts(tk_root, tmp_path, monk
     models = ltx_models(tk_root, tmp_path / "ltx", installed=False)
     panel = _panel(tk_root, models)
     section = panel._model_section
-    section.set_gpu_support(nvidia=True, blackwell=True)
+    section.set_gpu_support(vendor=NVIDIA, blackwell=True)
 
     section._cards["ltx"].radio.invoke()
     _pick_ltx_model(section, "undistilled")
@@ -211,7 +266,7 @@ def test_start_downloads_only_the_fast_model(tk_root, tmp_path, monkeypatch, dow
     models = LtxModels(tmp_path / "ltx", _NowCalls(), lambda: None)
     panel = _panel(tk_root, models)
     section = panel._model_section
-    section.set_gpu_support(nvidia=True, blackwell=True)
+    section.set_gpu_support(vendor=NVIDIA, blackwell=True)
     section._cards["ltx"].radio.invoke()
     section._widgets["ltx_fast"]._toggle()
     restarted: list[bool] = []
@@ -265,7 +320,7 @@ def test_a_missing_variant_without_downloads_stays_selected_with_a_note(tk_root,
     _install(directory, LTX_DEFAULT_MODEL, fast=False)
     panel = _panel(tk_root, ltx_models(tk_root, directory, installed=False))
     section = panel._model_section
-    section.set_gpu_support(nvidia=True, blackwell=True)
+    section.set_gpu_support(vendor=NVIDIA, blackwell=True)
     section._cards["ltx"].radio.invoke()
     assert not section._notice.winfo_manager()
 
@@ -459,6 +514,7 @@ def test_a_trial_seed_preview_never_reuses_a_real_prepared_range() -> None:
 
 
 def test_license_missing_only_for_encrypted_models(tmp_path, monkeypatch, downloadable) -> None:
+    pytest.importorskip("jasna.protection.license_store")
     from jasna.protection import LicenseError
 
     directory = tmp_path / "ltx"
@@ -468,7 +524,9 @@ def test_license_missing_only_for_encrypted_models(tmp_path, monkeypatch, downlo
     def refuse(*_args, **_kwargs):
         raise LicenseError("No license found.")
 
-    monkeypatch.setattr(model_files.LtxModelFiles, "from_dir", refuse)
+    monkeypatch.setattr(model_files, "needs_license", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ltx_models_module, "read_license_info", lambda: (True, True))
+    monkeypatch.setattr("jasna.protection.protected_tensors.check_ltx_license", refuse)
     assert ltx_models_module.license_missing(directory, "distilled", False)
 
 

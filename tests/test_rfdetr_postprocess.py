@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -133,6 +134,79 @@ class TestRfDetrPostprocess:
         assert box[1] == pytest.approx(0.0, abs=1)
         assert box[2] == pytest.approx(640.0, abs=1)
         assert box[3] == pytest.approx(480.0, abs=1)
+
+
+def _boolean_mask_postprocess(*, pred_boxes, pred_logits, pred_masks, target_hw, score_threshold, max_select):
+    b, q, c = pred_logits.shape
+    k = min(max_select, q)
+    topk_values, topk_indexes = torch.topk(pred_logits.sigmoid().view(b, -1), k, dim=1)
+    topk_boxes = topk_indexes // c
+    x_c, y_c, w, h = pred_boxes.unbind(-1)
+    boxes = torch.stack((x_c - 0.5 * w, y_c - 0.5 * h, x_c + 0.5 * w, y_c + 0.5 * h), dim=-1)
+    boxes = boxes.gather(1, topk_boxes.unsqueeze(-1).expand(b, k, 4)) * pred_boxes.new_tensor(
+        (target_hw[1], target_hw[0], target_hw[1], target_hw[0])
+    )
+    hm, wm = pred_masks.shape[-2:]
+    masks = pred_masks.gather(1, topk_boxes[:, :, None, None].expand(b, k, hm, wm)) > 0.0
+    valid = topk_values > score_threshold
+    boxes_cpu = boxes.float().cpu().numpy()
+    valid_cpu = valid.cpu().numpy()
+    return [boxes_cpu[i][valid_cpu[i]] for i in range(b)], [masks[i][valid[i]] for i in range(b)]
+
+
+_DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+def test_postprocess_matches_boolean_mask_selection(device):
+    generator = torch.Generator().manual_seed(3)
+    b, q, c = 5, 200, 2
+    logits = torch.randn(b, q, c, generator=generator) * 3
+    logits[1] = -20.0
+    logits[2, :40] = torch.linspace(1.0, 5.0, 80).view(40, 2)
+    kwargs = dict(
+        pred_boxes=torch.rand(b, q, 4, generator=generator).to(device),
+        pred_logits=logits.to(device),
+        pred_masks=torch.randn(b, q, 16, 16, generator=generator).half().to(device),
+        target_hw=(1080, 1920),
+        score_threshold=0.35,
+        max_select=16,
+    )
+
+    boxes, masks = RfDetrMosaicDetectionModel._postprocess(**kwargs)
+    expected_boxes, expected_masks = _boolean_mask_postprocess(**kwargs)
+
+    assert [len(frame) for frame in boxes] == [len(frame) for frame in expected_boxes]
+    assert len(boxes[1]) == 0 and len(boxes[2]) == 16
+    for got, want in zip(boxes, expected_boxes):
+        np.testing.assert_array_equal(got, want)
+    for got, want in zip(masks, expected_masks):
+        assert torch.equal(got, want)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+def test_postprocess_waits_for_the_gpu_once():
+    b, q = 4, 200
+    kwargs = dict(
+        pred_boxes=torch.rand(b, q, 4, device="cuda"),
+        pred_logits=torch.randn(b, q, 2, device="cuda"),
+        pred_masks=torch.randn(b, q, 16, 16, device="cuda"),
+        target_hw=(1080, 1920),
+        score_threshold=0.35,
+        max_select=16,
+    )
+    RfDetrMosaicDetectionModel._postprocess(**kwargs)
+    torch.cuda.synchronize()
+
+    torch.cuda.set_sync_debug_mode("warn")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            RfDetrMosaicDetectionModel._postprocess(**kwargs)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    assert len([w for w in caught if "called a synchronizing" in str(w.message)]) == 1
 
 
 def _build_rfdetr_model():
@@ -298,7 +372,7 @@ class TestRfDetrCall:
 
 
 class TestCompileRfdetrEngine:
-    def test_delegates_to_compile_onnx(self):
+    def test_delegates_to_compile_onnx(self, nvidia_vendor):
         with patch("jasna.trt.compile_onnx_to_tensorrt_engine", return_value=Path("out.engine")) as mock_compile:
             result = compile_rfdetr_engine(
                 Path("model.onnx"),
@@ -331,3 +405,99 @@ class TestCompileRfdetrEngine:
 
         # AMD runs the checkpoint through the rfdetr torch model; nothing to build.
         assert result == weights
+
+
+class _BrightnessRunner:
+    """Scores each frame by its mean input: bright frames are a detection, dark ones are not."""
+
+    input_names = ["input"]
+    input_dtypes = {"input": torch.float32}
+    output_names = ["dets", "labels", "masks"]
+    outputs = {
+        "dets": MagicMock(ndim=3, shape=(1, 1, 4)),
+        "labels": MagicMock(ndim=3, shape=(1, 1, 1)),
+        "masks": MagicMock(ndim=4, shape=(1, 1, 8, 8)),
+    }
+
+    def infer(self, inputs):
+        x = inputs["input"]
+        b = x.shape[0]
+        return {
+            "dets": torch.full((b, 1, 4), 0.5, device=x.device),
+            "labels": x.mean(dim=(1, 2, 3)).view(b, 1, 1) * 10,
+            "masks": x[:, :1, :8, :8].clone(),
+        }
+
+
+def _amd_model(monkeypatch, device: torch.device) -> RfDetrMosaicDetectionModel:
+    import jasna.mosaic.rfdetr as module
+    import jasna.mosaic.rfdetr_torch_runner as torch_runner_module
+
+    monkeypatch.setattr(module, "is_amd_device", lambda _device: True)
+    monkeypatch.setattr(torch_runner_module, "RfDetrTorchRunner", lambda *a, **k: _BrightnessRunner())
+    return RfDetrMosaicDetectionModel(
+        weights_path=Path("rfdetr-v6.pt"),
+        batch_size=4,
+        device=device,
+        resolution=64,
+        dynamic_batch=True,
+        torch_variant="medium",
+        score_threshold=0.5,
+    )
+
+
+class TestRfDetrOwnStream:
+    def test_amd_detects_on_its_stream_after_the_callers_work(self, monkeypatch):
+        import jasna.mosaic.rfdetr as module
+        from jasna.mosaic.detections import Detections
+
+        events = []
+        caller, model_stream = MagicMock(name="caller"), MagicMock(name="model")
+        caller.wait_stream.side_effect = lambda stream: events.append(("caller waits", stream))
+        model_stream.wait_stream.side_effect = lambda stream: events.append(("model waits", stream))
+        monkeypatch.setattr(module, "new_stream", lambda _device: model_stream)
+        monkeypatch.setattr(module, "current_stream", lambda _device: caller)
+
+        class _Context:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                events.append(("enter", self.stream))
+
+            def __exit__(self, *exc):
+                events.append(("exit", self.stream))
+
+        monkeypatch.setattr(module, "stream_context", _Context)
+        model = _amd_model(monkeypatch, torch.device("cpu"))
+        mask = MagicMock()
+        monkeypatch.setattr(
+            model, "_detect", lambda frames, target_hw: events.append("detect") or Detections([np.zeros((1, 4))], [mask])
+        )
+
+        model(torch.zeros(1, 3, 8, 8, dtype=torch.uint8), target_hw=(8, 8))
+
+        assert events == [
+            ("model waits", caller), ("enter", model_stream), "detect", ("exit", model_stream),
+            ("caller waits", model_stream),
+        ]
+        mask.record_stream.assert_called_once_with(caller)
+
+    def test_nvidia_detects_on_the_callers_stream(self):
+        model, _ = _build_rfdetr_model()
+        assert model._stream is None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+    def test_amd_stream_sees_the_frames_the_caller_is_still_writing(self, monkeypatch):
+        model = _amd_model(monkeypatch, torch.device("cuda"))
+        frames = torch.zeros(4, 3, 64, 64, dtype=torch.uint8, device="cuda")
+        model(frames, target_hw=(64, 64))
+        torch.cuda.synchronize()
+
+        torch.cuda._sleep(200_000_000)
+        frames.fill_(255)
+        detections = model(frames, target_hw=(64, 64))
+        mask_pixels = [int(masks.sum()) for masks in detections.masks]
+
+        assert [len(boxes) for boxes in detections.boxes_xyxy] == [1, 1, 1, 1]
+        assert mask_pixels == [64, 64, 64, 64]

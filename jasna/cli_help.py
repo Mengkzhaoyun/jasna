@@ -17,7 +17,7 @@ CLI_HELP: dict[str, str] = {
     ),
     "restoration_model_name": (
         "Restoration model for video: basicvsrpp (fast), ltx (Standard Quality LTX: more detail, much slower; "
-        "NVIDIA RTX only; recommended), ltx-4step (Good Quality: a bit more detail, about 1.5x slower than ltx), "
+        "NVIDIA RTX only, AMD runs only --ltx-trial; recommended), ltx-4step (Good Quality: a bit more detail, about 1.5x slower than ltx), "
         "ltx-8step (High Quality: more detail, about 2.5x slower than ltx) or ltx-undistilled (Top Quality: "
         "slightly better, about 5x slower than ltx). LTX doesn't "
         "support VR side-by-side video, streaming, secondary restoration or denoise. A missing "
@@ -38,7 +38,8 @@ CLI_HELP: dict[str, str] = {
     "ltx_auto_split": (
         "ltx: restore only mosaics at least PERCENT of the video height with LTX and smaller "
         "ones with BasicVSR++ (12 is a good start). Finds the mosaics in each video first and "
-        "copies the rest unchanged, keeping the video's own codec. Works on folders; a video "
+        "copies the rest unchanged, keeping the video's own codec (--cq and --encoder-settings apply "
+        "only when that is --codec). Works on folders; a video "
         "that can't be split is restored whole with LTX."
     ),
     "ltx_large_canvas": (
@@ -74,7 +75,7 @@ CLI_HELP: dict[str, str] = {
     "codec": "Offline output video codec (HLS streaming always uses H.264). Default: %(default)s",
     "cq": (
         "Video quality (CQ). Lower is better quality and bigger files. NVIDIA defaults: "
-        "H.264 25, HEVC 28, AV1 35; AMD defaults: H.264 24, HEVC 25, AV1 32."
+        "H.264 25, HEVC 28, AV1 35; AMD defaults: H.264 24, HEVC 25, AV1 16."
     ),
     "encoder_settings": 'Advanced encoder settings, as a JSON object or comma-separated key=value pairs (e.g. {"rc-lookahead":32} or rc-lookahead=32,bf=4)',
     "post_export_action": (

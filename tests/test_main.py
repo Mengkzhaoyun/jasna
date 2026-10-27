@@ -8,6 +8,8 @@ import pytest
 
 from jasna.main import build_parser
 
+pytestmark = pytest.mark.usefixtures("nvidia_vendor")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,7 +84,7 @@ def _run_main(argv, pipeline_side_effect=None):
 class TestBuildParser:
     def test_defaults(self):
         args = build_parser().parse_args(["--input", "a.mp4", "--output", "b.mp4"])
-        assert args.batch_size == 4
+        assert args.batch_size is None
         assert args.device == "cuda:0"
         assert args.fp16 is True
         assert args.log_level == "error"
@@ -286,6 +288,7 @@ class TestSecondaryRestorers:
         assert "model=prob-4:scale=2:noise=5" in kw.kwargs["tvai_args"]
 
     def test_unet4x_secondary(self, tmp_path):
+        pytest.importorskip("tensorrt")
         inp, out, rest, det = _make_model_files(tmp_path)
         mock_unet = MagicMock()
         with patch("jasna.restorer.unet4x_secondary_restorer.Unet4xSecondaryRestorer", mock_unet):
@@ -293,6 +296,7 @@ class TestSecondaryRestorers:
         mock_unet.assert_called_once()
 
     def test_rtx_super_res_secondary(self, tmp_path):
+        pytest.importorskip("tensorrt")
         inp, out, rest, det = _make_model_files(tmp_path)
         mock_rtx = MagicMock()
         with patch("jasna.restorer.rtx_superres_secondary_restorer.RtxSuperresSecondaryRestorer", mock_rtx):
@@ -311,6 +315,7 @@ class TestSecondaryRestorers:
         assert kw["deblur"] == "low"
 
     def test_rtx_denoise_none_passes_none(self, tmp_path):
+        pytest.importorskip("tensorrt")
         inp, out, rest, det = _make_model_files(tmp_path)
         mock_rtx = MagicMock()
         with patch("jasna.restorer.rtx_superres_secondary_restorer.RtxSuperresSecondaryRestorer", mock_rtx):
@@ -1090,6 +1095,7 @@ class TestRequiredArgs:
 
 class TestEngineCompilation:
     def test_unet4x_triggers_engine_compilation(self, tmp_path):
+        pytest.importorskip("tensorrt")
         inp, out, rest, det = _make_model_files(tmp_path)
         mock_unet = MagicMock()
 
@@ -1145,3 +1151,14 @@ class TestNonStreamingRun:
         with patch("jasna.streaming_pipeline.run_streaming") as run_streaming:
             _run_main(_base_argv(inp, out, rest, det))
         run_streaming.assert_not_called()
+
+
+@pytest.mark.parametrize(("argv", "amd", "expected"), [([], True, 8), ([], False, 4), (["--batch-size", "2"], True, 2)])
+def test_batch_size_defaults_per_vendor_unless_given(monkeypatch, argv, amd, expected):
+    import jasna.mosaic.detection_registry as registry
+    from jasna.main import batch_size_from_args
+
+    monkeypatch.setattr(registry, "is_amd_device", lambda _device: amd)
+    args = build_parser().parse_args(["--input", "a.mp4", "--output", "b.mp4", *argv])
+
+    assert batch_size_from_args(args) == expected

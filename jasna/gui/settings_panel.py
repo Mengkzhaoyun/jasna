@@ -6,8 +6,10 @@ import customtkinter as ctk
 import tkinter as tk
 from dataclasses import asdict
 
+from jasna.accelerator import AcceleratorVendor
 from jasna.gui.theme import Colors, Fonts, Sizing
 from jasna.gui.models import AppSettings, PresetManager
+from jasna.mosaic.detection_registry import default_detection_batch_size
 from jasna.gui.components import (
     AutoHidingScrollableFrame,
     ConfirmDialog,
@@ -261,8 +263,8 @@ class SettingsPanel(ctk.CTkFrame):
         self._model_section.refresh()
         self._update_modified_indicator()
 
-    def set_gpu_support(self, *, nvidia: bool, blackwell: bool):
-        self._model_section.set_gpu_support(nvidia=nvidia, blackwell=blackwell)
+    def set_gpu_support(self, *, vendor: AcceleratorVendor, blackwell: bool):
+        self._model_section.set_gpu_support(vendor=vendor, blackwell=blackwell)
         self._update_modified_indicator()
 
     def set_on_interactive_image_restore(self, callback: callable):
@@ -380,7 +382,7 @@ class SettingsPanel(ctk.CTkFrame):
         for section in self._sections:
             values.update(section.collect())
         return AppSettings(
-            batch_size=4,  # Fixed default value
+            batch_size=default_detection_batch_size("cuda:0"),
             **values,
         )
 
