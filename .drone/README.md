@@ -54,6 +54,23 @@ docker build -f .drone/dockerfile -t registry.cn-qingdao.aliyuncs.com/wod/cuda:1
 - **离线授权自动恢复**：自动从 `/data/jasna/license.json` 恢复离线证书，无需每次激活或传递 `JASNA_LICENSE`。
 - **4090 / 5090 单镜像自适应**：启动时自动探测 GPU Compute Capability，在 **RTX 4090 (`SM 8.9`)** 上自动使用 `INT8` 算子，在 **RTX 5090 (`SM 12.0`)** 且存在 `nvfp4` 权重时自动开启 `LTX_FAST=true`（`NVFP4` 硬件加速，全流程提速约 **2.3x**）。
 
+### 0. LTX 模型预热（多卡并发启动前推荐单卡执行一次）
+
+预热包含两步并统一持久化到 `/data/jasna/model_weights`（全卡共享）：
+1. 预编译/校验 `rfdetr-v6-large.bs1-4.fp16.linux.engine` 检测引擎（跳过无用的 `BasicVSR++` 编译）；
+2. 预热 LTX 3D Causal VAE / 22B DiT / Decoder，生成 `torch-compile-cache/` 与 `ltx-speed-profile.json`，避免多卡并发启动时重复执行 `LTX speed test` 与重复编译算子。
+
+```bash
+docker run --rm \
+  --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=all \
+  -e CUDA_VISIBLE_DEVICES=0 \
+  -v /etc/machine-id:/etc/machine-id:ro \
+  -v /data/jasna:/data/jasna \
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.12.0 \
+  warmup
+```
+
 ### 1. LTX 模式生产部署（默认推荐，4090 / 5090 通用）
 
 ```bash
@@ -64,7 +81,7 @@ docker run --name sglang \
   -v /etc/machine-id:/etc/machine-id:ro \
   -v /data/jasna:/data/jasna \
   -v /nas/sglang/ai:/data \
-  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.12.0
 ```
 
 > **提示**：
@@ -83,7 +100,7 @@ docker run --name sglang \
   -e RESTORATION_MODEL_NAME=basicvsrpp \
   -v /nas/sglang/model_weights:/app/sglang/model_weights \
   -v /nas/sglang/ai:/data \
-  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.11.3
+  registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.12.0
 ```
 
 ### 核心参数优化说明

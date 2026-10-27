@@ -45,10 +45,17 @@ if [ -d "/app/sglang" ]; then
 	cd /app/sglang
 fi
 
-# 兼容容器内外 model_weights 软链接路径 (/app/jasna-release/model_weights -> /data/jasna/model_weights)
-if [ -d "/app/sglang/model_weights" ] && [ ! -e "/data/jasna/model_weights" ]; then
+# 兼容容器内外 model_weights 双向软链接路径 (/app/sglang/model_weights <-> /data/jasna/model_weights)
+if [ -d "/data/jasna/model_weights" ] && [ -d "/app/sglang/model_weights" ] && [ ! -L "/app/sglang/model_weights" ]; then
+	if [ -z "$(ls -A /app/sglang/model_weights 2>/dev/null)" ]; then
+		rmdir /app/sglang/model_weights 2>/dev/null && ln -sfn /data/jasna/model_weights /app/sglang/model_weights || true
+	fi
+elif [ -d "/app/sglang/model_weights" ] && [ ! -e "/data/jasna/model_weights" ]; then
 	mkdir -p /data/jasna
 	ln -sfn /app/sglang/model_weights /data/jasna/model_weights
+fi
+if [ -d "/data/jasna/model_weights" ] && [ ! -e "/data/jasna/model_weights/ltx-restore" ]; then
+	ln -sfn . /data/jasna/model_weights/ltx-restore || true
 fi
 
 bitrate_to_kbps() {
@@ -109,61 +116,6 @@ probe_video_bitrate_kbps() {
 	echo "$(((bitrate + 999) / 1000))"
 }
 
-# ---- warmup 子命令 ----
-if [ "$1" = "warmup" ]; then
-	shift
-
-	CLIP_SIZE="${MAX_CLIP_SIZE:-150}"
-	BATCH_SIZE="${BATCH_SIZE:-4}"
-	DETECTION_MODEL="${DETECTION_MODEL:-rfdetr-v6-large}"
-	RESTORATION_MODEL="${RESTORATION_MODEL:-model_weights/lada_mosaic_restoration_model_generic_v1.2.pth}"
-	if [ -z "${DETECTION_MODEL_PATH:-}" ]; then
-		if [ -f "model_weights/${DETECTION_MODEL}.onnx" ]; then
-			DETECTION_MODEL_PATH="model_weights/${DETECTION_MODEL}.onnx"
-		elif [ -f "model_weights/${DETECTION_MODEL}.pt" ]; then
-			DETECTION_MODEL_PATH="model_weights/${DETECTION_MODEL}.pt"
-		else
-			DETECTION_MODEL_PATH="model_weights/${DETECTION_MODEL}.onnx"
-		fi
-	fi
-
-	echo "============================================"
-	echo " sglang TensorRT Engine Warmup"
-	echo "============================================"
-	echo " Batch Size:        ${BATCH_SIZE}"
-	echo " Detection Model:   ${DETECTION_MODEL}"
-	echo " Detection Path:    ${DETECTION_MODEL_PATH}"
-	echo " Restoration Model: ${RESTORATION_MODEL}"
-	echo "============================================"
-	echo ""
-	echo "编译 TensorRT 引擎中, 首次需要 15-60 分钟..."
-	echo "引擎会缓存到 model_weights/ 目录, 后续启动无需重新编译。"
-	echo ""
-
-	JSON_DATA=$(
-		cat <<EOF
-{
-    "device": "cuda:0",
-    "fp16": true,
-    "basicvsrpp": true,
-    "basicvsrpp_model_path": "${RESTORATION_MODEL}",
-    "detection": true,
-    "detection_model_name": "${DETECTION_MODEL}",
-    "detection_model_path": "${DETECTION_MODEL_PATH}",
-    "detection_batch_size": ${BATCH_SIZE},
-    "unet4x": false
-}
-EOF
-	)
-	/app/sglang/sglang --compile-engines "$JSON_DATA"
-
-	echo ""
-	echo "============================================"
-	echo " Warmup 完成! 引擎已缓存。"
-	echo "============================================"
-	exit 0
-fi
-
 # ---- 默认修复模型与路径自动探测 ----
 RESTORATION_MODEL_NAME="${RESTORATION_MODEL_NAME:-ltx}"
 if [ -z "${RESTORATION_MODEL_PATH:-}" ] && [[ "${RESTORATION_MODEL_NAME}" == ltx* ]]; then
@@ -204,6 +156,10 @@ JASNA_BIN="/app/sglang/sglang"
 FFMPEG_CHECK_ARG="--disable-ffmpeg-check"
 for rel_cand in "/app/jasna-release/jasna" "/data/jasna/.release-cache/v0.12.0/jasna-linux-nvidia-0.12.0/jasna" "/data/.release-cache/v0.12.0/jasna-linux-nvidia-0.12.0/jasna" "/data/jasna/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna" "/data/.release-cache/v0.11.3/jasna-linux-nvidia-0.11.3/jasna"; do
 	if [ -x "${rel_cand}" ]; then
+		rel_dir="$(dirname "${rel_cand}")"
+		if [ -d "/data/jasna/model_weights" ] && [ ! -e "${rel_dir}/model_weights" ]; then
+			ln -sfn /data/jasna/model_weights "${rel_dir}/model_weights" || true
+		fi
 		if [[ "${RESTORATION_MODEL_NAME:-}" == ltx* ]] || [[ " $* " == *" ltx"* ]] || [[ " $* " == *"--license-code"* ]] || [[ " $* " == *"--machine-key"* ]] || [ -n "${JASNA_LICENSE:-}" ]; then
 			JASNA_BIN="${rel_cand}"
 			FFMPEG_CHECK_ARG=""
@@ -215,6 +171,121 @@ done
 if [ -n "${JASNA_LICENSE:-}" ] && [ ! -f "/root/.config/jasna/license.json" ] && [ ! -f "/root/.local/share/jasna/license.json" ]; then
 	echo "检测到 JASNA_LICENSE，正在执行激活..."
 	$JASNA_BIN --license-code "${JASNA_LICENSE}" || true
+fi
+
+# ---- warmup 子命令 ----
+if [ "$1" = "warmup" ]; then
+	shift
+
+	BATCH_SIZE="${BATCH_SIZE:-4}"
+	DETECTION_MODEL="${DETECTION_MODEL:-rfdetr-v6-large}"
+	WEIGHTS_DIR="/data/jasna/model_weights"
+	[ ! -d "${WEIGHTS_DIR}" ] && WEIGHTS_DIR="model_weights"
+
+	if [ -z "${DETECTION_MODEL_PATH:-}" ]; then
+		if [ -f "${WEIGHTS_DIR}/${DETECTION_MODEL}.onnx" ]; then
+			DETECTION_MODEL_PATH="${WEIGHTS_DIR}/${DETECTION_MODEL}.onnx"
+		elif [ -f "${WEIGHTS_DIR}/${DETECTION_MODEL}.pt" ]; then
+			DETECTION_MODEL_PATH="${WEIGHTS_DIR}/${DETECTION_MODEL}.pt"
+		else
+			DETECTION_MODEL_PATH="model_weights/${DETECTION_MODEL}.onnx"
+		fi
+	fi
+
+	if [[ "${RESTORATION_MODEL_NAME}" == ltx* ]]; then
+		echo "============================================"
+		echo " Jasna LTX-2.5 22B & RF-DETR Warmup"
+		echo "============================================"
+		echo " Runtime Binary:    ${JASNA_BIN}"
+		echo " Restoration Model: ${RESTORATION_MODEL_NAME}$([ "${LTX_FAST}" = "true" ] && echo " [NVFP4 Fast]" || echo " [INT8]")"
+		echo " Restoration Path:  ${RESTORATION_MODEL_PATH:-${WEIGHTS_DIR}}"
+		echo " Detection Model:   ${DETECTION_MODEL} (batch=${BATCH_SIZE})"
+		echo " Detection Path:    ${DETECTION_MODEL_PATH}"
+		echo "============================================"
+		echo ""
+		echo "[1/2] 预编译/校验 RF-DETR TensorRT 检测引擎..."
+
+		JSON_DATA=$(
+			cat <<EOF
+{
+    "device": "cuda:0",
+    "fp16": true,
+    "basicvsrpp": false,
+    "detection": true,
+    "detection_model_name": "${DETECTION_MODEL}",
+    "detection_model_path": "${DETECTION_MODEL_PATH}",
+    "detection_batch_size": ${BATCH_SIZE},
+    "unet4x": false
+}
+EOF
+		)
+		$JASNA_BIN --compile-engines "$JSON_DATA"
+
+		echo ""
+		echo "[2/2] 预热 LTX 3D Causal VAE / 22B DiT / Decoder (torch-compile-cache & ltx-speed-profile.json)..."
+		if [ "${FORCE_WARMUP:-false}" = "true" ] || [ ! -d "${WEIGHTS_DIR}/torch-compile-cache" ] || [ -z "$(ls -A "${WEIGHTS_DIR}/torch-compile-cache" 2>/dev/null)" ]; then
+			rm -f "${WEIGHTS_DIR}/ltx-speed-profile.json"
+		fi
+
+		WARMUP_IN="/tmp/jasna_ltx_warmup_in.mp4"
+		WARMUP_OUT="/tmp/jasna_ltx_warmup_out.mp4"
+		rm -rf "${WARMUP_IN}" "${WARMUP_OUT}" /tmp/.jasna-resume-* 2>/dev/null || true
+		ffmpeg -y -f lavfi -i color=c=black:s=1920x1080:r=30 -frames:v 225 -c:v libx264 -pix_fmt yuv420p "${WARMUP_IN}" >/dev/null 2>&1
+
+		WARMUP_ARGS=(--detection-model "${DETECTION_MODEL}" --batch-size "${BATCH_SIZE}" --restoration-model-name "${RESTORATION_MODEL_NAME}" --fp16)
+		[ -n "${RESTORATION_MODEL_PATH:-}" ] && WARMUP_ARGS+=(--restoration-model-path "${RESTORATION_MODEL_PATH}")
+		[ "${LTX_FAST}" = "true" ] && WARMUP_ARGS+=(--ltx-fast)
+		[ "${LTX_LARGE_CANVAS:-false}" = "true" ] && WARMUP_ARGS+=(--ltx-large-canvas)
+		if [ "${LTX_TRIAL:-false}" = "true" ] || [ -z "${RESTORATION_MODEL_PATH:-}" ]; then
+			WARMUP_ARGS+=(--ltx-trial)
+		fi
+
+		$JASNA_BIN $FFMPEG_CHECK_ARG "${WARMUP_ARGS[@]}" --codec "${CODEC:-hevc}" --encoder-settings "$(build_encoder_settings)" --input "${WARMUP_IN}" --output "${WARMUP_OUT}" "$@"
+		rm -rf "${WARMUP_IN}" "${WARMUP_OUT}" "${WARMUP_OUT}.jasna-resume" 2>/dev/null || true
+
+		echo ""
+		echo "============================================"
+		echo " LTX Warmup 完成! 检测引擎、torch-compile-cache 与 ltx-speed-profile.json 已就绪。"
+		echo "============================================"
+		exit 0
+	else
+		RESTORATION_MODEL="${RESTORATION_MODEL:-${WEIGHTS_DIR}/lada_mosaic_restoration_model_generic_v1.2.pth}"
+		echo "============================================"
+		echo " BasicVSR++ & RF-DETR TensorRT Engine Warmup"
+		echo "============================================"
+		echo " Batch Size:        ${BATCH_SIZE}"
+		echo " Detection Model:   ${DETECTION_MODEL}"
+		echo " Detection Path:    ${DETECTION_MODEL_PATH}"
+		echo " Restoration Model: ${RESTORATION_MODEL}"
+		echo "============================================"
+		echo ""
+		echo "编译 TensorRT 引擎中, 首次需要 15-60 分钟..."
+		echo "引擎会缓存到 model_weights/ 目录, 后续启动无需重新编译。"
+		echo ""
+
+		JSON_DATA=$(
+			cat <<EOF
+{
+    "device": "cuda:0",
+    "fp16": true,
+    "basicvsrpp": true,
+    "basicvsrpp_model_path": "${RESTORATION_MODEL}",
+    "detection": true,
+    "detection_model_name": "${DETECTION_MODEL}",
+    "detection_model_path": "${DETECTION_MODEL_PATH}",
+    "detection_batch_size": ${BATCH_SIZE},
+    "unet4x": false
+}
+EOF
+		)
+		$JASNA_BIN --compile-engines "$JSON_DATA"
+
+		echo ""
+		echo "============================================"
+		echo " BasicVSR++ Warmup 完成! 引擎已缓存。"
+		echo "============================================"
+		exit 0
+	fi
 fi
 
 if [ $# -gt 0 ]; then
