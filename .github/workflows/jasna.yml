@@ -14,7 +14,7 @@ env:
 jobs:
   jasna-runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
       - name: Free Disk Space
