@@ -36,7 +36,9 @@ COPY . /app/jasna
 
 # 预编译 LTX 原生 C++/CUDA 算子扩展 (SageAttention INT8 + Triton AOT 内核, 覆盖 SM 8.0/8.6/8.9/12.0)
 # 并极速安装当前版本 jasna（无依赖重复下载）与创建 sglang 兼容入口
-RUN python3.13 -c "from jasna.ltx.native import PREBUILT, prebuild; prebuild(PREBUILT)" && \
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH} python3.13 -c "from jasna.ltx.native import PREBUILT, prebuild; prebuild(PREBUILT)" && \
+    rm -f /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
     pip install --no-cache-dir --no-deps . && \
     mkdir -p /app/sglang/model_weights && \
     printf '#!/bin/bash\nexec python3.13 -m jasna "$@"\n' > /app/sglang/sglang && \
