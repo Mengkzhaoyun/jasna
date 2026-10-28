@@ -45,6 +45,11 @@ class VideoMetadata:
     stereo_layout: str = ""
     spherical_projection: str = ""
     video_bitrate: int = 0
+    stream_bitrate_bps: int | None = None
+    stream_bitrate_source: str = "无法获取"
+    container_bitrate_bps: int | None = None
+    container_bitrate_source: str = "无法获取"
+    file_size_bytes: int | None = None
 
 
 def resolve_video_start_pts(stream_start_time: int | None, metadata_start_pts: int) -> int:
@@ -83,19 +88,19 @@ def parse_sample_aspect_ratio(json_video_stream: dict) -> Fraction:
     return Fraction(1, 1)
 
 
-def parse_video_bitrate(json_video_stream: dict, json_video_format: dict) -> int:
-    """Video bitrate in bits/s, or 0 when no source reports one."""
+def parse_stream_and_container_bitrate(
+    json_video_stream: dict, json_video_format: dict
+) -> tuple[int | None, str, int | None, str]:
+    """Return ``(stream_bps, stream_source, container_bps, container_source)`` without conflating stream vs container."""
     tags = json_video_stream.get("tags") or {}
-    candidates = (
-        json_video_stream.get("bit_rate"),
-        tags.get("BPS"),
-        tags.get("BPS-eng"),
-        # Container rate counts audio too, so it slightly overstates the video
-        # stream. Matroska muxers routinely omit the per-stream rate, and an
-        # ceiling that is a few percent loose beats having none at all.
-        json_video_format.get("bit_rate"),
+    stream_candidates = (
+        ("视频流bit_rate", json_video_stream.get("bit_rate")),
+        ("视频流tag:BPS", tags.get("BPS")),
+        ("视频流tag:BPS-eng", tags.get("BPS-eng")),
     )
-    for candidate in candidates:
+    stream_bps: int | None = None
+    stream_source = "无法获取"
+    for label, candidate in stream_candidates:
         if candidate is None:
             continue
         try:
@@ -103,7 +108,33 @@ def parse_video_bitrate(json_video_stream: dict, json_video_format: dict) -> int
         except (TypeError, ValueError):
             continue
         if value > 0:
-            return value
+            stream_bps = value
+            stream_source = label
+            break
+
+    container_bps: int | None = None
+    container_source = "无法获取"
+    fmt_br = json_video_format.get("bit_rate")
+    if fmt_br is not None:
+        try:
+            value = int(float(fmt_br))
+            if value > 0:
+                container_bps = value
+                container_source = "容器bit_rate"
+        except (TypeError, ValueError):
+            pass
+    return stream_bps, stream_source, container_bps, container_source
+
+
+def parse_video_bitrate(json_video_stream: dict, json_video_format: dict) -> int:
+    """Video bitrate in bits/s, or 0 when no source reports one."""
+    stream_bps, _, container_bps, _ = parse_stream_and_container_bitrate(
+        json_video_stream, json_video_format
+    )
+    if stream_bps is not None:
+        return stream_bps
+    if container_bps is not None:
+        return container_bps
     return 0
 
 
@@ -187,6 +218,18 @@ def get_video_meta_data(path: str) -> VideoMetadata:
         num_frames = _frame_count_from_container(path)
     is_10bit = is_stream_10bit(json_video_stream)
     stereo_layout, spherical_projection = parse_spatial_metadata(json_video_stream)
+    stream_bps, stream_src, container_bps, container_src = parse_stream_and_container_bitrate(
+        json_video_stream, json_video_format
+    )
+    file_size_bytes: int | None = None
+    fmt_size = json_video_format.get("size")
+    if fmt_size is not None:
+        try:
+            val = int(fmt_size)
+            if val >= 0:
+                file_size_bytes = val
+        except (TypeError, ValueError):
+            pass
 
     metadata = VideoMetadata(
         video_file=path,
@@ -212,5 +255,10 @@ def get_video_meta_data(path: str) -> VideoMetadata:
         stereo_layout=stereo_layout,
         spherical_projection=spherical_projection,
         video_bitrate=parse_video_bitrate(json_video_stream, json_video_format),
+        stream_bitrate_bps=stream_bps,
+        stream_bitrate_source=stream_src,
+        container_bitrate_bps=container_bps,
+        container_bitrate_source=container_src,
+        file_size_bytes=file_size_bytes,
     )
     return metadata

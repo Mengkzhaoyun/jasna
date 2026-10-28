@@ -39,7 +39,9 @@ class TrtRunner:
         device: torch.device,
         source: str,
     ) -> None:
-        self.device = device
+        self.device = torch.device(device)
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
 
         self.runtime = trt.Runtime(get_trt_logger())
         self.engine = self.runtime.deserialize_cuda_engine(engine_bytes)
@@ -133,6 +135,8 @@ class TrtRunner:
                     for name, tensor in inputs.items()
                 }
                 trim = n
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         shapes = {name: tuple(inputs[name].shape) for name in self.input_names}
         if shapes != self._cur_shapes:
             self._bind(shapes)

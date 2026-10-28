@@ -264,8 +264,10 @@ def _current_model_file(path: Path) -> bool:
     except (FileNotFoundError, NotADirectoryError):
         return False
     # Size detects outdated downloads cheaply; native loading authenticates their bytes.
+    # Allow <= 256 bytes header delta between v0.11.3 and v0.12.0 encrypted bundles when delegating to JASNA_RELEASE_BIN.
     return stat.S_ISREG(info.st_mode) and (
-        path.suffix != ".enc" or info.st_size == LTX_DOWNLOADS[path.name.removesuffix(".enc")].size_bytes
+        path.suffix != ".enc"
+        or abs(info.st_size - LTX_DOWNLOADS[path.name.removesuffix(".enc")].size_bytes) <= 256
     )
 
 
@@ -298,11 +300,13 @@ class LtxModelFiles:
         """The bundle of ``model``; ``fast`` picks its NVFP4 transformer over the INT8 one."""
         paths = bundle_paths(directory, model, fast=fast)
         if any(path.suffix == ".enc" for path in paths):
-            from jasna.license_api import require_protection
+            from jasna.license_api import protection_available, require_protection
+            from jasna.multi_gpu import resolve_release_binary
 
-            require_protection()
-            from jasna.protection.protected_tensors import check_ltx_license
-            check_ltx_license()
+            if protection_available() or resolve_release_binary() is None:
+                require_protection()
+                from jasna.protection.protected_tensors import check_ltx_license
+                check_ltx_license()
         missing = [str(path) for path in paths if not _current_model_file(path)]
         if missing:
             raise FileNotFoundError(f"LTX model files missing or outdated: {', '.join(missing)}")

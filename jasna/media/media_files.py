@@ -59,7 +59,8 @@ def folder_output_path(output_dir: str | Path, input_path: str | Path, output_pa
     """
     input_path = Path(input_path)
     if not output_pattern:
-        return Path(output_dir) / f"{input_path.stem}_out{input_path.suffix}"
+        suffix = input_path.suffix if is_image(input_path) else ".mp4"
+        return Path(output_dir) / f"{input_path.stem}_out{suffix}"
 
     pattern_suffix = Path(output_pattern.replace("{original}", "x")).suffix
     output_name = output_pattern.replace("{original}", input_path.stem)

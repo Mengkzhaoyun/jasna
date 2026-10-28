@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1690" viewBox="0 0 1200 1690" role="img" aria-labelledby="pipeline-title pipeline-desc">
+  <title id="pipeline-title">Jasna 单容器多 GPU 智能分段流水线</title>
+  <desc id="pipeline-desc">安全关键帧索引与过滤后的有效目标区间生成分片计划。无有效目标的分片选择 NVENC 或满足条件时复制码流；有效目标通过跨片段与跨轨迹多 GPU 调度修复。两路分片汇总后依次标准化、无损拼接视频和混流原音轨、字幕与章节。轨迹与分片原子提交，支持断点续跑。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M1 1 L7 4 L1 7" fill="none" stroke="#8295a8" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-blue" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M1 1 L7 4 L1 7" fill="none" stroke="#2563eb" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+    <marker id="arrow-teal" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M1 1 L7 4 L1 7" fill="none" stroke="#087f72" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+  </defs>
+  <g font-family="'Segoe UI', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">
+  <rect width="1200" height="1690" fill="#ffffff"/>
+
+<text x="40" y="60" font-size="32" fill="#172b40" font-weight="700" text-anchor="start">单容器多 GPU 智能分段流水线</text>
+<text x="40" y="98" font-size="19" fill="#52657a" font-weight="400" text-anchor="start">Jasna  /  安全切分 → 双通道处理 → 无损合并</text>
+<path d="M40 122 H1160" fill="none" stroke="#dce5ed" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="40" y="144" width="1120" height="370" rx="10" fill="#fafcfe" stroke="#dce5ed" stroke-width="1.5"/>
+<rect x="64" y="166" width="40" height="34" rx="7" fill="#eaf1fd" stroke="none" stroke-width="1.5"/>
+<text x="84" y="190" font-size="19" fill="#2563eb" font-weight="650" text-anchor="middle">01</text>
+<text x="120" y="191" font-size="24" fill="#172b40" font-weight="650" text-anchor="start">智能扫描与关键帧切分</text>
+<text x="64" y="222" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">输入源视频 · 先定位有效目标，再生成可并行处理的分片</text>
+<rect x="64" y="246" width="290" height="104" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="84" y="277" font-size="21" fill="#172b40" font-weight="650" text-anchor="start">安全关键帧索引</text>
+<text x="84" y="307" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">提取 IDR / CRA 安全切点</text>
+<text x="84" y="332" font-size="16" fill="#52657a" font-weight="400" text-anchor="start">probe_keyframes()</text>
+<rect x="410" y="246" width="300" height="104" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="430" y="277" font-size="21" fill="#172b40" font-weight="650" text-anchor="start">全片抽帧检测</text>
+<text x="430" y="307" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">每 1 秒采样 · RF-DETR v6</text>
+<text x="430" y="332" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">输出候选马赛克框与得分</text>
+<path d="M710 298 H766" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<rect x="766" y="246" width="370" height="104" rx="10" fill="#fff5e9" stroke="#efd7b9" stroke-width="1.5"/>
+<text x="786" y="277" font-size="21" fill="#b65d14" font-weight="650" text-anchor="start">头部马赛克过滤</text>
+<text x="786" y="307" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">仅有候选框时触发 Pose</text>
+<text x="786" y="332" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">头肩区域判定 + 髋部重叠保护</text>
+<path d="M209 350 V438 H410" fill="none" stroke="#8295a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M951 350 V390" fill="none" stroke="#8295a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="410" y="390" width="726" height="96" rx="10" fill="#eef4ff" stroke="#c9d9f8" stroke-width="1.5"/>
+<text x="430" y="420" font-size="21" fill="#2563eb" font-weight="650" text-anchor="start">有效区间聚合 → 关键帧对齐 → 长段均衡切分</text>
+<text x="430" y="451" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">build_splice_plan() 生成 SpliceSpan</text>
+<text x="430" y="476" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">分为无有效目标片段与有效修复片段</text>
+<path d="M773 486 V514" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M773 514 V548" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<rect x="40" y="548" width="1120" height="774" rx="10" fill="#fafcfe" stroke="#dce5ed" stroke-width="1.5"/>
+<rect x="64" y="570" width="40" height="34" rx="7" fill="#eaf1fd" stroke="none" stroke-width="1.5"/>
+<text x="84" y="594" font-size="19" fill="#2563eb" font-weight="650" text-anchor="middle">02</text>
+<text x="120" y="595" font-size="24" fill="#172b40" font-weight="650" text-anchor="start">单容器多 GPU 并行处理</text>
+<text x="64" y="626" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">容器挂载 --gpus all · 可用设备 cuda:0 … cuda:K−1</text>
+<rect x="64" y="650" width="330" height="534" rx="10" fill="#edf9f5" stroke="#c7e5db" stroke-width="1.5"/>
+<text x="84" y="682" font-size="21" fill="#087f72" font-weight="650" text-anchor="start">A  无有效目标片段</text>
+<text x="84" y="713" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">两种策略择一，均跳过 LTX</text>
+<rect x="84" y="738" width="280" height="156" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="104" y="768" font-size="20" fill="#087f72" font-weight="650" text-anchor="start">默认 · NVENC 重编码</text>
+<text x="104" y="802" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">统一输出编码参数与码率</text>
+<text x="104" y="832" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">与修复片段保持一致</text>
+<text x="104" y="872" font-size="16" fill="#52657a" font-weight="400" text-anchor="start">遵循低码率保护策略</text>
+<text x="224" y="924" font-size="18" fill="#52657a" font-weight="500" text-anchor="middle">或</text>
+<rect x="84" y="944" width="280" height="128" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="104" y="975" font-size="20" fill="#087f72" font-weight="650" text-anchor="start">可选 · Stream Copy</text>
+<text x="104" y="1009" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">输出编码器与输入一致</text>
+<text x="104" y="1039" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">且无需降低码率时复制</text>
+<path d="M364 816 H382 V1126 H374" fill="none" stroke="#087f72" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-teal)"/>
+<path d="M364 1008 H382" fill="none" stroke="#087f72" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="84" y="1094" width="290" height="64" rx="10" fill="#ffffff" stroke="#bdded2" stroke-width="1.5"/>
+<text x="104" y="1121" font-size="19" fill="#087f72" font-weight="650" text-anchor="start">产出无目标分片</text>
+<text x="104" y="1146" font-size="16" fill="#52657a" font-weight="400" text-anchor="start">{span_idx:04d}-raw.nut</text>
+<rect x="426" y="650" width="710" height="534" rx="10" fill="#f0f5ff" stroke="#cbdaf5" stroke-width="1.5"/>
+<text x="446" y="682" font-size="21" fill="#2563eb" font-weight="650" text-anchor="start">B  有效目标片段</text>
+<text x="446" y="713" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">LTX-2.5 22B · 跨片段与跨轨迹两级并行</text>
+<rect x="446" y="738" width="670" height="64" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="466" y="765" font-size="20" fill="#172b40" font-weight="650" text-anchor="start">逐帧检测与过滤 → TrackPlan</text>
+<text x="466" y="790" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">RF-DETR + Pose · 为保留的目标规划 121 帧滑窗</text>
+<path d="M781 802 V826" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<rect x="446" y="826" width="670" height="76" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="466" y="856" font-size="20" fill="#2563eb" font-weight="650" text-anchor="start">L1 跨 Span 分配   /   L2 同 Span 内跨 Track 分配</text>
+<text x="466" y="885" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">任务动态分发至空闲 GPU · 每卡独立 Worker 进程</text>
+<path d="M781 902 V914 H548 V934" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<path d="M781 914 V934" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<path d="M781 914 H1014 V934" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<rect x="446" y="934" width="204" height="68" rx="8" fill="#ffffff" stroke="#c9d9f8" stroke-width="1.5"/>
+<text x="548" y="962" font-size="20" fill="#2563eb" font-weight="650" text-anchor="middle">GPU 0</text>
+<text x="548" y="987" font-size="16" fill="#52657a" font-weight="400" text-anchor="middle">cuda:0</text>
+<rect x="679" y="934" width="204" height="68" rx="8" fill="#ffffff" stroke="#c9d9f8" stroke-width="1.5"/>
+<text x="781" y="962" font-size="20" fill="#2563eb" font-weight="650" text-anchor="middle">GPU 1</text>
+<text x="781" y="987" font-size="16" fill="#52657a" font-weight="400" text-anchor="middle">cuda:1</text>
+<rect x="912" y="934" width="204" height="68" rx="8" fill="#ffffff" stroke="#c9d9f8" stroke-width="1.5"/>
+<text x="1014" y="962" font-size="20" fill="#2563eb" font-weight="650" text-anchor="middle">GPU K−1</text>
+<text x="1014" y="987" font-size="16" fill="#52657a" font-weight="400" text-anchor="middle">cuda:K−1</text>
+<path d="M548 1002 V1014 H1014 V1002" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M781 1002 V1034" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<rect x="446" y="1034" width="670" height="44" rx="7" fill="#e4edfd" stroke="none" stroke-width="1.5"/>
+<text x="781" y="1063" font-size="18" fill="#2563eb" font-weight="600" text-anchor="middle">VAE Encode + Denoise → 共享 LatentStore</text>
+<path d="M781 1078 V1094" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow-blue)"/>
+<rect x="446" y="1094" width="670" height="64" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="466" y="1121" font-size="20" fill="#172b40" font-weight="650" text-anchor="start">VAE Decode → 羽化融合 → NVENC 输出修复分片</text>
+<text x="466" y="1146" font-size="16" fill="#52657a" font-weight="400" text-anchor="start">{span_idx:04d}-raw.nut</text>
+<path d="M229 1158 V1206 H600" fill="none" stroke="#087f72" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M781 1158 V1206 H600" fill="none" stroke="#2563eb" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M600 1206 V1234" fill="none" stroke="#8295a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="64" y="1234" width="1072" height="64" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="600" y="1261" font-size="20" fill="#172b40" font-weight="650" text-anchor="middle">分片与轨迹原子提交 · 已完成结果可复用</text>
+<text x="600" y="1286" font-size="17" fill="#52657a" font-weight="400" text-anchor="middle">临时文件 + fsync + 原子重命名 · 轨迹 .done / 潜变量 .final.pt / 分片 .nut</text>
+<path d="M600 1298 V1354" fill="none" stroke="#8295a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="1354" width="1120" height="290" rx="10" fill="#fafcfe" stroke="#dce5ed" stroke-width="1.5"/>
+<rect x="64" y="1376" width="40" height="34" rx="7" fill="#eaf1fd" stroke="none" stroke-width="1.5"/>
+<text x="84" y="1400" font-size="19" fill="#2563eb" font-weight="650" text-anchor="middle">03</text>
+<text x="120" y="1401" font-size="24" fill="#172b40" font-weight="650" text-anchor="start">标准化、无损拼接与混流</text>
+<text x="64" y="1432" font-size="17" fill="#52657a" font-weight="400" text-anchor="start">等待全部分片就绪 · 按原视频时间顺序组装</text>
+<rect x="64" y="1450" width="312" height="102" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="84" y="1482" font-size="21" fill="#172b40" font-weight="650" text-anchor="start">分片标准化</text>
+<text x="84" y="1513" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">补齐关键帧头部参数</text>
+<text x="84" y="1538" font-size="16" fill="#52657a" font-weight="400" text-anchor="start">normalize_fragment()</text>
+<rect x="432" y="1450" width="312" height="102" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="452" y="1482" font-size="21" fill="#172b40" font-weight="650" text-anchor="start">视频流无损拼接</text>
+<text x="452" y="1513" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">精确时长清单 · -c:v copy</text>
+<text x="452" y="1538" font-size="16" fill="#52657a" font-weight="400" text-anchor="start">concatenate_fragments()</text>
+<rect x="800" y="1450" width="336" height="102" rx="10" fill="#ffffff" stroke="#dce5ed" stroke-width="1.5"/>
+<text x="820" y="1482" font-size="21" fill="#172b40" font-weight="650" text-anchor="start">原始音轨与元数据混流</text>
+<text x="820" y="1513" font-size="18" fill="#52657a" font-weight="400" text-anchor="start">保留音轨、字幕与章节</text>
+<text x="820" y="1538" font-size="16" fill="#52657a" font-weight="400" text-anchor="start">mux_final_output()</text>
+<path d="M376 1501 H432" fill="none" stroke="#8295a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M744 1501 H800" fill="none" stroke="#8295a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<path d="M968 1552 V1568 H600 V1584" fill="none" stroke="#8295a8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="64" y="1584" width="1072" height="40" rx="7" fill="#eaf3f8" stroke="none" stroke-width="1.5"/>
+<text x="600" y="1611" font-size="19" fill="#172b40" font-weight="600" text-anchor="middle">最终视频 · 保留未修复区域与原始音轨信息</text>
+</g>
+</svg>

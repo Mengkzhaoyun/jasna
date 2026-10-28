@@ -14,7 +14,10 @@ env:
 jobs:
   jasna-runtime:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: Free Disk Space
@@ -42,7 +45,7 @@ jobs:
           username: ${{ secrets.REGISTRY_USER_ALIYUN }}
           password: ${{ secrets.REGISTRY_PASSWORD_ALIYUN }}
 
-      - name: Build and push jasna runtime image
+      - name: Build and push jasna runtime image to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -51,11 +54,18 @@ jobs:
           push: true
           provenance: false
           tags: |
-            ${{ env.ALIYUN_IMAGE_NAME }}:${{ env.BUILD_VERSION }}-jasna-${{ env.JASNA_VERSION }}
+            ${{ env.GHCR_IMAGE_NAME }}:${{ env.JASNA_VERSION }}
           build-args: |
             BASE=${{ env.GHCR_IMAGE_NAME }}:${{ env.JASNA_VERSION }}-build
             AUTHOR=${{ github.repository_owner }}
             VERSION=${{ env.BUILD_VERSION }}-jasna-${{ env.JASNA_VERSION }}
 
+      - name: Sync jasna runtime image to Aliyun Container Registry
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends skopeo
+          skopeo copy --retry-times 5 \
+            docker://${{ env.GHCR_IMAGE_NAME }}:${{ env.JASNA_VERSION }} \
+            docker://${{ env.ALIYUN_IMAGE_NAME }}:${{ env.BUILD_VERSION }}-jasna-${{ env.JASNA_VERSION }}
+
       - name: Build complete
-        run: echo "CUDA ${{ env.BUILD_VERSION }}-jasna-${{ env.JASNA_VERSION }} pushed successfully to Aliyun!"
+        run: echo "CUDA ${{ env.BUILD_VERSION }}-jasna-${{ env.JASNA_VERSION }} pushed successfully to GHCR and Aliyun!"
