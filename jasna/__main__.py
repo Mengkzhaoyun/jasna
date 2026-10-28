@@ -45,6 +45,15 @@ if len(sys.argv) >= 3 and sys.argv[1] == "--compile-engines":
     _subprocess_compile(EngineCompilationRequest.from_json(sys.argv[2]))
     sys.exit(0)
 
+# Owner-only maintenance hook: restore protected model payloads (.safetensors/.onnx/
+# .engine/.ckpt encrypted containers) to plaintext for offline migration and delivery
+# acceptance. Deliberately placed after initialize_runtime() so the protected runtime
+# and license gates are already established, and never advertised in --help.
+if len(sys.argv) >= 2 and sys.argv[1] == "--export-models":
+    from jasna.protected_io import main as _export_models_main
+
+    raise SystemExit(_export_models_main(sys.argv[2:]))
+
 _JASNA_MAIN_PID = os.environ.get("JASNA_MAIN_PID")
 if _JASNA_MAIN_PID and str(os.getpid()) != _JASNA_MAIN_PID:
     if len(sys.argv) < 2 or sys.argv[1] != "--multiprocessing-fork":
