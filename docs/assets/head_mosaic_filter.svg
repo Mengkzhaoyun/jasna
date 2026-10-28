@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="900" viewBox="0 0 1200 900" role="img" aria-labelledby="filter-title filter-desc" font-family="'Segoe UI', 'Microsoft YaHei', sans-serif">
+  <title id="filter-title">人头马赛克过滤：头部判定与髋部保护</title>
+  <desc id="filter-desc">RF-DETR 无候选框时跳过姿态模型。有候选框时通过人体关键点构建 HeadBox 与 HipBox。只有候选框被任意人物 HeadBox 覆盖至少百分之五十、最大边长小于画面高度百分之三十五，且不与任何人物 HipBox 重叠，才从修复候选中剔除。其他候选框保留。过滤后无剩余框的采样帧得分设为零。</desc>
+  <defs>
+    <marker id="filter-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#2563eb" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="keep-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#087f72" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <marker id="drop-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M1 1 L7 4 L1 7" fill="none" stroke="#b65d14" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <pattern id="candidate-grid" x="0" y="0" width="16" height="16" patternUnits="userSpaceOnUse">
+      <rect width="16" height="16" fill="#dce5ed"/>
+      <path d="M0 0 H8 V8 H0 Z M8 8 H16 V16 H8 Z" fill="#bdccd9"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="900" fill="#ffffff"/>
+  <text x="40" y="59" fill="#172b40" font-size="30" font-weight="700">人头马赛克过滤</text>
+  <text x="40" y="92" fill="#52657a" font-size="18">先识别头部候选，再检查髋部保护；仅将符合条件的框移出修复任务。</text>
+  <path d="M40 116 H1160" stroke="#dce5ed"/>
+
+  <!-- Geometry reference: neutral candidate boxes do not imply a decision. -->
+  <rect x="40" y="140" width="330" height="665" rx="12" fill="#f7f9fc" stroke="#dce5ed"/>
+  <text x="64" y="175" fill="#172b40" font-size="20" font-weight="600">关键点与区域</text>
+  <text x="64" y="201" fill="#52657a" font-size="16">示意图 · 候选框仍须经过右侧判定</text>
+
+  <rect x="64" y="222" width="282" height="350" rx="8" fill="#ffffff" stroke="#dce5ed"/>
+  <path d="M157 360 L174 466 L236 466 L253 360 M174 466 L156 548 M236 466 L254 548 M157 360 L126 436 M253 360 L284 436" fill="none" stroke="#a1b1c1" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M157 360 Q205 332 253 360" fill="none" stroke="#a1b1c1" stroke-width="4"/>
+  <circle cx="205" cy="294" r="33" fill="#f0f4f8" stroke="#a1b1c1" stroke-width="2"/>
+  <path d="M205 327 V345" stroke="#a1b1c1" stroke-width="4"/>
+
+  <rect x="148" y="245" width="114" height="130" rx="6" fill="#2563eb" fill-opacity="0.04" stroke="#2563eb" stroke-width="1.7" stroke-dasharray="6 5"/>
+  <text x="79" y="247" fill="#2563eb" font-size="15" font-weight="600">HeadBox</text>
+  <path d="M104 256 H139 L148 267" fill="none" stroke="#2563eb"/>
+  <rect x="174" y="267" width="62" height="58" rx="3" fill="url(#candidate-grid)" stroke="#52657a"/>
+  <text x="273" y="298" fill="#52657a" font-size="16" font-weight="600">B₁</text>
+  <path d="M240 293 H265" stroke="#94a7ba"/>
+
+  <g fill="#2563eb" stroke="#ffffff" stroke-width="1.5">
+    <circle cx="205" cy="298" r="4"/>
+    <circle cx="194" cy="287" r="4"/>
+    <circle cx="216" cy="287" r="4"/>
+    <circle cx="177" cy="294" r="4"/>
+    <circle cx="233" cy="294" r="4"/>
+    <circle cx="157" cy="360" r="5"/>
+    <circle cx="253" cy="360" r="5"/>
+  </g>
+
+  <rect x="145" y="435" width="120" height="74" rx="6" fill="#087f72" fill-opacity="0.05" stroke="#087f72" stroke-width="1.7" stroke-dasharray="6 5"/>
+  <text x="79" y="428" fill="#087f72" font-size="15" font-weight="600">HipBox</text>
+  <path d="M106 437 H136 L145 446" fill="none" stroke="#087f72"/>
+  <rect x="175" y="451" width="60" height="48" rx="3" fill="url(#candidate-grid)" stroke="#52657a"/>
+  <path d="M174 466 H236" stroke="#087f72" stroke-width="2"/>
+  <g fill="#087f72" stroke="#ffffff" stroke-width="1.5">
+    <circle cx="174" cy="466" r="5"/>
+    <circle cx="236" cy="466" r="5"/>
+  </g>
+  <text x="273" y="479" fill="#52657a" font-size="16" font-weight="600">B₂</text>
+  <path d="M240 474 H265" stroke="#94a7ba"/>
+
+  <text x="64" y="608" fill="#2563eb" font-size="18" font-weight="600">HeadBox · 头肩包络</text>
+  <text x="64" y="637" fill="#52657a" font-size="17">关键点 0–4：鼻、眼、耳</text>
+  <text x="64" y="663" fill="#52657a" font-size="17">关键点 5–6：双肩</text>
+  <text x="64" y="706" fill="#087f72" font-size="18" font-weight="600">HipBox · 髋部保护区</text>
+  <text x="64" y="735" fill="#52657a" font-size="17">关键点 11–12：左右髋部</text>
+  <text x="64" y="761" fill="#52657a" font-size="17">由髋部关键点向外扩展</text>
+
+  <!-- Main flow, with explicit branches kept outside the text boxes. -->
+  <rect x="430" y="140" width="480" height="84" rx="10" fill="#f1f6ff" stroke="#c7d9f7"/>
+  <text x="454" y="174" fill="#172b40" font-size="20" font-weight="600">1  RF-DETR 检测</text>
+  <text x="454" y="202" fill="#52657a" font-size="18">读取当前帧的候选马赛克框 B</text>
+
+  <path d="M910 182 H970" fill="none" stroke="#8296ac" stroke-width="1.8"/>
+  <text x="940" y="164" text-anchor="middle" fill="#52657a" font-size="15">无框</text>
+  <rect x="970" y="151" width="190" height="62" rx="8" fill="#f7f9fc" stroke="#dce5ed"/>
+  <text x="1065" y="189" text-anchor="middle" fill="#52657a" font-size="19" font-weight="600">跳过 Pose</text>
+
+  <path d="M670 224 V269" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#filter-arrow)"/>
+  <text x="687" y="251" fill="#2563eb" font-size="16">有候选框</text>
+  <rect x="430" y="270" width="480" height="97" rx="10" fill="#ffffff" stroke="#c7d9f7" stroke-width="1.5"/>
+  <text x="454" y="303" fill="#172b40" font-size="20" font-weight="600">2  按需运行人体姿态模型</text>
+  <text x="454" y="332" fill="#52657a" font-size="18">YOLOv8n-pose / YOLO11n-pose</text>
+  <text x="454" y="354" fill="#52657a" font-size="16">为每个人构建 HeadBox 与 HipBox</text>
+
+  <path d="M670 367 V411" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#filter-arrow)"/>
+  <text x="687" y="395" fill="#2563eb" font-size="16">逐个判断候选框 B</text>
+  <rect x="430" y="412" width="480" height="124" rx="10" fill="#f1f6ff" stroke="#c7d9f7" stroke-width="1.5"/>
+  <text x="454" y="446" fill="#172b40" font-size="20" font-weight="600">3  同时满足头部命中条件？</text>
+  <text x="454" y="478" fill="#172b40" font-size="18">任意 HeadBox 覆盖 B 的比例 ≥ 0.50</text>
+  <text x="454" y="507" fill="#172b40" font-size="18">且 B 的最大边长 &lt; 画面高度 × 0.35</text>
+
+  <path d="M910 475 H969" fill="none" stroke="#087f72" stroke-width="2" marker-end="url(#keep-arrow)"/>
+  <text x="939" y="457" fill="#087f72" font-size="16" text-anchor="middle">否</text>
+  <rect x="970" y="438" width="190" height="177" rx="10" fill="#edf9f5" stroke="#a8d9cd" stroke-width="1.5"/>
+  <text x="994" y="477" fill="#087f72" font-size="23" font-weight="700">保留候选框</text>
+  <text x="994" y="514" fill="#172b40" font-size="17">参与有效区间聚合</text>
+  <text x="994" y="542" fill="#172b40" font-size="17">与后续轨迹规划</text>
+  <path d="M994 564 H1136" stroke="#c3e5db"/>
+  <text x="994" y="590" fill="#087f72" font-size="16">髋部重叠优先保护</text>
+
+  <path d="M670 536 V584" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#filter-arrow)"/>
+  <text x="687" y="566" fill="#2563eb" font-size="16">是</text>
+  <rect x="430" y="585" width="480" height="88" rx="10" fill="#f1f6ff" stroke="#c7d9f7" stroke-width="1.5"/>
+  <text x="454" y="619" fill="#172b40" font-size="20" font-weight="600">4  与任意人物的 HipBox 重叠？</text>
+  <text x="454" y="648" fill="#52657a" font-size="18">检查整帧人物，保护头髋贴近的区域</text>
+  <path d="M910 629 H1065 V616" fill="none" stroke="#087f72" stroke-width="2" marker-end="url(#keep-arrow)"/>
+  <text x="939" y="612" fill="#087f72" font-size="16" text-anchor="middle">是</text>
+
+  <path d="M670 673 V724" fill="none" stroke="#b65d14" stroke-width="2" marker-end="url(#drop-arrow)"/>
+  <text x="687" y="704" fill="#b65d14" font-size="16">否</text>
+  <rect x="430" y="725" width="480" height="80" rx="10" fill="#fff5e9" stroke="#ebcdac" stroke-width="1.5"/>
+  <text x="454" y="759" fill="#b65d14" font-size="23" font-weight="700">剔除候选框</text>
+  <text x="454" y="788" fill="#172b40" font-size="18">移出修复任务，原画面中的头像打码保留</text>
+
+  <path d="M40 834 H1160" stroke="#dce5ed"/>
+  <text x="40" y="867" fill="#52657a" font-size="18">采样帧过滤后若无剩余候选框，得分设为 0.0；剩余框继续参与有效马赛克区间聚合。</text>
+</svg>

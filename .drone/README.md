@@ -53,10 +53,15 @@ docker build -f .drone/dockerfile -t registry.cn-qingdao.aliyuncs.com/wod/cuda:1
 - **模型路径自动探测**：自动发现 `/data/jasna/model_weights` 或 `/app/sglang/model_weights`。
 - **离线授权自动恢复**：自动从 `/data/jasna/license.json` 恢复离线证书，无需每次激活或传递 `JASNA_LICENSE`。
 - **4090 / 5090 单镜像自适应**：启动时自动探测 GPU Compute Capability，在 **RTX 4090 (`SM 8.9`)** 上自动使用 `INT8` 算子，在 **RTX 5090 (`SM 12.0`)** 且存在 `nvfp4` 权重时自动开启 `LTX_FAST=true`（`NVFP4` 硬件加速，全流程提速约 **2.3x**）。
+- **单容器多 GPU 智能切片与人头马赛克剔除（默认开启）**：
+  - `MULTI_GPU=true`（默认）：启动 `1 fps` 全片预扫描，自动跳过无码片段（仅做 `5M` NVENC 快速硬件重编码），并在单容器内跨多张 GPU 执行 **L1 Span 级 + L2 Track 级**双层并发 LTX 去噪；
+  - `MULTI_GPU_MAX_INNER_GAP=35`（默认，秒）：不超过该时长的短无码过渡并入同一 LTX 渲染大块（由 Pass 1 扫描跳过 LTX 2/3/4），每块只加载一次 22B 模型；超过该时长的无码区间拆出走通道 A（NVENC 硬件快编）。
+  - `IGNORE_HEAD_MOSAIC=true`（默认）：基于 `YOLO26s-pose` 人体姿态关键点与几何双框拓扑关系，自动识别并剔除男优/路人头部人脸马赛克，仅对核心身体部位马赛克调用 LTX-2.5 22B 修复。详细架构见 [`docs/MultiGpuSmartPipeline.md`](../docs/MultiGpuSmartPipeline.md)。
 
 ### 0. LTX 模型预热（多卡并发启动前推荐单卡执行一次）
 
 预热包含两步并统一持久化到 `/data/jasna/model_weights`（全卡共享）：
+
 1. 预编译/校验 `rfdetr-v6-large.bs1-4.fp16.linux.engine` 检测引擎（跳过无用的 `BasicVSR++` 编译）；
 2. 预热 LTX 3D Causal VAE / 22B DiT / Decoder，生成 `torch-compile-cache/` 与 `ltx-speed-profile.json`，避免多卡并发启动时重复执行 `LTX speed test` 与重复编译算子。
 
@@ -87,7 +92,8 @@ docker run --name sglang \
 > **提示**：
 >
 > - 4090 与 5090 节点的离线激活凭证已持久化于 `/data/jasna/license.json`，挂载 `-v /data/jasna:/data/jasna` 即可免激活离线直跑。
-> - 默认使用 0 号显卡；在多卡节点上如需指定其他显卡，额外加上 `-e CUDA_VISIBLE_DEVICES=<卡号>` 即可。
+> - `--gpus all` 下默认自动发现并使用容器内全部可见显卡协同加速单个视频（L1 Span 级 + L2 Track 级并行）；如需限制显卡列表，可传入 `-e GPUS=0,1` 或 `-e CUDA_VISIBLE_DEVICES=0,1`。
+> - 如需关闭人头马赛克过滤，传入 `-e IGNORE_HEAD_MOSAIC=false`（或 CLI `--no-ignore-head-mosaic`）；如需回退单卡整片顺序模式，传入 `-e MULTI_GPU=false`（或 CLI `--no-multi-gpu`）。
 > - 如需切换回传统极速模式（BasicVSR++），额外加上 `-e RESTORATION_MODEL_NAME=basicvsrpp` 即可。
 
 ### 2. BasicVSR++ 极速模式部署（无需官方 release 挂载与授权）

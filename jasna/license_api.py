@@ -13,8 +13,9 @@ def protection_available() -> bool:
     if is_frozen():
         return True
     spec = find_spec("jasna.protection")
-    # An uninitialized git submodule is an empty namespace, not an implementation.
-    return spec is not None and spec.origin is not None
+    if spec is None or spec.origin is None:
+        return False
+    return find_spec("jasna.protection.protected_tensors") is not None
 
 
 def require_protection() -> None:

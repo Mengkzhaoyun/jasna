@@ -211,6 +211,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument(
+        "--multi-gpu",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Enable smart mosaic pre-scan, non-mosaic skip, and single-container multi-GPU (L1 Span + L2 Track) scheduling (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default="",
+        help="GPU list for multi-GPU scheduling (e.g. 'all' or '0,1,2'). Defaults to all visible CUDA GPUs when --multi-gpu is enabled.",
+    )
+    parser.add_argument(
         "--fp16",
         default=True,
         action=argparse.BooleanOptionalAction,
@@ -507,6 +519,12 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         help=CLI_HELP["scene_detection"],
     )
+    detection.add_argument(
+        "--ignore-head-mosaic",
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="Automatically identify and ignore face/head mosaics (e.g. male actors / passersby) using pose keypoints and geometric topology (default: %(default)s)",
+    )
 
     projection = parser.add_argument_group("VR projection")
     projection.add_argument(
@@ -686,6 +704,10 @@ def _check_system(args: argparse.Namespace) -> None:
 
 
 def _configure_runtime(args: argparse.Namespace) -> None:
+    import os
+
+    os.environ["IGNORE_HEAD_MOSAIC"] = "1" if getattr(args, "ignore_head_mosaic", True) else "0"
+    os.environ["JASNA_SMART_PIPELINE"] = "1" if getattr(args, "multi_gpu", True) else "0"
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s %(name)s %(levelname)s: %(message)s",
@@ -823,36 +845,189 @@ def _run_videos(
     in_folder: bool,
     first_index: int,
     total: int,
+    config: SessionConfig | None = None,
+    input_root: Path | None = None,
 ) -> bool:
     """Process videos one by one; returns False when a per-video command failed in a folder batch."""
+    import os
+    import signal
+    import time
+    import traceback
+    from datetime import datetime
     from jasna.job_resume import ResumeMismatchError
+    from jasna.media.probe import get_video_meta_data
+    from jasna.mosaic.head_filter import is_head_filter_enabled
+    from jasna.multi_gpu import discover_logical_gpus, is_smart_pipeline_enabled
     from jasna.post_export_action import PostExportVideoCommandError, run_post_export_video_command
+    from jasna.runtime_log import (
+        RunLog,
+        format_duration,
+        format_input_summary,
+        format_output_summary,
+        format_target_summary,
+        is_child_worker_process,
+        sanitize_cli_args,
+    )
 
     post_export_video_command = str(args.post_export_video_command).strip()
-    all_commands_ok = True
-    for i, vid in enumerate(videos, start=first_index):
-        out_path = output_path_for(vid)
-        if in_folder:
-            print(f"[{i}/{total}] Processing {vid.name} -> {out_path.name}")
-        try:
-            _run_resumable_video(make_pipeline, vid, out_path)
-        except (UnsupportedVideoError, ResumeMismatchError) as e:
-            if isinstance(e, ResumeMismatchError):
+    if is_child_worker_process() or os.environ.get("JASNA_DISABLE_RUNTIME_LOG", "").strip() == "1":
+        all_commands_ok = True
+        for i, vid in enumerate(videos, start=first_index):
+            out_path = output_path_for(vid)
+            if in_folder:
+                print(f"[{i}/{total}] Processing {vid.name} -> {out_path.name}")
+            try:
+                _run_resumable_video(make_pipeline, vid, out_path)
+            except (UnsupportedVideoError, ResumeMismatchError) as e:
+                if isinstance(e, ResumeMismatchError):
+                    all_commands_ok = False
+                print(f"Error processing {vid.name}: {e}")
+                if not in_folder:
+                    sys.exit(1)
+                continue
+            if not post_export_video_command:
+                continue
+            print(f"Running post-export command for {out_path.name}")
+            try:
+                run_post_export_video_command(post_export_video_command, vid, out_path, lambda: False)
+            except PostExportVideoCommandError as e:
+                print(f"Error post-processing {vid.name}: {e}")
+                if not in_folder:
+                    sys.exit(1)
                 all_commands_ok = False
-            print(f"Error processing {vid.name}: {e}")
-            if not in_folder:
-                sys.exit(1)
-            continue
-        if not post_export_video_command:
-            continue
-        print(f"Running post-export command for {out_path.name}")
+        return all_commands_ok
+
+    external_batch = bool(os.environ.get("JASNA_BATCH_LOG_FILE", "").strip())
+    batch_t0 = time.monotonic()
+    outcomes: dict[int, str] = {}
+    exit_code = 0
+    all_commands_ok = True
+    multi_gpu_on = bool(getattr(args, "multi_gpu", True)) and is_smart_pipeline_enabled()
+    head_filter_on = is_head_filter_enabled()
+    gpus = discover_logical_gpus(str(getattr(args, "gpus", "") or "")) if multi_gpu_on else [0]
+
+    with RunLog() as run_log:
+        if not external_batch:
+            tz = datetime.now().astimezone().strftime("UTC%z")
+            run_log.emit(
+                "批次开始",
+                f"运行编号={run_log.path.parent.name} 任务数={len(videos)} 执行方式=串行 "
+                f"失败策略={'继续下一视频' if in_folder else '结束运行'} 时区={tz} 日志={run_log.path}",
+            )
+            run_log.emit(
+                "参数记录",
+                f"实际参数={sanitize_cli_args(sys.argv[1:])} "
+                "输入/输出视频码率来源=视频流bit_rate或tag:BPS 文件总码率来源=容器bit_rate 大小来源=最终文件字节数",
+            )
         try:
-            run_post_export_video_command(post_export_video_command, vid, out_path, lambda: False)
-        except PostExportVideoCommandError as e:
-            print(f"Error post-processing {vid.name}: {e}")
-            if not in_folder:
-                sys.exit(1)
-            all_commands_ok = False
+            for offset, vid in enumerate(videos):
+                idx = int(os.environ.get("JASNA_TASK_INDEX") or (first_index + offset))
+                tot = int(os.environ.get("JASNA_TASK_TOTAL") or total)
+                if os.environ.get("JASNA_TASK_DISPLAY_NAME"):
+                    display_name = os.environ["JASNA_TASK_DISPLAY_NAME"]
+                elif input_root is not None:
+                    try:
+                        display_name = vid.relative_to(input_root).as_posix()
+                    except ValueError:
+                        display_name = vid.name
+                else:
+                    display_name = vid.name
+
+                out_path = output_path_for(vid)
+                if multi_gpu_on and config is not None and config.restoration_model_name == "ltx" and out_path.suffix.lower() != ".mp4":
+                    out_path = out_path.with_suffix(".mp4")
+
+                task = run_log.task(display_name, idx, tot)
+                started = False
+                t0 = time.monotonic()
+                try:
+                    with task.capture():
+                        meta = get_video_meta_data(str(vid))
+                    t0 = time.monotonic()
+                    task.emit("任务开始", format_input_summary(meta, vid))
+                    started = True
+                    if config is not None:
+                        task.emit(
+                            "处理目标",
+                            format_target_summary(
+                                config,
+                                meta,
+                                out_path,
+                                multi_gpu_enabled=multi_gpu_on,
+                                head_filter_enabled=head_filter_on,
+                                gpu_count=len(gpus),
+                            ),
+                        )
+                    with task.capture():
+                        if in_folder:
+                            print(f"[{idx}/{tot}] Processing {vid.name} -> {out_path.name}")
+                        _run_resumable_video(make_pipeline, vid, out_path)
+                        if post_export_video_command:
+                            print(f"Running post-export command for {out_path.name}")
+                            run_post_export_video_command(post_export_video_command, vid, out_path, lambda: False)
+                        summary = format_output_summary(out_path, task.stats, t0, task)
+                    outcomes[offset] = "成功"
+                    task.emit("处理完毕", summary)
+                except KeyboardInterrupt as exc:
+                    exit_code = 128 + getattr(exc, "signum", signal.SIGINT)
+                    all_commands_ok = False
+                    if offset not in outcomes:
+                        outcomes[offset] = "中断"
+                        if not started:
+                            task.emit("任务开始", format_input_summary(None, vid))
+                        task.emit(
+                            "任务中断",
+                            f"原因=收到中断信号 输出=未确认完成 视频码率=无法获取 大小=未确认 处理时长={format_duration(time.monotonic() - t0)}",
+                        )
+                    break
+                except Exception as exc:
+                    all_commands_ok = False
+                    if offset not in outcomes:
+                        outcomes[offset] = "失败"
+                        if not started:
+                            task.emit("任务开始", format_input_summary(None, vid))
+                        task.emit("处理日志", traceback.format_exc())
+                        task.emit(
+                            "处理失败",
+                            f"原因={exc} 输出=未确认完成 视频码率=无法获取 大小=未确认 "
+                            f"处理时长={format_duration(time.monotonic() - t0)} "
+                            f"后续={'继续下一视频' if (in_folder or external_batch) else '结束运行'}",
+                        )
+                    if not in_folder:
+                        exit_code = 1
+                        break
+        finally:
+            if not external_batch:
+                counts = {
+                    state: sum(val == state for val in outcomes.values())
+                    for state in ("成功", "失败", "跳过", "中断")
+                }
+                unprocessed = max(0, len(videos) - sum(counts.values()))
+                status = (
+                    "中断"
+                    if exit_code >= 128 or counts["中断"]
+                    else "存在失败"
+                    if counts["失败"] or exit_code
+                    else "含跳过"
+                    if counts["跳过"]
+                    else "全部成功"
+                )
+                parts = [
+                    f"状态={status}",
+                    f"总数={len(videos)}",
+                    f"成功={counts['成功']}",
+                    f"失败={counts['失败']}",
+                    f"跳过={counts['跳过']}",
+                ]
+                if counts["中断"]:
+                    parts.append(f"中断={counts['中断']}")
+                parts.append(f"未处理={unprocessed}")
+                parts.append(f"总耗时={format_duration(time.monotonic() - batch_t0)}")
+                parts.append(f"进程退出码={exit_code}")
+                run_log.emit("批次结束", " ".join(parts))
+
+    if exit_code != 0 and not in_folder:
+        sys.exit(exit_code)
     return all_commands_ok
 
 
@@ -1132,12 +1307,36 @@ def main() -> None:
 
     _ensure_ltx_model(config, segments)
 
+    from jasna.multi_gpu import is_smart_pipeline_enabled, run_smart_multi_gpu_video
     from jasna.session_factory import build_pipeline, build_restoration_session, ltx_auto_split
+
+    class _SmartMultiGpuPipeline:
+        def __init__(self, vid_input: Path, out_path: Path) -> None:
+            self._vid_input = vid_input
+            self._out_path = out_path
+
+        def run(self) -> None:
+            run_smart_multi_gpu_video(
+                config,
+                session,
+                self._vid_input,
+                self._out_path,
+                requested_gpus=str(getattr(args, "gpus", "") or ""),
+            )
 
     with device_context(config.device):
         session = build_restoration_session(config, log_callback=None)
 
         def make_pipeline(vid_input: Path, out_path: Path):
+            if (
+                bool(getattr(args, "multi_gpu", True))
+                and is_smart_pipeline_enabled()
+                and not is_streaming
+                and not segments
+                and args.ltx_auto_split is None
+                and config.restoration_model_name == "ltx"
+            ):
+                return _SmartMultiGpuPipeline(vid_input, out_path)
             split = None if segments else ltx_auto_split(config, session, vid_input, out_path, progress_callback=None)
             if split is None:
                 return build_pipeline(config, session, vid_input, out_path, segments=segments, splice_plan=splice_plan)
@@ -1162,6 +1361,8 @@ def main() -> None:
                 in_folder=input_is_dir,
                 first_index=len(folder_images) + 1,
                 total=len(folder_images) + len(folder_videos) if input_is_dir else 1,
+                config=config,
+                input_root=input_video if input_is_dir else None,
             )
             _run_post_export_action()
             if not all_commands_ok:

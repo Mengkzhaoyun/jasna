@@ -46,24 +46,32 @@ class RestorationSession:
     def detection_model_for(self, config: SessionConfig) -> "DetectionModel":
         """The detector for ``config``, reused across videos until its settings change."""
         from jasna.mosaic.detection_registry import build_detection_model
+        from jasna.mosaic.head_filter import HeadFilteredDetector, is_head_filter_enabled
 
+        head_filter_enabled = is_head_filter_enabled()
         key = (
             config.detection_model_name,
             config.detection_model_path,
             config.detection_score_threshold,
             config.batch_size,
             config.fp16,
+            head_filter_enabled,
         )
         if key != self._detection_key:
             if self._detection_model is not None:
                 self._detection_model.close()
-            self._detection_model = build_detection_model(
+            raw_model = build_detection_model(
                 config.detection_model_name,
                 config.detection_model_path,
                 batch_size=config.batch_size,
                 device=self.device,
                 score_threshold=config.detection_score_threshold,
                 fp16=config.fp16,
+            )
+            self._detection_model = (
+                HeadFilteredDetector(raw_model, device=self.device)
+                if head_filter_enabled
+                else raw_model
             )
             self._detection_key = key
         return self._detection_model
@@ -91,6 +99,7 @@ def build_compiled_detection_model(
     """Compile the detector's TensorRT engine if it is missing, then load the detector."""
     from jasna.engine_compiler import EngineCompilationRequest, ensure_engines_compiled
     from jasna.mosaic.detection_registry import build_detection_model
+    from jasna.mosaic.head_filter import HeadFilteredDetector, is_head_filter_enabled
 
     ensure_engines_compiled(
         EngineCompilationRequest(
@@ -103,7 +112,7 @@ def build_compiled_detection_model(
         ),
         log_callback=log_callback,
     )
-    return build_detection_model(
+    raw_model = build_detection_model(
         detection_model_name,
         detection_model_path,
         batch_size=batch_size,
@@ -111,6 +120,7 @@ def build_compiled_detection_model(
         score_threshold=score_threshold,
         fp16=fp16,
     )
+    return HeadFilteredDetector(raw_model, device=device) if is_head_filter_enabled() else raw_model
 
 
 def _build_secondary_restorer(config: SessionConfig, device: "torch.device"):

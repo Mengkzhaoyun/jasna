@@ -411,8 +411,8 @@ def _is_safe_random_access_packet(
         for _, nal_type in _nal_units(data, codec=codec, length_size=length_size, length_prefixed=length_prefixed)
     ]
     if codec == "h264":
-        return 5 in nal_types
-    return any(16 <= nal_type <= 20 for nal_type in nal_types)
+        return 5 in nal_types or (7 in nal_types and 8 in nal_types and 1 in nal_types)
+    return any(16 <= nal_type <= 21 for nal_type in nal_types)
 
 
 def segment_render_span(segment: SegmentRange, index: KeyframeIndex) -> SpliceSpan:
