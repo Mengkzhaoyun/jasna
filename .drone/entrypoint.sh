@@ -5,7 +5,7 @@ set -e
 # Jasna Docker Entrypoint
 #
 # 用法:
-#   sglang                              # 自动扫描 /data 批量处理
+#   sglang                              # 自动扫描 /data/input 批量处理
 #   sglang --input ... --output ...     # 正常处理视频
 #   sglang --stream                     # 流媒体模式
 #   sglang warmup [选项]                # 预编译 TensorRT 引擎
@@ -33,7 +33,7 @@ set -e
 #   PRESERVE_LOW_BITRATE       (默认: true) 输入视频码率 <= TARGET_BITRATE 时仍处理，但不压缩
 #   LOW_BITRATE_ENCODER_SETTINGS 低码率输入使用的 NVENC 设置；默认禁用码率上限，仅保留 CQ/GOP
 #   POST_COMPRESS_BITRATE      (默认: 空) 若设置则额外使用 FFmpeg 二次压缩
-#   SCAN_DIR                   扫描目录 (默认: /data)
+#   SCAN_DIR                   扫描目录 (默认: /data/input)
 #   CODEC                      编码器 (默认: hevc, 可选: av1, h264)
 #   EXTRA_ARGS                 传给 sglang 的额外参数
 # ============================================================
@@ -348,7 +348,7 @@ if [ $# -gt 0 ]; then
 fi
 
 # ---- 无参数: 批量扫描模式 ----
-SCAN_DIR="${SCAN_DIR:-/data}"
+SCAN_DIR="${SCAN_DIR:-/data/input}"
 CODEC="${CODEC:-hevc}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 

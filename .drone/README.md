@@ -85,7 +85,7 @@ docker run --name sglang \
   --gpus all \
   -v /etc/machine-id:/etc/machine-id:ro \
   -v /data/jasna:/data/jasna \
-  -v /nas/sglang/ai:/data \
+  -v /nas/sglang/ai:/data/input \
   registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.12.0
 ```
 
@@ -105,7 +105,7 @@ docker run --name sglang \
   --gpus all \
   -e RESTORATION_MODEL_NAME=basicvsrpp \
   -v /nas/sglang/model_weights:/app/sglang/model_weights \
-  -v /nas/sglang/ai:/data \
+  -v /nas/sglang/ai:/data/input \
   registry.cn-qingdao.aliyuncs.com/wod/cuda:13.0.3-jasna-v0.12.0
 ```
 
